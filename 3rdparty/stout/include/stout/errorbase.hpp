@@ -15,6 +15,7 @@
 
 #include <errno.h>
 
+#include <ostream>
 #include <string>
 
 #include <stout/os/strerror.hpp>
@@ -37,6 +38,11 @@ class Error
 public:
   explicit Error(const std::string& _message) : message(_message) {}
 
+  bool operator==(const Error& that) const
+  {
+    return message == that.message;
+  }
+
   const std::string message;
 };
 
@@ -44,12 +50,23 @@ public:
 class ErrnoError : public Error
 {
 public:
-  ErrnoError() : Error(os::strerror(errno)), code(errno) {}
+  ErrnoError() : ErrnoError(errno) {}
 
-  ErrnoError(const std::string& message)
-    : Error(message + ": " + os::strerror(errno)), code(errno) {}
+  explicit ErrnoError(int _code) : Error(os::strerror(_code)), code(_code) {}
+
+  explicit ErrnoError(const std::string& message)
+    : ErrnoError(errno, message) {}
+
+  ErrnoError(int _code, const std::string& message)
+    : Error(message + ": " + os::strerror(_code)), code(_code) {}
 
   const int code;
 };
+
+
+inline std::ostream& operator<<(std::ostream& stream, const Error& error)
+{
+  return stream << error.message;
+}
 
 #endif // __STOUT_ERROR_BASE_HPP__

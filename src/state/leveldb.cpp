@@ -28,6 +28,7 @@
 
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
+#include <process/id.hpp>
 #include <process/process.hpp>
 
 #include <stout/error.hpp>
@@ -55,13 +56,13 @@ class LevelDBStorageProcess : public Process<LevelDBStorageProcess>
 {
 public:
   explicit LevelDBStorageProcess(const string& path);
-  virtual ~LevelDBStorageProcess();
+  ~LevelDBStorageProcess() override;
 
-  virtual void initialize();
+  void initialize() override;
 
   // Storage implementation.
   Future<Option<Entry>> get(const string& name);
-  Future<bool> set(const Entry& entry, const UUID& uuid);
+  Future<bool> set(const Entry& entry, const id::UUID& uuid);
   Future<bool> expunge(const Entry& entry);
   Future<std::set<string>> names();
 
@@ -78,7 +79,9 @@ private:
 
 
 LevelDBStorageProcess::LevelDBStorageProcess(const string& _path)
-  : path(_path), db(nullptr) {}
+  : ProcessBase(process::ID::generate("leveldb-storage")),
+    path(_path),
+    db(nullptr) {}
 
 
 LevelDBStorageProcess::~LevelDBStorageProcess()
@@ -143,7 +146,9 @@ Future<Option<Entry>> LevelDBStorageProcess::get(const string& name)
 }
 
 
-Future<bool> LevelDBStorageProcess::set(const Entry& entry, const UUID& uuid)
+Future<bool> LevelDBStorageProcess::set(
+    const Entry& entry,
+    const id::UUID& uuid)
 {
   if (error.isSome()) {
     return Failure(error.get());
@@ -158,15 +163,15 @@ Future<bool> LevelDBStorageProcess::set(const Entry& entry, const UUID& uuid)
     return Failure(option.error());
   }
 
-  if (option.get().isSome()) {
-    if (UUID::fromBytes(option.get().get().uuid()).get() != uuid) {
+  if (option->isSome()) {
+    if (id::UUID::fromBytes(option.get()->uuid()).get() != uuid) {
       return false;
     }
   }
 
   // Note that the read (i.e., DB::Get) and the write (i.e., DB::Put)
   // are inherently "atomic" because only one db can be opened at a
-  // time, so there can not be any writes that occur concurrently.
+  // time, so there cannot be any writes that occur concurrently.
 
   Try<bool> result = write(entry);
 
@@ -193,18 +198,18 @@ Future<bool> LevelDBStorageProcess::expunge(const Entry& entry)
     return Failure(option.error());
   }
 
-  if (option.get().isNone()) {
+  if (option->isNone()) {
     return false;
   }
 
-  if (UUID::fromBytes(option.get().get().uuid()).get() !=
-      UUID::fromBytes(entry.uuid()).get()) {
+  if (id::UUID::fromBytes(option.get()->uuid()).get() !=
+      id::UUID::fromBytes(entry.uuid()).get()) {
     return false;
   }
 
   // Note that the read (i.e., DB::Get) and DB::Delete are inherently
   // "atomic" because only one db can be opened at a time, so there
-  // can not be any writes that occur concurrently.
+  // cannot be any writes that occur concurrently.
 
   leveldb::WriteOptions options;
   options.sync = true;
@@ -291,7 +296,7 @@ Future<Option<Entry>> LevelDBStorage::get(const string& name)
 }
 
 
-Future<bool> LevelDBStorage::set(const Entry& entry, const UUID& uuid)
+Future<bool> LevelDBStorage::set(const Entry& entry, const id::UUID& uuid)
 {
   return dispatch(process, &LevelDBStorageProcess::set, entry, uuid);
 }

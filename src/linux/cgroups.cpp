@@ -24,10 +24,17 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 
+// This header include must be enclosed in an `extern "C"` block to
+// workaround a bug in glibc <= 2.12 (see MESOS-7378).
+//
+// TODO(gilbert): Remove this when we no longer support glibc <= 2.12.
+extern "C" {
+#include <sys/sysmacros.h>
+}
+
 #include <glog/logging.h>
 
 #include <fstream>
-#include <list>
 #include <map>
 #include <set>
 #include <sstream>
@@ -37,6 +44,7 @@
 #include <process/collect.hpp>
 #include <process/defer.hpp>
 #include <process/delay.hpp>
+#include <process/id.hpp>
 #include <process/io.hpp>
 #include <process/process.hpp>
 #include <process/reap.hpp>
@@ -55,6 +63,8 @@
 #include <stout/strings.hpp>
 #include <stout/unreachable.hpp>
 
+#include <stout/os/realpath.hpp>
+
 #include "linux/cgroups.hpp"
 #include "linux/fs.hpp"
 
@@ -67,7 +77,6 @@ using std::dec;
 using std::getline;
 using std::ifstream;
 using std::istringstream;
-using std::list;
 using std::map;
 using std::ofstream;
 using std::ostream;
@@ -217,19 +226,6 @@ static Try<Nothing> mount(const string& hierarchy, const string& subsystems)
 }
 
 
-// Unmount the cgroups virtual file system from the given hierarchy root. Make
-// sure to remove all cgroups in the hierarchy before unmount. This function
-// assumes the given hierarchy is currently mounted with a cgroups virtual file
-// system.
-// @param   hierarchy   Path to the hierarchy root.
-// @return  Some if the operation succeeds.
-//          Error if the operation fails.
-static Try<Nothing> unmount(const string& hierarchy)
-{
-  return fs::unmount(hierarchy);
-}
-
-
 // Copies the value of 'cpuset.cpus' and 'cpuset.mems' from a parent
 // cgroup to a child cgroup so the child cgroup can actually run tasks
 // (otherwise it gets the error 'Device or resource busy').
@@ -267,143 +263,6 @@ static Try<Nothing> cloneCpusetCpusMems(
   return Nothing();
 }
 
-
-// Create a cgroup in a given hierarchy. To create a cgroup, one just
-// need to create a directory in the cgroups virtual file system. The
-// given cgroup is a relative path to the given hierarchy. This
-// function assumes the given hierarchy is valid and is currently
-// mounted with a cgroup virtual file system. The function also
-// assumes the given cgroup is valid.
-// @param   hierarchy   Path to the hierarchy root.
-// @param   cgroup      Path to the cgroup relative to the hierarchy root.
-// @param   recursive   Create nest cgroup structure
-// @return  Some if the operation succeeds.
-//          Error if the operation fails.
-static Try<Nothing> create(
-    const string& hierarchy,
-    const string& cgroup,
-    bool recursive)
-{
-  string path = path::join(hierarchy, cgroup);
-  Try<Nothing> mkdir = os::mkdir(path, recursive);
-  if (mkdir.isError()) {
-    return Error(
-        "Failed to create directory '" + path + "': " + mkdir.error());
-  }
-
-  // Now clone 'cpuset.cpus' and 'cpuset.mems' if the 'cpuset'
-  // subsystem is attached to the hierarchy.
-  Try<set<string>> attached = cgroups::subsystems(hierarchy);
-  if (attached.isError()) {
-    return Error(
-        "Failed to determine if hierarchy '" + hierarchy +
-        "' has the 'cpuset' subsystem attached: " + attached.error());
-  } else if (attached.get().count("cpuset") > 0) {
-    string parent = Path(path::join("/", cgroup)).dirname();
-    return cloneCpusetCpusMems(hierarchy, parent, cgroup);
-  }
-
-  return Nothing();
-}
-
-
-// Remove a cgroup in a given hierarchy. To remove a cgroup, one needs
-// to remove the corresponding directory in the cgroups virtual file
-// system. A cgroup cannot be removed if it has processes or
-// sub-cgroups inside. This function does nothing but tries to remove
-// the corresponding directory of the given cgroup. It will return
-// error if the remove operation fails because it has either processes
-// or sub-cgroups inside.
-// @param   hierarchy   Path to the hierarchy root.
-// @param   cgroup      Path to the cgroup relative to the hierarchy root.
-// @return  Some if the operation succeeds.
-//          Error if the operation fails.
-static Try<Nothing> remove(const string& hierarchy, const string& cgroup)
-{
-  string path = path::join(hierarchy, cgroup);
-
-  // Do NOT recursively remove cgroups.
-  Try<Nothing> rmdir = os::rmdir(path, false);
-
-  if (rmdir.isError()) {
-    return Error(
-        "Failed to remove cgroup '" + path + "': " + rmdir.error());
-  }
-
-  return rmdir;
-}
-
-
-// Read a control file. Control files are the gateway to monitor and
-// control cgroups. This function assumes the cgroups virtual file
-// systems are properly mounted on the given hierarchy, and the given
-// cgroup has been already created properly. The given control file
-// name should also be valid.
-// @param   hierarchy   Path to the hierarchy root.
-// @param   cgroup      Path to the cgroup relative to the hierarchy root.
-// @param   control     Name of the control file.
-// @return  The value read from the control file.
-static Try<string> read(
-    const string& hierarchy,
-    const string& cgroup,
-    const string& control)
-{
-  string path = path::join(hierarchy, cgroup, control);
-
-  // TODO(benh): Use os::read. Note that we do not use os::read
-  // currently because it cannot correctly read /proc or cgroups
-  // control files since lseek (in os::read) will return error.
-  ifstream file(path.c_str());
-
-  if (!file.is_open()) {
-    return Error("Failed to open file " + path);
-  }
-
-  ostringstream ss;
-  ss << file.rdbuf();
-
-  if (file.fail()) {
-    // TODO(jieyu): Does ifstream actually set errno?
-    return ErrnoError();
-  }
-
-  return ss.str();
-}
-
-
-// Write a control file.
-// @param   hierarchy   Path to the hierarchy root.
-// @param   cgroup      Path to the cgroup relative to the hierarchy root.
-// @param   control     Name of the control file.
-// @param   value       Value to be written.
-// @return  Some if the operation succeeds.
-//          Error if the operation fails.
-static Try<Nothing> write(
-    const string& hierarchy,
-    const string& cgroup,
-    const string& control,
-    const string& value)
-{
-  string path = path::join(hierarchy, cgroup, control);
-  ofstream file(path.c_str());
-
-  if (!file.is_open()) {
-    return Error("Failed to open file " + path);
-  }
-
-  // NOTE: cgroups convention does not append a endln!
-  // Recent kernels will cause operations to fail if 'endl' is
-  // appended to the control file.
-  file << value;
-
-  if (file.fail()) {
-    // TODO(jieyu): Does ofstream actually set errno?
-    return ErrnoError();
-  }
-
-  return Nothing();
-}
-
 } // namespace internal {
 
 
@@ -429,7 +288,7 @@ Try<string> prepare(
   if (hierarchy.isError()) {
     return Error(
         "Failed to determine the hierarchy where the subsystem " +
-        subsystem + " is attached");
+        subsystem + " is attached: " + hierarchy.error());
   }
 
   if (hierarchy.isNone()) {
@@ -462,15 +321,7 @@ Try<string> prepare(
   CHECK_SOME(hierarchy);
 
   // Create the cgroup if it doesn't exist.
-  Try<bool> exists = cgroups::exists(hierarchy.get(), cgroup);
-  if (exists.isError()) {
-    return Error(
-        "Failed to check existence of root cgroup " +
-        path::join(hierarchy.get(), cgroup) +
-        ": " + exists.error());
-  }
-
-  if (!exists.get()) {
+  if (!cgroups::exists(hierarchy.get(), cgroup)) {
     // No cgroup exists, create it.
     Try<Nothing> create = cgroups::create(hierarchy.get(), cgroup, true);
     if (create.isError()) {
@@ -481,45 +332,14 @@ Try<string> prepare(
     }
   }
 
-  // Test for nested cgroup support.
-  // TODO(jieyu): Consider doing this test only once.
-  const string& testCgroup = path::join(cgroup, "test");
-
-  // Create a nested test cgroup if it doesn't exist.
-  exists = cgroups::exists(hierarchy.get(), testCgroup);
-  if (exists.isError()) {
-    return Error(
-        "Failed to check existence of the nested test cgroup " +
-        path::join(hierarchy.get(), testCgroup) +
-        ": " + exists.error());
-  }
-
-  if (!exists.get()) {
-    // Make sure this kernel supports creating nested cgroups.
-    Try<Nothing> create = cgroups::create(hierarchy.get(), testCgroup);
-    if (create.isError()) {
-      return Error(
-          "Your kernel might be too old to support nested cgroup: " +
-          create.error());
-    }
-  }
-
-  // Remove the nested 'test' cgroup.
-  Try<Nothing> remove = cgroups::remove(hierarchy.get(), testCgroup);
-  if (remove.isError()) {
-    return Error("Failed to remove the nested test cgroup: " + remove.error());
-  }
-
   return hierarchy.get();
 }
 
 
-// Returns some error string if either (a) hierarchy is not mounted,
-// (b) cgroup does not exist, or (c) control file does not exist.
-static Option<Error> verify(
+Try<Nothing> verify(
     const string& hierarchy,
-    const string& cgroup = "",
-    const string& control = "")
+    const string& cgroup,
+    const string& control)
 {
   Try<bool> mounted = cgroups::mounted(hierarchy);
   if (mounted.isError()) {
@@ -543,7 +363,7 @@ static Option<Error> verify(
     }
   }
 
-  return None();
+  return Nothing();
 }
 
 
@@ -562,7 +382,7 @@ Try<set<string>> hierarchies()
   }
 
   set<string> results;
-  foreach (const fs::MountTable::Entry& entry, table.get().entries) {
+  foreach (const fs::MountTable::Entry& entry, table->entries) {
     if (entry.type == "cgroup") {
       Result<string> realpath = os::realpath(entry.dir);
       if (!realpath.isSome()) {
@@ -698,7 +518,7 @@ Try<set<string>> subsystems(const string& hierarchy)
 
   // Check if hierarchy is a mount point of type cgroup.
   Option<fs::MountTable::Entry> hierarchyEntry;
-  foreach (const fs::MountTable::Entry& entry, table.get().entries) {
+  foreach (const fs::MountTable::Entry& entry, table->entries) {
     if (entry.type == "cgroup") {
       Result<string> dirAbsPath = os::realpath(entry.dir);
       if (!dirAbsPath.isSome()) {
@@ -733,7 +553,7 @@ Try<set<string>> subsystems(const string& hierarchy)
 
   set<string> result;
   foreach (const string& name, names.get()) {
-    if (hierarchyEntry.get().hasOption(name)) {
+    if (hierarchyEntry->hasOption(name)) {
       result.insert(name);
     }
   }
@@ -762,12 +582,7 @@ Try<Nothing> mount(const string& hierarchy, const string& subsystems, int retry)
 
 Try<Nothing> unmount(const string& hierarchy)
 {
-  Option<Error> error = verify(hierarchy);
-  if (error.isSome()) {
-    return error.get();
-  }
-
-  Try<Nothing> unmount = internal::unmount(hierarchy);
+  Try<Nothing> unmount = fs::unmount(hierarchy);
   if (unmount.isError()) {
     return unmount;
   }
@@ -804,7 +619,7 @@ Try<bool> mounted(const string& hierarchy, const string& subsystems)
         "Failed to get mounted hierarchies: " + hierarchies.error());
   }
 
-  if (hierarchies.get().count(realpath.get()) == 0) {
+  if (hierarchies->count(realpath.get()) == 0) {
     return false;
   }
 
@@ -817,7 +632,7 @@ Try<bool> mounted(const string& hierarchy, const string& subsystems)
   }
 
   foreach (const string& subsystem, strings::tokenize(subsystems, ",")) {
-    if (attached.get().count(subsystem) == 0) {
+    if (attached->count(subsystem) == 0) {
       return false;
     }
   }
@@ -831,53 +646,52 @@ Try<Nothing> create(
     const string& cgroup,
     bool recursive)
 {
-  Option<Error> error = verify(hierarchy);
-  if (error.isSome()) {
-    return error.get();
+  string path = path::join(hierarchy, cgroup);
+  Try<Nothing> mkdir = os::mkdir(path, recursive);
+  if (mkdir.isError()) {
+    return Error(
+        "Failed to create directory '" + path + "': " + mkdir.error());
   }
 
-  return internal::create(hierarchy, cgroup, recursive);
+  // Now clone 'cpuset.cpus' and 'cpuset.mems' if the 'cpuset'
+  // subsystem is attached to the hierarchy.
+  Try<set<string>> attached = cgroups::subsystems(hierarchy);
+  if (attached.isError()) {
+    return Error(
+        "Failed to determine if hierarchy '" + hierarchy +
+        "' has the 'cpuset' subsystem attached: " + attached.error());
+  } else if (attached->count("cpuset") > 0) {
+    string parent = Path(path::join("/", cgroup)).dirname();
+    return internal::cloneCpusetCpusMems(hierarchy, parent, cgroup);
+  }
+
+  return Nothing();
 }
 
 
 Try<Nothing> remove(const string& hierarchy, const string& cgroup)
 {
-  Option<Error> error = verify(hierarchy, cgroup);
-  if (error.isSome()) {
-    return error.get();
+  string path = path::join(hierarchy, cgroup);
+
+  // Do NOT recursively remove cgroups.
+  Try<Nothing> rmdir = os::rmdir(path, false);
+  if (rmdir.isError()) {
+    return Error(
+        "Failed to remove cgroup '" + path + "': " + rmdir.error());
   }
 
-  Try<vector<string>> cgroups = cgroups::get(hierarchy, cgroup);
-  if (cgroups.isError()) {
-    return Error("Failed to get nested cgroups: " + cgroups.error());
-  }
-
-  if (!cgroups.get().empty()) {
-    return Error("Nested cgroups exist");
-  }
-
-  return internal::remove(hierarchy, cgroup);
+  return rmdir;
 }
 
 
-Try<bool> exists(const string& hierarchy, const string& cgroup)
+bool exists(const string& hierarchy, const string& cgroup)
 {
-  Option<Error> error = verify(hierarchy);
-  if (error.isSome()) {
-    return error.get();
-  }
-
   return os::exists(path::join(hierarchy, cgroup));
 }
 
 
 Try<vector<string>> get(const string& hierarchy, const string& cgroup)
 {
-  Option<Error> error = verify(hierarchy, cgroup);
-  if (error.isSome()) {
-    return error.get();
-  }
-
   Result<string> hierarchyAbsPath = os::realpath(hierarchy);
   if (!hierarchyAbsPath.isSome()) {
     return Error(
@@ -897,7 +711,7 @@ Try<vector<string>> get(const string& hierarchy, const string& cgroup)
          : "No such file or directory"));
   }
 
-  char* paths[] = { const_cast<char*>(destAbsPath.get().c_str()), nullptr };
+  char* paths[] = {const_cast<char*>(destAbsPath->c_str()), nullptr};
 
   FTS* tree = fts_open(paths, FTS_NOCHDIR, nullptr);
   if (tree == nullptr) {
@@ -914,7 +728,7 @@ Try<vector<string>> get(const string& hierarchy, const string& cgroup)
     // FTS_DP indicates a directory being visited in postorder.
     if (node->fts_level > 0 && node->fts_info & FTS_DP) {
       string path =
-        strings::trim(node->fts_path + hierarchyAbsPath.get().length(), "/");
+        strings::trim(node->fts_path + hierarchyAbsPath->length(), "/");
       cgroups.push_back(path);
     }
   }
@@ -939,11 +753,6 @@ Try<Nothing> kill(
     const string& cgroup,
     int signal)
 {
-  Option<Error> error = verify(hierarchy, cgroup);
-  if (error.isSome()) {
-    return error.get();
-  }
-
   Try<set<pid_t>> pids = processes(hierarchy, cgroup);
   if (pids.isError()) {
     return Error("Failed to get processes of cgroup: " + pids.error());
@@ -971,12 +780,8 @@ Try<string> read(
     const string& cgroup,
     const string& control)
 {
-  Option<Error> error = verify(hierarchy, cgroup, control);
-  if (error.isSome()) {
-    return error.get();
-  }
-
-  return internal::read(hierarchy, cgroup, control);
+  string path = path::join(hierarchy, cgroup, control);
+  return os::read(path);
 }
 
 
@@ -986,25 +791,16 @@ Try<Nothing> write(
     const string& control,
     const string& value)
 {
-  Option<Error> error = verify(hierarchy, cgroup, control);
-  if (error.isSome()) {
-    return error.get();
-  }
-
-  return internal::write(hierarchy, cgroup, control, value);
+  string path = path::join(hierarchy, cgroup, control);
+  return os::write(path, value);
 }
 
 
-Try<bool> exists(
+bool exists(
     const string& hierarchy,
     const string& cgroup,
     const string& control)
 {
-  Option<Error> error = verify(hierarchy, cgroup);
-  if (error.isSome()) {
-    return error.get();
-  }
-
   return os::exists(path::join(hierarchy, cgroup, control));
 }
 
@@ -1070,6 +866,28 @@ Try<set<pid_t>> threads(const string& hierarchy, const string& cgroup)
 Try<Nothing> assign(const string& hierarchy, const string& cgroup, pid_t pid)
 {
   return cgroups::write(hierarchy, cgroup, "cgroup.procs", stringify(pid));
+}
+
+
+Try<Nothing> isolate(
+    const string& hierarchy,
+    const string& cgroup,
+    pid_t pid)
+{
+  // Create cgroup if necessary.
+  if (!cgroups::exists(hierarchy, cgroup)) {
+    Try<Nothing> create = cgroups::create(hierarchy, cgroup, true);
+    if (create.isError()) {
+      return Error("Failed to create cgroup: " + create.error());
+    }
+  }
+
+  Try<Nothing> assign = cgroups::assign(hierarchy, cgroup, pid);
+  if (assign.isError()) {
+    return Error("Failed to assign process to cgroup: " + assign.error());
+  }
+
+  return Nothing();
 }
 
 
@@ -1157,8 +975,13 @@ static Try<int> registerNotifier(
   if (args.isSome()) {
     out << " " << args.get();
   }
-  Try<Nothing> write = internal::write(
-      hierarchy, cgroup, "cgroup.event_control", out.str());
+
+  Try<Nothing> write = cgroups::write(
+      hierarchy,
+      cgroup,
+      "cgroup.event_control",
+      out.str());
+
   if (write.isError()) {
     os::close(efd);
     os::close(cfd.get());
@@ -1192,20 +1015,21 @@ public:
            const string& _cgroup,
            const string& _control,
            const Option<string>& _args)
-    : hierarchy(_hierarchy),
+    : ProcessBase(ID::generate("cgroups-listener")),
+      hierarchy(_hierarchy),
       cgroup(_cgroup),
       control(_control),
       args(_args),
       data(0) {}
 
-  virtual ~Listener() {}
+  ~Listener() override {}
 
   // Waits for the next event to occur, at which point the future
   // becomes ready. Returns a failure if error occurs. If any previous
   // call to 'listen' returns a failure, all subsequent calls to
   // 'listen' will return failures as well (in that case, the user
   // should consider terminate this process and create a new one if
-  // he/she still wants to monitor the events).
+  // they still want to monitor the events).
   // TODO(chzhcn): If the user discards the returned future, currently
   // we do not do anything. Consider a better discard semantics here.
   Future<uint64_t> listen()
@@ -1223,14 +1047,14 @@ public:
       // uint64_t) from the event file, it indicates that an event has
       // occurred.
       reading = io::read(eventfd.get(), &data, sizeof(data));
-      reading.onAny(defer(self(), &Listener::_listen));
+      reading->onAny(defer(self(), &Listener::_listen, lambda::_1));
     }
 
     return promise.get()->future();
   }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // Register an eventfd "notifier" for the given control.
     Try<int> fd = registerNotifier(hierarchy, cgroup, control, args);
@@ -1242,17 +1066,26 @@ protected:
     }
   }
 
-  virtual void finalize()
+  void finalize() override
   {
     // Discard the nonblocking read.
-    reading.discard();
+    if (reading.isSome()) {
+      reading->discard();
+    }
 
-    // Unregister the eventfd if needed.
+    // Unregister the eventfd if needed. If there's a pending read,
+    // we must wait for it to finish.
     if (eventfd.isSome()) {
-      Try<Nothing> unregister = unregisterNotifier(eventfd.get());
-      if (unregister.isError()) {
-        LOG(ERROR) << "Failed to unregister eventfd: " << unregister.error();
-      }
+      int fd = eventfd.get();
+
+      reading.getOrElse(Future<size_t>(0))
+        .onAny([fd]() {
+          Try<Nothing> unregister = unregisterNotifier(fd);
+          if (unregister.isError()) {
+            LOG(ERROR) << "Failed to unregister eventfd '" << fd << "'"
+                       << ": " << unregister.error();
+          }
+      });
     }
 
     // TODO(chzhcn): Fail our promise only after 'reading' has
@@ -1265,11 +1098,15 @@ protected:
 private:
   // This function is called when the nonblocking read on the eventfd has
   // result, either because the event has happened, or an error has occurred.
-  void _listen()
+  void _listen(Future<size_t> read)
   {
     CHECK_SOME(promise);
+    CHECK_SOME(reading);
 
-    if (reading.isReady() && reading.get() == sizeof(data)) {
+    // Reset to none since we're no longer reading.
+    reading = None();
+
+    if (read.isReady() && read.get() == sizeof(data)) {
       promise.get()->set(data);
 
       // After fulfilling the promise, reset to get ready for the next one.
@@ -1277,18 +1114,18 @@ private:
       return;
     }
 
-    if (reading.isDiscarded()) {
+    if (read.isDiscarded()) {
       error = Error("Reading eventfd stopped unexpectedly");
-    } else if (reading.isFailed()) {
-      error = Error("Failed to read eventfd: " + reading.failure());
+    } else if (read.isFailed()) {
+      error = Error("Failed to read eventfd: " + read.failure());
     } else {
       error = Error("Read less than expected. Expect " +
                     stringify(sizeof(data)) + " bytes; actual " +
-                    stringify(reading.get()) + " bytes");
+                    stringify(read.get()) + " bytes");
     }
 
     // Inform failure and not listen again.
-    promise.get()->fail(error.get().message);
+    promise.get()->fail(error->message);
   }
 
   const string hierarchy;
@@ -1297,7 +1134,7 @@ private:
   const Option<string> args;
 
   Option<Owned<Promise<uint64_t>>> promise;
-  Future<size_t> reading;
+  Option<Future<size_t>> reading;
   Option<Error> error;
   Option<int> eventfd;
   uint64_t data;                // The data read from the eventfd last time.
@@ -1310,11 +1147,6 @@ Future<uint64_t> listen(
     const string& control,
     const Option<string>& args)
 {
-  Option<Error> error = verify(hierarchy, cgroup, control);
-  if (error.isSome()) {
-    return Failure(error.get());
-  }
-
   Listener* listener = new Listener(hierarchy, cgroup, control, args);
 
   spawn(listener, true);
@@ -1382,11 +1214,12 @@ public:
   Freezer(
       const string& _hierarchy,
       const string& _cgroup)
-    : hierarchy(_hierarchy),
+    : ProcessBase(ID::generate("cgroups-freezer")),
+      hierarchy(_hierarchy),
       cgroup(_cgroup),
       start(Clock::now()) {}
 
-  virtual ~Freezer() {}
+  ~Freezer() override {}
 
   void freeze()
   {
@@ -1450,21 +1283,14 @@ public:
   Future<Nothing> future() { return promise.future(); }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
-    Option<Error> error = verify(hierarchy, cgroup, "freezer.state");
-    if (error.isSome()) {
-      promise.fail("Invalid freezer cgroup: " + error.get().message);
-      terminate(self());
-      return;
-    }
-
     // Stop attempting to freeze/thaw if nobody cares.
     promise.future().onDiscard(lambda::bind(
           static_cast<void(*)(const UPID&, bool)>(terminate), self(), true));
   }
 
-  virtual void finalize()
+  void finalize() override
   {
     promise.discard();
   }
@@ -1482,9 +1308,11 @@ class TasksKiller : public Process<TasksKiller>
 {
 public:
   TasksKiller(const string& _hierarchy, const string& _cgroup)
-    : hierarchy(_hierarchy), cgroup(_cgroup) {}
+    : ProcessBase(ID::generate("cgroups-tasks-killer")),
+      hierarchy(_hierarchy),
+      cgroup(_cgroup) {}
 
-  virtual ~TasksKiller() {}
+  ~TasksKiller() override {}
 
   // Return a future indicating the state of the killer.
   // Failure occurs if any process in the cgroup is unable to be
@@ -1492,7 +1320,7 @@ public:
   Future<Nothing> future() { return promise.future(); }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // Stop when no one cares.
     promise.future().onDiscard(lambda::bind(
@@ -1501,7 +1329,7 @@ protected:
     killTasks();
   }
 
-  virtual void finalize()
+  void finalize() override
   {
     chain.discard();
 
@@ -1576,27 +1404,38 @@ private:
     return cgroups::freezer::thaw(hierarchy, cgroup);
   }
 
-  Future<list<Option<int>>> reap()
+  Future<vector<Option<int>>> reap()
   {
     // Wait until we've reaped all processes.
     return collect(statuses);
   }
 
-  void finished(const Future<list<Option<int>>>& future)
+  void finished(const Future<vector<Option<int>>>& future)
   {
     if (future.isDiscarded()) {
       promise.fail("Unexpected discard of future");
       terminate(self());
       return;
     } else if (future.isFailed()) {
-      promise.fail(future.failure());
+      // If the `cgroup` still exists in the hierarchy, treat this as
+      // an error; otherwise, treat this as a success since the `cgroup`
+      // has actually been cleaned up.
+      if (os::exists(path::join(hierarchy, cgroup))) {
+        promise.fail(future.failure());
+      } else {
+        promise.set(Nothing());
+      }
+
       terminate(self());
       return;
     }
 
     // Verify the cgroup is now empty.
     Try<set<pid_t>> processes = cgroups::processes(hierarchy, cgroup);
-    if (processes.isError() || !processes.get().empty()) {
+
+    // If the `cgroup` is already removed, treat this as a success.
+    if ((processes.isError() || !processes->empty()) &&
+        os::exists(path::join(hierarchy, cgroup))) {
       promise.fail("Failed to kill all processes in cgroup: " +
                    (processes.isError() ? processes.error()
                                         : "processes remain"));
@@ -1611,8 +1450,8 @@ private:
   const string hierarchy;
   const string cgroup;
   Promise<Nothing> promise;
-  list<Future<Option<int>>> statuses; // List of statuses for processes.
-  Future<list<Option<int>>> chain; // Used to discard all operations.
+  vector<Future<Option<int>>> statuses; // List of statuses for processes.
+  Future<vector<Option<int>>> chain; // Used to discard all operations.
 };
 
 
@@ -1621,16 +1460,18 @@ class Destroyer : public Process<Destroyer>
 {
 public:
   Destroyer(const string& _hierarchy, const vector<string>& _cgroups)
-    : hierarchy(_hierarchy), cgroups(_cgroups) {}
+    : ProcessBase(ID::generate("cgroups-destroyer")),
+      hierarchy(_hierarchy),
+      cgroups(_cgroups) {}
 
-  virtual ~Destroyer() {}
+  ~Destroyer() override {}
 
   // Return a future indicating the state of the destroyer.
   // Failure occurs if any cgroup fails to be destroyed.
   Future<Nothing> future() { return promise.future(); }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // Stop when no one cares.
     promise.future().onDiscard(lambda::bind(
@@ -1649,14 +1490,14 @@ protected:
       .onAny(defer(self(), &Destroyer::killed, lambda::_1));
   }
 
-  virtual void finalize()
+  void finalize() override
   {
     discard(killers);
     promise.discard();
   }
 
 private:
-  void killed(const Future<list<Nothing>>& kill)
+  void killed(const Future<vector<Nothing>>& kill)
   {
     if (kill.isReady()) {
       remove();
@@ -1673,12 +1514,17 @@ private:
   void remove()
   {
     foreach (const string& cgroup, cgroups) {
-      Try<Nothing> remove = internal::remove(hierarchy, cgroup);
+      Try<Nothing> remove = cgroups::remove(hierarchy, cgroup);
       if (remove.isError()) {
-        promise.fail(
-            "Failed to remove cgroup '" + cgroup + "': " + remove.error());
-        terminate(self());
-        return;
+        // If the `cgroup` still exists in the hierarchy, treat this as
+        // an error; otherwise, treat this as a success since the `cgroup`
+        // has actually been cleaned up.
+        if (os::exists(path::join(hierarchy, cgroup))) {
+          promise.fail(
+              "Failed to remove cgroup '" + cgroup + "': " + remove.error());
+          terminate(self());
+          return;
+        }
       }
     }
 
@@ -1691,7 +1537,7 @@ private:
   Promise<Nothing> promise;
 
   // The killer processes used to atomically kill tasks in each cgroup.
-  list<Future<Nothing>> killers;
+  vector<Future<Nothing>> killers;
 };
 
 } // namespace internal {
@@ -1716,8 +1562,7 @@ Future<Nothing> destroy(const string& hierarchy, const string& cgroup)
   }
 
   // If the freezer subsystem is available, destroy the cgroups.
-  Option<Error> error = verify(hierarchy, cgroup, "freezer.state");
-  if (error.isNone()) {
+  if (cgroups::exists(hierarchy, cgroup, "freezer.state")) {
     internal::Destroyer* destroyer =
       new internal::Destroyer(hierarchy, candidates);
     Future<Nothing> future = destroyer->future();
@@ -1728,7 +1573,12 @@ Future<Nothing> destroy(const string& hierarchy, const string& cgroup)
     foreach (const string& cgroup, candidates) {
       Try<Nothing> remove = cgroups::remove(hierarchy, cgroup);
       if (remove.isError()) {
-        return Failure(remove.error());
+        // If the `cgroup` still exists in the hierarchy, treat this as
+        // an error; otherwise, treat this as a success since the `cgroup`
+        // has actually been cleaned up.
+        if (os::exists(path::join(hierarchy, cgroup))) {
+          return Failure(remove.error());
+        }
       }
     }
   }
@@ -1887,7 +1737,10 @@ Result<string> cgroup(pid_t pid, const string& subsystem)
   foreach (const string& line, strings::tokenize(read.get(), "\n")) {
     vector<string> tokens = strings::tokenize(line, ":");
 
-    if (tokens.size() != 3) {
+    // The second field is empty for cgroups v2 hierarchy.
+    if (tokens.size() == 2) {
+      continue;
+    } else if (tokens.size() != 3) {
       return Error("Unexpected format in " + path);
     }
 
@@ -1902,6 +1755,366 @@ Result<string> cgroup(pid_t pid, const string& subsystem)
 }
 
 } // namespace internal {
+
+
+namespace blkio {
+
+Result<string> cgroup(pid_t pid)
+{
+  return internal::cgroup(pid, "blkio");
+}
+
+
+unsigned int Device::getMajor() const
+{
+  return major(value);
+}
+
+
+unsigned int Device::getMinor() const
+{
+  return minor(value);
+}
+
+
+Try<Device> Device::parse(const string& s)
+{
+  vector<string> device = strings::tokenize(s, ":");
+  if (device.size() != 2) {
+    return Error("Invalid major:minor device number: '" + s + "'");
+  }
+
+  Try<unsigned int> major = numify<unsigned int>(device[0]);
+  if (major.isError()) {
+    return Error("Invalid device major number: '" + device[0] + "'");
+  }
+
+  Try<unsigned int> minor = numify<unsigned int>(device[1]);
+  if (minor.isError()) {
+    return Error("Invalid device minor number: '" + device[1] + "'");
+  }
+
+  return Device(makedev(major.get(), minor.get()));
+}
+
+
+static bool isOperation(const string& s)
+{
+  return (s == "Total" ||
+          s == "Read" ||
+          s == "Write" ||
+          s == "Sync" ||
+          s == "Async" ||
+          s == "Discard");
+}
+
+
+static Try<Operation> parseOperation(const string& s)
+{
+  if (s == "Total") {
+    return Operation::TOTAL;
+  } else if (s == "Read") {
+    return Operation::READ;
+  } else if (s == "Write") {
+    return Operation::WRITE;
+  } else if (s == "Sync") {
+    return Operation::SYNC;
+  } else if (s == "Async") {
+    return Operation::ASYNC;
+  } else if (s == "Discard") {
+    return Operation::DISCARD;
+  }
+
+  return Error("Invalid Operation value: '" + s + "'");
+}
+
+
+Try<Value> Value::parse(const string& s)
+{
+  vector<string> tokens = strings::tokenize(s, " ");
+  if (tokens.size() == 1) {
+    Try<uint64_t> value = numify<uint64_t>(tokens[0]);
+    if (value.isError()) {
+      return Error("Value is not a number: '" + tokens[0] + "'");
+    }
+
+    return Value{None(), None(), value.get()};
+  }
+
+  Option<Device> device;
+  int offset = 0;
+
+  if (tokens.size() == 3) {
+    Try<Device> dev = Device::parse(tokens[0]);
+    if (dev.isError()) {
+      return Error(dev.error());
+    }
+
+    device = dev.get();
+    offset++;
+  } else if (tokens.size() != 2) {
+    return Error("Invalid blkio value: '" + s + "'");
+  }
+
+  if (!isOperation(tokens[offset])) {
+    Try<Device> dev = Device::parse(tokens[offset]);
+    if (dev.isError()) {
+      return Error(dev.error());
+    }
+
+    Try<uint64_t> value = numify<uint64_t>(tokens[offset + 1]);
+    if (value.isError()) {
+      return Error("Value is not a number: '" + tokens[offset + 1] + "'");
+    }
+
+    return Value{dev.get(), None(), value.get()};
+  }
+
+  Try<Operation> operation = parseOperation(tokens[offset]);
+  if (operation.isError()) {
+    return Error(operation.error());
+  }
+
+  Try<uint64_t> value = numify<uint64_t>(tokens[offset + 1]);
+  if (value.isError()) {
+    return Error("Value is not a number: " + value.error());
+  }
+
+  return Value{device, operation.get(), value.get()};
+}
+
+
+static Try<vector<Value>> readEntries(
+    const string& hierarchy,
+    const string& cgroup,
+    const string& control)
+{
+  Try<string> read = cgroups::read(hierarchy, cgroup, control);
+  if (read.isError()) {
+    return Error("Failed to read from '" + control + "': " + read.error());
+  }
+
+  vector<Value> entries;
+
+  foreach (const string& s, strings::tokenize(read.get(), "\n")) {
+    Try<Value> value = Value::parse(s);
+    if (value.isError()) {
+      return Error("Failed to parse blkio value '" + s + "' from '" +
+                   control + "': " + value.error());
+    }
+
+    entries.push_back(value.get());
+  }
+
+  return entries;
+}
+
+
+namespace cfq {
+
+Try<vector<Value>> time(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.time");
+}
+
+
+Try<vector<Value>> time_recursive(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.time_recursive");
+}
+
+
+Try<vector<Value>> sectors(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.sectors");
+}
+
+
+Try<vector<Value>> sectors_recursive(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.sectors_recursive");
+}
+
+
+Try<vector<Value>> io_merged(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.io_merged");
+}
+
+
+Try<vector<Value>> io_merged_recursive(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.io_merged_recursive");
+}
+
+
+Try<vector<Value>> io_queued(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.io_queued");
+}
+
+
+Try<vector<Value>> io_queued_recursive(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.io_queued_recursive");
+}
+
+
+Try<vector<Value>> io_service_bytes(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.io_service_bytes");
+}
+
+
+Try<vector<Value>> io_service_bytes_recursive(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.io_service_bytes_recursive");
+}
+
+
+Try<vector<Value>> io_service_time(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.io_service_time");
+}
+
+
+Try<vector<Value>> io_service_time_recursive(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.io_service_time_recursive");
+}
+
+
+Try<vector<Value>> io_serviced(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.io_serviced");
+}
+
+
+Try<vector<Value>> io_serviced_recursive(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.io_serviced_recursive");
+}
+
+
+Try<vector<Value>> io_wait_time(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.io_wait_time");
+}
+
+
+Try<vector<Value>> io_wait_time_recursive(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.io_wait_time_recursive");
+}
+
+} // namespace cfq {
+
+
+namespace throttle {
+
+Try<vector<Value>> io_service_bytes(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.throttle.io_service_bytes");
+}
+
+
+Try<vector<Value>> io_serviced(
+    const string& hierarchy,
+    const string& cgroup)
+{
+  return readEntries(
+      hierarchy,
+      cgroup,
+      "blkio.throttle.io_serviced");
+}
+
+} // namespace throttle {
+} // namespace blkio {
 
 
 namespace cpu {
@@ -2004,7 +2217,7 @@ Try<Stats> stat(
     return Error(stats.error());
   }
 
-  if (!stats.get().contains("user") || !stats.get().contains("system")) {
+  if (!stats->contains("user") || !stats->contains("system")) {
     return Error("Failed to get user/system value from cpuacct.stat");
   }
 
@@ -2016,8 +2229,7 @@ Try<Stats> stat(
     return ErrnoError("Failed to get _SC_CLK_TCK");
   }
 
-  Try<Duration> user =
-    Duration::create((double) stats.get().at("user") / userTicks);
+  Try<Duration> user = Duration::create((double)stats->at("user") / userTicks);
 
   if (user.isError()) {
     return Error(
@@ -2025,7 +2237,7 @@ Try<Stats> stat(
   }
 
   Try<Duration> system =
-    Duration::create((double) stats.get().at("system") / userTicks);
+    Duration::create((double)stats->at("system") / userTicks);
 
   if (system.isError()) {
     return Error(
@@ -2075,16 +2287,7 @@ Result<Bytes> memsw_limit_in_bytes(
     const string& hierarchy,
     const string& cgroup)
 {
-  Try<bool> exists = cgroups::exists(
-      hierarchy, cgroup, "memory.memsw.limit_in_bytes");
-
-  if (exists.isError()) {
-    return Error(
-        "Could not check for existence of 'memory.memsw.limit_in_bytes': " +
-        exists.error());
-  }
-
-  if (!exists.get()) {
+  if (!cgroups::exists(hierarchy, cgroup, "memory.memsw.limit_in_bytes")) {
     return None();
   }
 
@@ -2110,16 +2313,7 @@ Try<bool> memsw_limit_in_bytes(
     const string& cgroup,
     const Bytes& limit)
 {
-  Try<bool> exists = cgroups::exists(
-      hierarchy, cgroup, "memory.memsw.limit_in_bytes");
-
-  if (exists.isError()) {
-    return Error(
-        "Could not check for existence of 'memory.memsw.limit_in_bytes': " +
-        exists.error());
-  }
-
-  if (!exists.get()) {
+  if (!cgroups::exists(hierarchy, cgroup, "memory.memsw.limit_in_bytes")) {
     return false;
   }
 
@@ -2215,15 +2409,11 @@ namespace killer {
 
 Try<bool> enabled(const string& hierarchy, const string& cgroup)
 {
-  Try<bool> exists = cgroups::exists(hierarchy, cgroup, "memory.oom_control");
-
-  if (exists.isError() || !exists.get()) {
-    return Error("Could not find 'memory.oom_control' control file: " +
-                 (exists.isError() ? exists.error() : "does not exist"));
+  if (!cgroups::exists(hierarchy, cgroup, "memory.oom_control")) {
+    return Error("Could not find 'memory.oom_control' control file");
   }
 
   Try<string> read = cgroups::read(hierarchy, cgroup, "memory.oom_control");
-
   if (read.isError()) {
     return Error("Could not read 'memory.oom_control' control file: " +
                  read.error());
@@ -2313,7 +2503,8 @@ public:
   CounterProcess(const string& hierarchy,
                  const string& cgroup,
                  Level level)
-    : value_(0),
+    : ProcessBase(ID::generate("cgroups-counter")),
+      value_(0),
       error(None()),
       process(new event::Listener(
           hierarchy,
@@ -2321,7 +2512,7 @@ public:
           "memory.pressure_level",
           stringify(level))) {}
 
-  virtual ~CounterProcess() {}
+  ~CounterProcess() override {}
 
   Future<uint64_t> value()
   {
@@ -2333,13 +2524,13 @@ public:
   }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     spawn(CHECK_NOTNULL(process.get()));
     listen();
   }
 
-  virtual void finalize()
+  void finalize() override
   {
     terminate(process.get());
     wait(process.get());
@@ -2377,11 +2568,6 @@ Try<Owned<Counter>> Counter::create(
     const string& cgroup,
     Level level)
 {
-  Option<Error> error = verify(hierarchy, cgroup);
-  if (error.isSome()) {
-    return Error(error.get());
-  }
-
   return Owned<Counter>(new Counter(hierarchy, cgroup, level));
 }
 
@@ -2547,8 +2733,7 @@ Try<Entry> Entry::parse(const string& s)
   entry.selector.minor = None();
 
   if (deviceNumbers[0] != "*") {
-    Try<dev_t> major = numify<dev_t>(deviceNumbers[0]);
-
+    Try<unsigned int> major = numify<unsigned int>(deviceNumbers[0]);
     if (major.isError()) {
       return Error("Invalid format");
     }
@@ -2557,8 +2742,7 @@ Try<Entry> Entry::parse(const string& s)
   }
 
   if (deviceNumbers[1] != "*") {
-    Try<dev_t> minor = numify<dev_t>(deviceNumbers[1]);
-
+    Try<unsigned int> minor = numify<unsigned int>(deviceNumbers[1]);
     if (minor.isError()) {
       return Error("Invalid format");
     }
@@ -2740,5 +2924,15 @@ Try<Nothing> classid(
 }
 
 } // namespace net_cls {
+
+
+namespace named {
+
+Result<string> cgroup(const string& hierarchyName, pid_t pid)
+{
+  return internal::cgroup(pid, "name=" + hierarchyName);
+}
+
+} // namespace named {
 
 } // namespace cgroups {

@@ -17,11 +17,15 @@
 #ifndef __PROVISIONER_HPP__
 #define __PROVISIONER_HPP__
 
-#include <list>
+#include <vector>
 
 #include <mesos/resources.hpp>
 
+#include <mesos/appc/spec.hpp>
+
 #include <mesos/docker/v1.hpp>
+
+#include <mesos/secret/resolver.hpp>
 
 #include <mesos/slave/isolator.hpp> // For ContainerState.
 
@@ -30,6 +34,7 @@
 
 #include <process/future.hpp>
 #include <process/owned.hpp>
+#include <process/rwlock.hpp>
 
 #include <process/metrics/counter.hpp>
 #include <process/metrics/metrics.hpp>
@@ -58,6 +63,9 @@ struct ProvisionInfo
 
   // Docker v1 image manifest.
   Option<::docker::spec::v1::ImageManifest> dockerManifest;
+
+  // Appc image manifest.
+  Option<::appc::spec::ImageManifest> appcManifest;
 };
 
 
@@ -65,7 +73,9 @@ class Provisioner
 {
 public:
   // Create the provisioner based on the specified flags.
-  static Try<process::Owned<Provisioner>> create(const Flags& flags);
+  static Try<process::Owned<Provisioner>> create(
+      const Flags& flags,
+      SecretResolver* secretResolver = nullptr);
 
   // Available only for testing.
   explicit Provisioner(process::Owned<ProvisionerProcess> process);
@@ -73,26 +83,31 @@ public:
   // NOTE: Made 'virtual' for mocking and testing.
   virtual ~Provisioner();
 
-  // Recover root filesystems for containers from the run states and
-  // the orphan containers (known to the launcher but not known to the
-  // slave) detected by the launcher. This function is also
-  // responsible for cleaning up any intermediate artifacts (e.g.
-  // directories) to not leak anything.
+  // Recover root filesystems for containers from the known
+  // containers (forked by the launcher) detected by the
+  // launcher. This function is also responsible for cleaning
+  // up any intermediate artifacts (e.g. directories) to not
+  // leak anything.
   virtual process::Future<Nothing> recover(
-      const std::list<mesos::slave::ContainerState>& states,
-      const hashset<ContainerID>& orphans);
+      const hashset<ContainerID>& knownContainerIds) const;
 
   // Provision a root filesystem for the container using the specified
   // image and return the absolute path to the root filesystem.
   virtual process::Future<ProvisionInfo> provision(
       const ContainerID& containerId,
-      const Image& image);
+      const Image& image) const;
 
   // Destroy a previously provisioned root filesystem. Assumes that
   // all references (e.g., mounts, open files) to the provisioned
   // filesystem have been removed. Return false if there is no
   // provisioned root filesystem for the given container.
-  virtual process::Future<bool> destroy(const ContainerID& containerId);
+  virtual process::Future<bool> destroy(const ContainerID& containerId) const;
+
+  // Prune images in different stores. Image references in excludedImages
+  // will be passed to stores and retained in a best effort fashion.
+  // All layer paths used by active containers will not be pruned.
+  virtual process::Future<Nothing> pruneImages(
+      const std::vector<Image>& excludedImages) const;
 
 protected:
   Provisioner() {} // For creating mock object.
@@ -110,14 +125,13 @@ class ProvisionerProcess : public process::Process<ProvisionerProcess>
 {
 public:
   ProvisionerProcess(
-      const Flags& flags,
       const std::string& rootDir,
+      const std::string& defaultBackend,
       const hashmap<Image::Type, process::Owned<Store>>& stores,
       const hashmap<std::string, process::Owned<Backend>>& backends);
 
   process::Future<Nothing> recover(
-      const std::list<mesos::slave::ContainerState>& states,
-      const hashset<ContainerID>& orphans);
+      const hashset<ContainerID>& knownContainerIds);
 
   process::Future<ProvisionInfo> provision(
       const ContainerID& containerId,
@@ -125,20 +139,21 @@ public:
 
   process::Future<bool> destroy(const ContainerID& containerId);
 
+  process::Future<Nothing> pruneImages(
+      const std::vector<Image>& excludedImages);
+
 private:
   process::Future<ProvisionInfo> _provision(
       const ContainerID& containerId,
       const Image& image,
+      const std::string& backend,
       const ImageInfo& imageInfo);
 
-  process::Future<ProvisionInfo> __provision(
-      const std::string& rootfs,
-      const Image& image,
-      const ImageInfo& imageInfo);
+  process::Future<bool> _destroy(
+      const ContainerID& containerId,
+      const std::vector<process::Future<bool>>& destroys);
 
-  process::Future<bool> _destroy(const ContainerID& containerId);
-
-  const Flags flags;
+  process::Future<bool> __destroy(const ContainerID& containerId);
 
   // Absolute path to the provisioner root directory. It can be
   // derived from '--work_dir' but we keep a separate copy here
@@ -147,6 +162,13 @@ private:
   // backends are used).
   const std::string rootDir;
 
+  // The default provisioner backend, using the following logic:
+  // 1. Use `--image_provisioner_backend` if it is set.
+  // 2. Use overlayfs backend if it exists.
+  // 3. Use aufs backend if the overlayfs does not exist.
+  // 4. Use copy backend of both overlayfs and aufs do not exist.
+  const std::string defaultBackend;
+
   const hashmap<Image::Type, process::Owned<Store>> stores;
   const hashmap<std::string, process::Owned<Backend>> backends;
 
@@ -154,6 +176,15 @@ private:
   {
     // Mappings: backend -> {rootfsId, ...}
     hashmap<std::string, hashset<std::string>> rootfses;
+
+    // TODO(zhitao): Remove Option after the deprecation cycle
+    // started in 1.5.
+    Option<std::vector<std::string>> layers;
+
+    process::Promise<bool> termination;
+
+    // The container status in provisioner.
+    bool destroying = false;
   };
 
   hashmap<ContainerID, process::Owned<Info>> infos;
@@ -165,6 +196,20 @@ private:
 
     process::metrics::Counter remove_container_errors;
   } metrics;
+
+  // This `ReadWriteLock` instance is used to protect the critical
+  // section, which includes store directory and provision directory.
+  // Because `provision` and `destroy` are scoped by `containerId`,
+  // they are not expected to touch the same critical section
+  // simultaneously, so any `provision` and `destroy` can happen concurrently.
+  // This is guaranteed by Mesos containerizer, e.g., a `destroy` will always
+  // wait for a container's `provision` to finish, then do the cleanup.
+  //
+  // On the other hand, `pruneImages` needs to know all active layers from all
+  // containers, therefore it must be exclusive to other `provision`, `destroy`
+  // and `pruneImages` so that we do not prune image layers which is used by an
+  // active `provision` or `destroy`.
+  process::ReadWriteLock rwLock;
 };
 
 } // namespace slave {

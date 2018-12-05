@@ -36,7 +36,8 @@ namespace contender {
 
 Try<MasterContender*> MasterContender::create(
     const Option<string>& zk_,
-    const Option<string>& masterContenderModule_)
+    const Option<string>& masterContenderModule_,
+    const Option<Duration>& zkSessionTimeout_)
 {
   if (masterContenderModule_.isSome()) {
     return modules::ModuleManager::create<MasterContender>(
@@ -47,18 +48,20 @@ Try<MasterContender*> MasterContender::create(
     return new StandaloneMasterContender();
   }
 
-  string zk = zk_.get();
+  const string& zk = zk_.get();
 
   if (strings::startsWith(zk, "zk://")) {
     Try<zookeeper::URL> url = zookeeper::URL::parse(zk);
     if (url.isError()) {
       return Error(url.error());
     }
-    if (url.get().path == "/") {
+    if (url->path == "/") {
       return Error(
           "Expecting a (chroot) path for ZooKeeper ('/' is not supported)");
     }
-    return new ZooKeeperMasterContender(url.get());
+    return new ZooKeeperMasterContender(
+        url.get(),
+        zkSessionTimeout_.getOrElse(MASTER_CONTENDER_ZK_SESSION_TIMEOUT));
   } else if (strings::startsWith(zk, "file://")) {
     // Load the configuration out of a file. While Mesos and related
     // programs always use <stout/flags> to process the command line
@@ -94,6 +97,6 @@ Try<MasterContender*> MasterContender::create(
 
 MasterContender::~MasterContender() {}
 
-} // namespace contender  {
+} // namespace contender {
 } // namespace master {
 } // namespace mesos {

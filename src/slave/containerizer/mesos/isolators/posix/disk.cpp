@@ -30,6 +30,7 @@
 #include <process/collect.hpp>
 #include <process/defer.hpp>
 #include <process/delay.hpp>
+#include <process/id.hpp>
 #include <process/io.hpp>
 #include <process/subprocess.hpp>
 
@@ -40,6 +41,7 @@
 #include <stout/strings.hpp>
 #include <stout/path.hpp>
 
+#include <stout/os/constants.hpp>
 #include <stout/os/exists.hpp>
 #include <stout/os/killtree.hpp>
 #include <stout/os/stat.hpp>
@@ -51,14 +53,11 @@
 namespace io = process::io;
 
 using std::deque;
-using std::list;
 using std::string;
 using std::vector;
 
 using process::Failure;
 using process::Future;
-using process::MONITOR;
-using process::NO_SETSID;
 using process::Owned;
 using process::PID;
 using process::Process;
@@ -99,17 +98,38 @@ PosixDiskIsolatorProcess::Info::PathInfo::~PathInfo()
 
 
 PosixDiskIsolatorProcess::PosixDiskIsolatorProcess(const Flags& _flags)
-  : flags(_flags), collector(flags.container_disk_watch_interval) {}
+  : ProcessBase(process::ID::generate("posix-disk-isolator")),
+    flags(_flags),
+    collector(flags.container_disk_watch_interval) {}
 
 
 PosixDiskIsolatorProcess::~PosixDiskIsolatorProcess() {}
 
 
+bool PosixDiskIsolatorProcess::supportsNesting()
+{
+  return true;
+}
+
+
+bool PosixDiskIsolatorProcess::supportsStandalone()
+{
+  return true;
+}
+
+
 Future<Nothing> PosixDiskIsolatorProcess::recover(
-    const list<ContainerState>& states,
+    const vector<ContainerState>& states,
     const hashset<ContainerID>& orphans)
 {
   foreach (const ContainerState& state, states) {
+    // If this is a nested container, we do not need to create an Info
+    // struct for it because we only perform disk space check for the
+    // top level container.
+    if (state.container_id().has_parent()) {
+      continue;
+    }
+
     // Since we checkpoint the executor after we create its working
     // directory, the working directory should definitely exist.
     CHECK(os::exists(state.directory()))
@@ -126,6 +146,13 @@ Future<Option<ContainerLaunchInfo>> PosixDiskIsolatorProcess::prepare(
     const ContainerID& containerId,
     const ContainerConfig& containerConfig)
 {
+  // If this is a nested container, we do not need to create an Info
+  // struct for it because we only perform disk space check for the
+  // top level container.
+  if (containerId.has_parent()) {
+    return None();
+  }
+
   if (infos.contains(containerId)) {
     return Failure("Container has already been prepared");
   }
@@ -140,6 +167,10 @@ Future<Nothing> PosixDiskIsolatorProcess::isolate(
     const ContainerID& containerId,
     pid_t pid)
 {
+  if (containerId.has_parent()) {
+    return Nothing();
+  }
+
   if (!infos.contains(containerId)) {
     return Failure("Unknown container");
   }
@@ -151,6 +182,13 @@ Future<Nothing> PosixDiskIsolatorProcess::isolate(
 Future<ContainerLimitation> PosixDiskIsolatorProcess::watch(
     const ContainerID& containerId)
 {
+  // Since we are not doing disk space check for nested containers
+  // currently, we simply return a pending future here, indicating
+  // that the limit for the nested container will not be reached.
+  if (containerId.has_parent()) {
+    return Future<ContainerLimitation>();
+  }
+
   if (!infos.contains(containerId)) {
     return Failure("Unknown container");
   }
@@ -163,6 +201,10 @@ Future<Nothing> PosixDiskIsolatorProcess::update(
     const ContainerID& containerId,
     const Resources& resources)
 {
+  if (containerId.has_parent()) {
+    return Failure("Not supported for nested containers");
+  }
+
   if (!infos.contains(containerId)) {
     LOG(WARNING) << "Ignoring update for unknown container " << containerId;
     return Nothing();
@@ -224,6 +266,8 @@ Future<Nothing> PosixDiskIsolatorProcess::update(
   // Remove paths that we no longer interested in.
   foreach (const string& path, info->paths.keys()) {
     if (!quotas.contains(path)) {
+      // Cancel the usage collection as we are no longer interested.
+      info->paths[path].usage.discard();
       info->paths.erase(path);
     }
   }
@@ -241,6 +285,11 @@ Future<Bytes> PosixDiskIsolatorProcess::collect(
   const Owned<Info>& info = infos[containerId];
 
   // Volume paths to exclude from sandbox disk usage calculation.
+  //
+  // TODO(jieyu): The 'excludes' list might change when a new
+  // persistent volume is added to the list. That might result in the
+  // 'du' process to incorrectly include the disk usage of the newly
+  // added persistent volume to the usage of the sandbox.
   vector<string> excludes;
   if (path == info->directory) {
     foreachkey (const string& exclude, info->paths) {
@@ -336,26 +385,54 @@ void PosixDiskIsolatorProcess::_collect(
 Future<ResourceStatistics> PosixDiskIsolatorProcess::usage(
     const ContainerID& containerId)
 {
+  if (containerId.has_parent()) {
+    return Failure("Not supported for nested containers");
+  }
+
   if (!infos.contains(containerId)) {
     return Failure("Unknown container");
   }
 
-  // TODO(hartem): Report volume usage  as well (MESOS-4263).
   ResourceStatistics result;
 
   const Owned<Info>& info = infos[containerId];
 
-  if (info->paths.contains(info->directory)) {
-    Option<Bytes> quota = info->paths[info->directory].quota.disk();
+  foreachpair (const string& path,
+               const Info::PathInfo& pathInfo,
+               info->paths) {
+    DiskStatistics *statistics = result.add_disk_statistics();
+
+    Option<Bytes> quota = pathInfo.quota.disk();
     CHECK_SOME(quota);
 
-    result.set_disk_limit_bytes(quota.get().bytes());
+    statistics->set_limit_bytes(quota->bytes());
+    if (path == info->directory) {
+      result.set_disk_limit_bytes(quota->bytes());
+    }
 
     // NOTE: There may be a large delay (# of containers * interval)
     // until an initial cached value is returned here!
-    if (info->paths[info->directory].lastUsage.isSome()) {
-      result.set_disk_used_bytes(
-          info->paths[info->directory].lastUsage.get().bytes());
+    if (pathInfo.lastUsage.isSome()) {
+      statistics->set_used_bytes(pathInfo.lastUsage->bytes());
+      if (path == info->directory) {
+        result.set_disk_used_bytes(pathInfo.lastUsage->bytes());
+      }
+    }
+
+    // Set meta information for persistent volumes.
+    if (path != info->directory) {
+      // TODO(jieyu): For persistent volumes, validate that there is
+      // only one Resource object associated with it.
+      Resource resource = *pathInfo.quota.begin();
+
+      if (resource.has_disk() && resource.disk().has_source()) {
+        statistics->mutable_source()->CopyFrom(resource.disk().source());
+      }
+
+      if (resource.has_disk() && resource.disk().has_persistence()) {
+        statistics->mutable_persistence()->CopyFrom(
+            resource.disk().persistence());
+      }
     }
   }
 
@@ -366,6 +443,12 @@ Future<ResourceStatistics> PosixDiskIsolatorProcess::usage(
 Future<Nothing> PosixDiskIsolatorProcess::cleanup(
     const ContainerID& containerId)
 {
+  // No need to cleanup anything because we don't create Info struct
+  // for nested containers.
+  if (containerId.has_parent()) {
+    return Nothing();
+  }
+
   if (!infos.contains(containerId)) {
     LOG(WARNING) << "Ignoring cleanup for unknown container " << containerId;
     return Nothing();
@@ -380,8 +463,10 @@ Future<Nothing> PosixDiskIsolatorProcess::cleanup(
 class DiskUsageCollectorProcess : public Process<DiskUsageCollectorProcess>
 {
 public:
-  DiskUsageCollectorProcess(const Duration& _interval) : interval(_interval) {}
-  virtual ~DiskUsageCollectorProcess() {}
+  DiskUsageCollectorProcess(const Duration& _interval)
+    : ProcessBase(process::ID::generate("posix-disk-usage-collector")),
+      interval(_interval) {}
+  ~DiskUsageCollectorProcess() override {}
 
   Future<Bytes> usage(
       const string& path,
@@ -407,16 +492,16 @@ public:
   }
 
 protected:
-  void initialize()
+  void initialize() override
   {
     schedule();
   }
 
-  void finalize()
+  void finalize() override
   {
     foreach (const Owned<Entry>& entry, entries) {
-      if (entry->du.isSome() && entry->du.get().status().isPending()) {
-        os::killtree(entry->du.get().pid(), SIGKILL);
+      if (entry->du.isSome() && entry->du->status().isPending()) {
+        os::killtree(entry->du->pid(), SIGKILL);
       }
 
       entry->promise.fail("DiskUsageCollector is destroyed");
@@ -489,21 +574,19 @@ private:
     // Add path on which 'du' must be run.
     command.push_back(entry->path);
 
-    // NOTE: The monitor watchdog will watch the parent process and kill
+    // NOTE: The supervisor childhook will watch the parent process and kill
     // the 'du' process in case that the parent die.
     Try<Subprocess> s = subprocess(
         "du",
         command,
-        Subprocess::PATH("/dev/null"),
+        Subprocess::PATH(os::DEV_NULL),
         Subprocess::PIPE(),
         Subprocess::PIPE(),
-        NO_SETSID,
+        nullptr,
         None(),
         None(),
-        None(),
-        Subprocess::Hook::None(),
-        None(),
-        MONITOR);
+        {},
+        {Subprocess::ChildHook::SUPERVISOR()});
 
     if (s.isError()) {
       entry->promise.fail("Failed to exec 'du': " + s.error());
@@ -515,9 +598,9 @@ private:
 
     entry->du = s.get();
 
-    await(s.get().status(),
-          io::read(s.get().out().get()),
-          io::read(s.get().err().get()))
+    await(s->status(),
+          io::read(s->out().get()),
+          io::read(s->err().get()))
       .onAny(defer(self(), &Self::_schedule, lambda::_1));
   }
 
@@ -532,16 +615,16 @@ private:
     const Owned<Entry>& entry = entries.front();
     CHECK_SOME(entry->du);
 
-    Future<Option<int>> status = std::get<0>(future.get());
+    const Future<Option<int>>& status = std::get<0>(future.get());
 
     if (!status.isReady()) {
       entry->promise.fail(
           "Failed to perform 'du': " +
           (status.isFailed() ? status.failure() : "discarded"));
-    } else if (status.get().isNone()) {
+    } else if (status->isNone()) {
       entry->promise.fail("Failed to reap the status of 'du'");
-    } else if (status.get().get() != 0) {
-      Future<string> error = std::get<2>(future.get());
+    } else if (status->get() != 0) {
+      const Future<string>& error = std::get<2>(future.get());
       if (!error.isReady()) {
         entry->promise.fail(
             "Failed to perform 'du'. Reading stderr failed: " +
@@ -550,7 +633,7 @@ private:
         entry->promise.fail("Failed to perform 'du': " + error.get());
       }
     } else {
-      Future<string> output = std::get<1>(future.get());
+      const Future<string>& output = std::get<1>(future.get());
       if (!output.isReady()) {
         entry->promise.fail(
             "Failed to read stdout from 'du': " +

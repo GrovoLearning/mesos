@@ -23,6 +23,7 @@
 #endif // __linux__
 #include <sys/types.h>
 
+#include <initializer_list>
 #include <string>
 
 #include <glog/logging.h>
@@ -39,6 +40,18 @@
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
 
+#include <stout/os/chdir.hpp>
+#include <stout/os/close.hpp>
+#include <stout/os/dup.hpp>
+#include <stout/os/fcntl.hpp>
+#include <stout/os/signals.hpp>
+
+#ifdef __WINDOWS__
+#include "windows/subprocess.hpp"
+#else
+#include "posix/subprocess.hpp"
+#endif // __WINDOWS__
+
 using std::map;
 using std::string;
 using std::vector;
@@ -49,9 +62,195 @@ using InputFileDescriptors = Subprocess::IO::InputFileDescriptors;
 using OutputFileDescriptors = Subprocess::IO::OutputFileDescriptors;
 
 
-Subprocess::Hook::Hook(
-    const lambda::function<Try<Nothing>(pid_t)>& _parent_callback)
-  : parent_callback(_parent_callback) {}
+Subprocess::ParentHook::ParentHook(
+    const lambda::function<Try<Nothing>(pid_t)>& _parent_setup)
+  : parent_setup(_parent_setup) {}
+
+
+Subprocess::ChildHook::ChildHook(
+    const lambda::function<Try<Nothing>()>& _child_setup)
+  : child_setup(_child_setup) {}
+
+
+Subprocess::ChildHook Subprocess::ChildHook::CHDIR(
+    const std::string& working_directory)
+{
+  return Subprocess::ChildHook([working_directory]() -> Try<Nothing> {
+    const Try<Nothing> result = os::chdir(working_directory);
+    if (result.isError()) {
+      return Error(result.error());
+    }
+
+    return Nothing();
+  });
+}
+
+
+Subprocess::ChildHook Subprocess::ChildHook::SETSID()
+{
+  return Subprocess::ChildHook([]() -> Try<Nothing> {
+    // TODO(josephw): By default, child processes on Windows do not
+    // terminate when the parent terminates. We need to implement
+    // `JobObject` support to change this default.
+#ifndef __WINDOWS__
+    // Put child into its own process session to prevent the parent
+    // suicide on child process SIGKILL/SIGTERM.
+    if (::setsid() == -1) {
+      return Error("Could not setsid");
+    }
+#endif // __WINDOWS__
+
+    return Nothing();
+  });
+}
+
+
+#ifndef __WINDOWS__
+Subprocess::ChildHook Subprocess::ChildHook::DUP2(int oldFd, int newFd)
+{
+  return Subprocess::ChildHook([oldFd, newFd]() -> Try<Nothing> {
+    return os::dup2(oldFd, newFd);
+  });
+}
+#endif // __WINDOWS__
+
+
+#ifdef __linux__
+static void signalHandler(int signal)
+{
+  // Send SIGKILL to every process in the process group of the
+  // calling process.
+  kill(0, SIGKILL);
+  _exit(EXIT_FAILURE);
+}
+#endif // __linux__
+
+
+Subprocess::ChildHook Subprocess::ChildHook::SUPERVISOR()
+{
+  return Subprocess::ChildHook([]() -> Try<Nothing> {
+#ifdef __linux__
+    // Send SIGTERM to the current process if the parent exits.
+    // NOTE:: This function should always succeed because we are passing
+    // in a valid signal.
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+    // Put the current process into a separate process group so that
+    // we can kill it and all its children easily.
+    if (setpgid(0, 0) != 0) {
+      return Error("Could not start supervisor process.");
+    }
+
+    // Install a SIGTERM handler which will kill the current process
+    // group. Since we already setup the death signal above, the
+    // signal handler will be triggered when the parent exits.
+    if (os::signals::install(SIGTERM, &signalHandler) != 0) {
+      return Error("Could not start supervisor process.");
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+      return Error("Could not start supervisor process.");
+    } else if (pid == 0) {
+      // Child. This is the process that is going to exec the
+      // process if zero is returned.
+
+      // We setup death signal for the process as well in case
+      // someone, though unlikely, accidentally kill the parent of
+      // this process (the bookkeeping process).
+      prctl(PR_SET_PDEATHSIG, SIGKILL);
+
+      // NOTE: We don't need to clear the signal handler explicitly
+      // because the subsequent 'exec' will clear them.
+      return Nothing();
+    } else {
+      // Parent. This is the bookkeeping process which will wait for
+      // the child process to finish.
+
+      // Close the files to prevent interference on the communication
+      // between the parent and the child process.
+      ::close(STDIN_FILENO);
+      ::close(STDOUT_FILENO);
+      ::close(STDERR_FILENO);
+
+      // Block until the child process finishes.
+      int status = 0;
+      while (waitpid(pid, &status, 0) == -1) {
+        if (errno != EINTR) {
+          _exit(EXIT_FAILURE);
+        }
+      }
+
+      // Forward the exit status if the child process exits normally.
+      if (WIFEXITED(status)) {
+        _exit(WEXITSTATUS(status));
+      }
+
+      _exit(EXIT_FAILURE);
+    }
+#endif // __linux__
+    return Nothing();
+  });
+}
+
+
+Subprocess::IO Subprocess::FD(int_fd fd, IO::FDType type)
+{
+  return Subprocess::IO(
+      [fd, type]() -> Try<InputFileDescriptors> {
+        int_fd prepared_fd = -1;
+        switch (type) {
+          case IO::DUPLICATED: {
+            Try<int_fd> dup = os::dup(fd);
+            if (dup.isError()) {
+              return Error(dup.error());
+            }
+
+            prepared_fd = dup.get();
+            break;
+          }
+          case IO::OWNED: {
+            prepared_fd = fd;
+            break;
+          }
+
+            // NOTE: By not setting a default we leverage the compiler
+            // errors when the enumeration is augmented to find all
+            // the cases we need to provide. Same for below.
+        }
+
+        InputFileDescriptors fds;
+        fds.read = prepared_fd;
+        return fds;
+      },
+      [fd, type]() -> Try<OutputFileDescriptors> {
+        int_fd prepared_fd = -1;
+        switch (type) {
+          case IO::DUPLICATED: {
+            Try<int_fd> dup = os::dup(fd);
+            if (dup.isError()) {
+              return Error(dup.error());
+            }
+
+            prepared_fd = dup.get();
+            break;
+          }
+          case IO::OWNED: {
+            prepared_fd = fd;
+            break;
+          }
+
+            // NOTE: By not setting a default we leverage the compiler
+            // errors when the enumeration is augmented to find all
+            // the cases we need to provide. Same for below.
+        }
+
+        OutputFileDescriptors fds;
+        fds.write = prepared_fd;
+        return fds;
+      });
+}
+
 
 namespace internal {
 
@@ -72,6 +271,33 @@ static void cleanup(
   delete promise;
 }
 
+
+static void close(std::initializer_list<int_fd> fds)
+{
+  foreach (int_fd fd, fds) {
+    if (fd >= 0) {
+      os::close(fd);
+    }
+  }
+}
+
+
+// This function will invoke `os::close` on all specified file
+// descriptors that are valid (i.e., not `None` and >= 0).
+static void close(
+    const Subprocess::IO::InputFileDescriptors& stdinfds,
+    const Subprocess::IO::OutputFileDescriptors& stdoutfds,
+    const Subprocess::IO::OutputFileDescriptors& stderrfds)
+{
+  close(
+      {stdinfds.read,
+       stdinfds.write.getOrElse(-1),
+       stdoutfds.read.getOrElse(-1),
+       stdoutfds.write,
+       stderrfds.read.getOrElse(-1),
+       stderrfds.write});
+}
+
 }  // namespace internal {
 
 
@@ -80,7 +306,7 @@ static void cleanup(
 // NOTE: On Windows, components of the `path` and `argv` that need to be quoted
 // are expected to have been quoted before they are passed to `subprocess. For
 // example, either of these may contain paths with spaces in them, like
-// `C:\"Program Files"\foo.exe`, where notably the character sequence `\"` does
+// `C:\"Program Files"\foo.exe`, where notably the character sequence `\"`
 // is not escaped quote, but instead a path separator and the start of a path
 // component. Since the semantics of quoting are shell-dependent, it is not
 // practical to attempt to re-parse the command that is passed in and properly
@@ -92,15 +318,17 @@ Try<Subprocess> subprocess(
     const Subprocess::IO& in,
     const Subprocess::IO& out,
     const Subprocess::IO& err,
-    const Setsid set_sid,
-    const Option<flags::FlagsBase>& flags,
+    const flags::FlagsBase* flags,
     const Option<map<string, string>>& environment,
     const Option<lambda::function<
         pid_t(const lambda::function<int()>&)>>& _clone,
-    const vector<Subprocess::Hook>& parent_hooks,
-    const Option<string>& working_directory,
-    const Watchdog watchdog)
+    const vector<Subprocess::ParentHook>& parent_hooks,
+    const vector<Subprocess::ChildHook>& child_hooks,
+    const vector<int_fd>& whitelist_fds)
 {
+  // TODO(hausdorff): We should error out on Windows here if we are passing
+  // parameters that aren't used.
+
   // File descriptors for redirecting stdin/stdout/stderr.
   // These file descriptors are used for different purposes depending
   // on the specified I/O modes.
@@ -146,9 +374,9 @@ Try<Subprocess> subprocess(
 
   // Prepare the arguments. If the user specifies the 'flags', we will
   // stringify them and append them to the existing arguments.
-  if (flags.isSome()) {
-    foreachvalue (const flags::Flag& flag, flags.get()) {
-      Option<string> value = flag.stringify(flags.get());
+  if (flags != nullptr) {
+    foreachvalue (const flags::Flag& flag, *flags) {
+      Option<string> value = flag.stringify(*flags);
       if (value.isSome()) {
         argv.push_back("--" + flag.effective_name().value + "=" + value.get());
       }
@@ -172,15 +400,14 @@ Try<Subprocess> subprocess(
     Try<pid_t> pid = internal::cloneChild(
         path,
         argv,
-        set_sid,
         environment,
         _clone,
         parent_hooks,
-        working_directory,
-        watchdog,
+        child_hooks,
         stdinfds,
         stdoutfds,
-        stderrfds);
+        stderrfds,
+        whitelist_fds);
 
     if (pid.isError()) {
       return Error(pid.error());
@@ -188,32 +415,31 @@ Try<Subprocess> subprocess(
 
     process.data->pid = pid.get();
 #else
-    Try<PROCESS_INFORMATION> processInformation = internal::createChildProcess(
-        path, argv, environment, stdinfds, stdoutfds, stderrfds);
+    // TODO(joerg84): Consider using the childHooks and parentHooks here.
+    Try<::internal::windows::ProcessData> process_data =
+      internal::createChildProcess(
+          path,
+          argv,
+          environment,
+          parent_hooks,
+          stdinfds,
+          stdoutfds,
+          stderrfds,
+          whitelist_fds);
 
-    if (processInformation.isError()) {
-      process::internal::close(stdinfds, stdoutfds, stderrfds);
-      return Error(
-          "Could not launch child process" + processInformation.error());
+    if (process_data.isError()) {
+      // NOTE: `createChildProcess` either succeeds entirely or returns an
+      // `Error`. There is no need to check the value of the PID.
+      return Error(process_data.error());
     }
 
-    if (processInformation.get().dwProcessId == -1) {
-      // Save the errno as 'close' below might overwrite it.
-      ErrnoError error("Failed to clone");
-      process::internal::close(stdinfds, stdoutfds, stderrfds);
-      return error;
-    }
-
-    process.data->processInformation = processInformation.get();
-    process.data->pid = processInformation.get().dwProcessId;
+    // NOTE: We specifically tie the lifetime of the child process to
+    // the `Subprocess` object by saving the handles here so that
+    // there is zero chance of the `pid` getting reused.
+    process.data->process_data = process_data.get();
+    process.data->pid = process_data->pid;
 #endif // __WINDOWS__
   }
-
-  // Close the child-ends of the file descriptors that are created
-  // by this function.
-  os::close(stdinfds.read);
-  os::close(stdoutfds.write);
-  os::close(stderrfds.write);
 
   // For any pipes, store the parent side of the pipe so that
   // the user can communicate with the subprocess.

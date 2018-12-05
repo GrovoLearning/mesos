@@ -22,16 +22,15 @@
 #include <mesos/mesos.hpp>
 #include <mesos/resources.hpp>
 
-#include <mesos/containerizer/containerizer.hpp>
-
 #include <process/future.hpp>
+#include <process/http.hpp>
 #include <process/process.hpp>
 
-#include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
 #include <stout/option.hpp>
 #include <stout/try.hpp>
 
+#include "slave/containerizer/containerizer.hpp"
 
 namespace mesos {
 namespace internal {
@@ -39,6 +38,7 @@ namespace slave {
 
 // Forward declaration.
 class ComposingContainerizerProcess;
+
 
 class ComposingContainerizer : public Containerizer
 {
@@ -49,46 +49,46 @@ public:
   ComposingContainerizer(
       const std::vector<Containerizer*>& containerizers);
 
-  virtual ~ComposingContainerizer();
+  ~ComposingContainerizer() override;
 
-  virtual process::Future<Nothing> recover(
-      const Option<state::SlaveState>& state);
+  process::Future<Nothing> recover(
+      const Option<state::SlaveState>& state) override;
 
-  virtual process::Future<bool> launch(
+  process::Future<Containerizer::LaunchResult> launch(
       const ContainerID& containerId,
-      const ExecutorInfo& executorInfo,
-      const std::string& directory,
-      const Option<std::string>& user,
-      const SlaveID& slaveId,
-      const process::PID<Slave>& slavePid,
-      bool checkpoint);
+      const mesos::slave::ContainerConfig& containerConfig,
+      const std::map<std::string, std::string>& environment,
+      const Option<std::string>& pidCheckpointPath) override;
 
-  virtual process::Future<bool> launch(
+  process::Future<process::http::Connection> attach(
+      const ContainerID& containerId) override;
+
+  process::Future<Nothing> update(
       const ContainerID& containerId,
-      const TaskInfo& taskInfo,
-      const ExecutorInfo& executorInfo,
-      const std::string& directory,
-      const Option<std::string>& user,
-      const SlaveID& slaveId,
-      const process::PID<Slave>& slavePid,
-      bool checkpoint);
+      const Resources& resources) override;
 
-  virtual process::Future<Nothing> update(
+  process::Future<ResourceStatistics> usage(
+      const ContainerID& containerId) override;
+
+  process::Future<ContainerStatus> status(
+      const ContainerID& containerId) override;
+
+  process::Future<Option<mesos::slave::ContainerTermination>> wait(
+      const ContainerID& containerId) override;
+
+  process::Future<Option<mesos::slave::ContainerTermination>> destroy(
+      const ContainerID& containerId) override;
+
+  process::Future<bool> kill(
       const ContainerID& containerId,
-      const Resources& resources);
+      int signal) override;
 
-  virtual process::Future<ResourceStatistics> usage(
-      const ContainerID& containerId);
+  process::Future<hashset<ContainerID>> containers() override;
 
-  virtual process::Future<ContainerStatus> status(
-      const ContainerID& containerId);
+  process::Future<Nothing> remove(const ContainerID& containerId) override;
 
-  virtual process::Future<containerizer::Termination> wait(
-      const ContainerID& containerId);
-
-  virtual void destroy(const ContainerID& containerId);
-
-  virtual process::Future<hashset<ContainerID>> containers();
+  process::Future<Nothing> pruneImages(
+      const std::vector<Image>& excludedImages) override;
 
 private:
   ComposingContainerizerProcess* process;

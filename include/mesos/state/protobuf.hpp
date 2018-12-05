@@ -71,7 +71,7 @@ class State : public mesos::state::State
 public:
   explicit State(mesos::state::Storage* storage)
     : mesos::state::State(storage) {}
-  virtual ~State() {}
+  ~State() override {}
 
   // Returns a variable from the state, creating a new one if one
   // previously did not exist (or an error if one occurs).
@@ -94,7 +94,7 @@ private:
   // constructor.
   template <typename T>
   static process::Future<Variable<T>> _fetch(
-      const mesos::state::Variable& option);
+      const mesos::state::Variable& variable);
 
   template <typename T>
   static process::Future<Option<Variable<T>>> _store(

@@ -87,17 +87,15 @@ TEST(SharedTest, Own)
 
   EXPECT_EQ(42, shared->get());
   EXPECT_EQ(42, (*shared).get());
-  EXPECT_EQ(42, shared.get()->get());
   EXPECT_TRUE(shared.unique());
 
-  Future<Owned<Foo> > future;
+  Future<Owned<Foo>> future;
 
   {
     Shared<Foo> shared2(shared);
 
     EXPECT_EQ(42, shared2->get());
     EXPECT_EQ(42, (*shared2).get());
-    EXPECT_EQ(42, shared2.get()->get());
     EXPECT_FALSE(shared2.unique());
     EXPECT_FALSE(shared.unique());
 
@@ -119,5 +117,4 @@ TEST(SharedTest, Own)
   Owned<Foo> owned = future.get();
   EXPECT_EQ(42, owned->get());
   EXPECT_EQ(42, (*owned).get());
-  EXPECT_EQ(42, owned.get()->get());
 }

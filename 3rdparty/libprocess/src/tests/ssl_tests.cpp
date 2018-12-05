@@ -48,9 +48,14 @@ namespace http = process::http;
 namespace io = process::io;
 namespace network = process::network;
 namespace openssl = network::openssl;
+#ifndef __WINDOWS__
+namespace unix = process::network::unix;
+#endif // __WINDOWS__
 
-using network::Address;
-using network::Socket;
+using network::inet::Address;
+using network::inet::Socket;
+
+using network::internal::SocketImpl;
 
 using process::Clock;
 using process::Failure;
@@ -72,7 +77,12 @@ Future<Nothing> await_subprocess(
 {
   // Dup the pipe fd of the subprocess so we can read the output if
   // needed.
-  int out = dup(subprocess.out().get());
+  Try<int_fd> dup = os::dup(subprocess.out().get());
+  if (dup.isError()) {
+    return Failure(dup.error());
+  }
+
+  int_fd out = dup.get();
 
   // Once we get the status of the process.
   return subprocess.status()
@@ -112,7 +122,7 @@ TEST(SSL, Disabled)
 {
   os::setenv("LIBPROCESS_SSL_ENABLED", "false");
   openssl::reinitialize();
-  EXPECT_ERROR(Socket::create(Socket::SSL));
+  EXPECT_ERROR(Socket::create(SocketImpl::Kind::SSL));
 }
 
 
@@ -130,50 +140,97 @@ TEST_P(SSLTest, BasicSameProcess)
 
   openssl::reinitialize();
 
-  const Try<Socket> server_create = Socket::create(Socket::SSL);
-  ASSERT_SOME(server_create);
+  Try<Socket> server = Socket::create(SocketImpl::Kind::SSL);
+  ASSERT_SOME(server);
 
-  const Try<Socket> client_create = Socket::create(Socket::SSL);
-  ASSERT_SOME(client_create);
+  Try<Socket> client = Socket::create(SocketImpl::Kind::SSL);
+  ASSERT_SOME(client);
 
-  Socket server = server_create.get();
-  Socket client = client_create.get();
+  // We need to explicitly bind to the address advertised by libprocess so the
+  // certificate we create in this test fixture can be verified.
+  ASSERT_SOME(server->bind(Address(net::IP(process::address().ip), 0)));
+  ASSERT_SOME(server->listen(BACKLOG));
 
-  // We need to explicitly bind to INADDR_LOOPBACK so the certificate
-  // we create in this test fixture can be verified.
-  ASSERT_SOME(server.bind(Address(net::IP(INADDR_LOOPBACK), 0)));
+  Try<Address> address = server->address();
+  ASSERT_SOME(address);
 
-  const Try<Nothing> listen = server.listen(BACKLOG);
-  ASSERT_SOME(listen);
+  Future<Socket> accept = server->accept();
 
-  const Try<Address> server_address = server.address();
-  ASSERT_SOME(server_address);
-
-  const Future<Socket> _socket = server.accept();
-
-  const Future<Nothing> connect = client.connect(server_address.get());
+  AWAIT_ASSERT_READY(client->connect(address.get()));
 
   // Wait for the server to have accepted the client connection.
-  AWAIT_ASSERT_READY(_socket);
-  Socket socket = _socket.get(); // TODO(jmlvanre): Remove const copy.
+  AWAIT_ASSERT_READY(accept);
 
-  // Verify that the client also views the connection as established.
-  AWAIT_ASSERT_READY(connect);
+  Socket socket = accept.get();
 
   // Send a message from the client to the server.
   const string data = "Hello World!";
-  AWAIT_ASSERT_READY(client.send(data));
+  AWAIT_ASSERT_READY(client->send(data));
 
   // Verify the server received the message.
-  AWAIT_ASSERT_EQ(data, socket.recv());
+  AWAIT_ASSERT_EQ(data, socket.recv(data.size()));
 
   // Send the message back from the server to the client.
   AWAIT_ASSERT_READY(socket.send(data));
 
   // Verify the client received the message.
-  AWAIT_ASSERT_EQ(data, client.recv());
+  AWAIT_ASSERT_EQ(data, client->recv(data.size()));
 }
 
+
+#ifndef __WINDOWS__
+TEST_P(SSLTest, BasicSameProcessUnix)
+{
+  os::setenv("LIBPROCESS_SSL_ENABLED", "true");
+  os::setenv("LIBPROCESS_SSL_KEY_FILE", key_path().string());
+  os::setenv("LIBPROCESS_SSL_CERT_FILE", certificate_path().string());
+  // NOTE: we must set LIBPROCESS_SSL_REQUIRE_CERT to false because we
+  // don't have a hostname or IP to verify!
+  os::setenv("LIBPROCESS_SSL_REQUIRE_CERT", "false");
+  os::setenv("LIBPROCESS_SSL_CA_DIR", os::getcwd());
+  os::setenv("LIBPROCESS_SSL_CA_FILE", certificate_path().string());
+  os::setenv("LIBPROCESS_SSL_VERIFY_IPADD", GetParam());
+
+  openssl::reinitialize();
+
+  Try<unix::Socket> server = unix::Socket::create(SocketImpl::Kind::SSL);
+  ASSERT_SOME(server);
+
+  Try<unix::Socket> client = unix::Socket::create(SocketImpl::Kind::SSL);
+  ASSERT_SOME(client);
+
+  // Use a path in the temporary directory so it gets cleaned up.
+  string path = path::join(sandbox.get(), "socket");
+
+  Try<unix::Address> address = unix::Address::create(path);
+  ASSERT_SOME(address);
+
+  ASSERT_SOME(server->bind(address.get()));
+  ASSERT_SOME(server->listen(BACKLOG));
+
+  Future<unix::Socket> accept = server->accept();
+
+  AWAIT_ASSERT_READY(client->connect(address.get()));
+
+  // Wait for the server to have accepted the client connection.
+  AWAIT_ASSERT_READY(accept);
+
+  unix::Socket socket = accept.get();
+
+  // Send a message from the client to the server.
+  const string data = "Hello World!";
+  AWAIT_ASSERT_READY(client->send(data));
+
+  // Verify the server received the message.
+  AWAIT_ASSERT_EQ(data, socket.recv(data.size()));
+
+  // Send the message back from the server to the client.
+  AWAIT_ASSERT_READY(socket.send(data));
+
+  // Verify the client received the message.
+  AWAIT_ASSERT_EQ(data, client->recv(data.size()));
+}
+#endif // __WINDOWS__
 
 // Test a basic back-and-forth communication using the 'ssl-client'
 // subprocess.
@@ -193,7 +250,7 @@ TEST_F(SSLTest, SSLSocket)
       true);
   ASSERT_SOME(client);
 
-  Future<Socket> socket = server.get().accept();
+  Future<Socket> socket = server->accept();
   AWAIT_ASSERT_READY(socket);
 
   // TODO(jmlvanre): Remove const copy.
@@ -222,7 +279,7 @@ TEST_F(SSLTest, NonSSLSocket)
       false);
   ASSERT_SOME(client);
 
-  Future<Socket> socket = server.get().accept();
+  Future<Socket> socket = server->accept();
   AWAIT_ASSERT_FAILED(socket);
 
   AWAIT_ASSERT_READY(await_subprocess(client.get(), None()));
@@ -253,7 +310,7 @@ TEST_F(SSLTest, NoVerifyBadCA)
       true);
   ASSERT_SOME(client);
 
-  Future<Socket> socket = server.get().accept();
+  Future<Socket> socket = server->accept();
   AWAIT_ASSERT_READY(socket);
 
   // TODO(jmlvanre): Remove const copy.
@@ -285,7 +342,7 @@ TEST_F(SSLTest, RequireBadCA)
       true);
   ASSERT_SOME(client);
 
-  Future<Socket> socket = server.get().accept();
+  Future<Socket> socket = server->accept();
   AWAIT_ASSERT_FAILED(socket);
 
   AWAIT_ASSERT_READY(await_subprocess(client.get(), None()));
@@ -313,7 +370,7 @@ TEST_F(SSLTest, VerifyBadCA)
       true);
   ASSERT_SOME(client);
 
-  Future<Socket> socket = server.get().accept();
+  Future<Socket> socket = server->accept();
   AWAIT_ASSERT_FAILED(socket);
 
   AWAIT_ASSERT_READY(await_subprocess(client.get(), None()));
@@ -343,7 +400,7 @@ TEST_F(SSLTest, VerifyCertificate)
       true);
   ASSERT_SOME(client);
 
-  Future<Socket> socket = server.get().accept();
+  Future<Socket> socket = server->accept();
   AWAIT_ASSERT_READY(socket);
 
   // TODO(jmlvanre): Remove const copy.
@@ -379,7 +436,7 @@ TEST_P(SSLTest, RequireCertificate)
       true);
   ASSERT_SOME(client);
 
-  Future<Socket> socket = server.get().accept();
+  Future<Socket> socket = server->accept();
   AWAIT_ASSERT_READY(socket);
 
   // TODO(jmlvanre): Remove const copy.
@@ -451,7 +508,7 @@ TEST_F(SSLTest, ProtocolMismatch)
 
       if (server_protocol == client_protocol) {
         // If the protocols are the same, it is valid.
-        Future<Socket> socket = server.get().accept();
+        Future<Socket> socket = server->accept();
         AWAIT_ASSERT_READY(socket);
 
         // TODO(jmlvanre): Remove const copy.
@@ -461,13 +518,56 @@ TEST_F(SSLTest, ProtocolMismatch)
         AWAIT_ASSERT_READY(await_subprocess(client.get(), 0));
       } else {
         // If the protocols are NOT the same, it is invalid.
-        Future<Socket> socket = server.get().accept();
+        Future<Socket> socket = server->accept();
         AWAIT_ASSERT_FAILED(socket);
 
         AWAIT_ASSERT_READY(await_subprocess(client.get(), None()));
       }
     }
   }
+}
+
+
+// Ensure that key exchange using ECDHE algorithm works.
+TEST_F(SSLTest, ECDHESupport)
+{
+  // Set up the default server environment variables.
+  map<string, string> server_environment = {
+    {"LIBPROCESS_SSL_ENABLED", "true"},
+    {"LIBPROCESS_SSL_KEY_FILE", key_path().string()},
+    {"LIBPROCESS_SSL_CERT_FILE", certificate_path().string()},
+    {"LIBPROCESS_SSL_CIPHERS",
+     "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:"
+     "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA"}
+  };
+
+  // Set up the default client environment variables.
+  map<string, string> client_environment = {
+    {"LIBPROCESS_SSL_ENABLED", "true"},
+    {"LIBPROCESS_SSL_KEY_FILE", key_path().string()},
+    {"LIBPROCESS_SSL_CERT_FILE", certificate_path().string()},
+    {"LIBPROCESS_SSL_CIPHERS",
+     "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:"
+     "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA"}
+  };
+
+  // Set up the server.
+  Try<Socket> server = setup_server(server_environment);
+  ASSERT_SOME(server);
+
+  // Launch the client.
+  Try<Subprocess> client =
+      launch_client(client_environment, server.get(), true);
+  ASSERT_SOME(client);
+
+  Future<Socket> socket = server->accept();
+  AWAIT_ASSERT_READY(socket);
+
+  // TODO(jmlvanre): Remove const copy.
+  AWAIT_ASSERT_EQ(data, Socket(socket.get()).recv());
+  AWAIT_ASSERT_READY(Socket(socket.get()).send(data));
+
+  AWAIT_ASSERT_READY(await_subprocess(client.get(), 0));
 }
 
 
@@ -489,7 +589,7 @@ TEST_F(SSLTest, ValidDowngrade)
       false);
   ASSERT_SOME(client);
 
-  Future<Socket> socket = server.get().accept();
+  Future<Socket> socket = server->accept();
   AWAIT_ASSERT_READY(socket);
 
   // TODO(jmlvanre): Remove const copy.
@@ -500,7 +600,7 @@ TEST_F(SSLTest, ValidDowngrade)
 }
 
 
-// Ensure we can NOT communicate between a POLL based socket and an
+// Ensure we CANNOT communicate between a POLL based socket and an
 // SSL socket if 'SSL_SUPPORT_DOWNGRADE' is not enabled.
 TEST_F(SSLTest, NoValidDowngrade)
 {
@@ -518,7 +618,7 @@ TEST_F(SSLTest, NoValidDowngrade)
       false);
   ASSERT_SOME(client);
 
-  Future<Socket> socket = server.get().accept();
+  Future<Socket> socket = server->accept();
   AWAIT_ASSERT_FAILED(socket);
 
   AWAIT_ASSERT_READY(await_subprocess(client.get(), None()));
@@ -559,7 +659,7 @@ TEST_F(SSLTest, ValidDowngradeEachProtocol)
         false);
     ASSERT_SOME(client);
 
-    Future<Socket> socket = server.get().accept();
+    Future<Socket> socket = server->accept();
     AWAIT_ASSERT_READY(socket);
 
     // TODO(jmlvanre): Remove const copy.
@@ -571,7 +671,7 @@ TEST_F(SSLTest, ValidDowngradeEachProtocol)
 }
 
 
-// For each protocol: ensure we can NOT communicate between a POLL
+// For each protocol: ensure we CANNOT communicate between a POLL
 // based socket and an SSL socket if 'SSL_SUPPORT_DOWNGRADE' is not
 // enabled.
 TEST_F(SSLTest, NoValidDowngradeEachProtocol)
@@ -606,7 +706,7 @@ TEST_F(SSLTest, NoValidDowngradeEachProtocol)
         false);
     ASSERT_SOME(client);
 
-    Future<Socket> socket = server.get().accept();
+    Future<Socket> socket = server->accept();
     AWAIT_ASSERT_FAILED(socket);
 
     AWAIT_ASSERT_READY(await_subprocess(client.get(), None()));
@@ -623,14 +723,14 @@ TEST_F(SSLTest, PeerAddress)
       {"LIBPROCESS_SSL_CERT_FILE", certificate_path().string()}});
   ASSERT_SOME(server);
 
-  const Try<Socket> client_create = Socket::create(Socket::SSL);
+  const Try<Socket> client_create = Socket::create(SocketImpl::Kind::SSL);
   ASSERT_SOME(client_create);
 
   Socket client = client_create.get();
 
-  Future<Socket> socket = server.get().accept();
+  Future<Socket> socket = server->accept();
 
-  const Try<Address> server_address = server.get().address();
+  const Try<Address> server_address = server->address();
   ASSERT_SOME(server_address);
 
   const Future<Nothing> connect = client.connect(server_address.get());
@@ -638,7 +738,7 @@ TEST_F(SSLTest, PeerAddress)
   AWAIT_ASSERT_READY(socket);
   AWAIT_ASSERT_READY(connect);
 
-  const Try<Address> socket_address = socket.get().address();
+  const Try<Address> socket_address = socket->address();
   ASSERT_SOME(socket_address);
 
   // Ensure the client thinks its peer is the server.
@@ -647,7 +747,7 @@ TEST_F(SSLTest, PeerAddress)
   // Ensure the client has an address, and that the server thinks its
   // peer is the client.
   ASSERT_SOME(client.address());
-  ASSERT_SOME_EQ(client.address().get(), socket.get().peer());
+  ASSERT_SOME_EQ(client.address().get(), socket->peer());
 }
 
 
@@ -660,16 +760,14 @@ TEST_F(SSLTest, HTTPSGet)
       {"LIBPROCESS_SSL_CERT_FILE", certificate_path().string()}});
 
   ASSERT_SOME(server);
-  ASSERT_SOME(server.get().address());
-  ASSERT_SOME(server.get().address().get().hostname());
+  ASSERT_SOME(server->address());
+  ASSERT_SOME(server->address()->hostname());
 
-  Future<Socket> socket = server.get().accept();
+  Future<Socket> socket = server->accept();
 
   // Create URL from server hostname and port.
   const http::URL url(
-      "https",
-      server.get().address().get().hostname().get(),
-      server.get().address().get().port);
+      "https", server->address()->hostname().get(), server->address()->port);
 
   // Send GET request.
   Future<http::Response> response = http::get(url);
@@ -687,7 +785,7 @@ TEST_F(SSLTest, HTTPSGet)
 
   AWAIT_ASSERT_READY(response);
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
-  ASSERT_EQ(data, response.get().body);
+  ASSERT_EQ(data, response->body);
 }
 
 
@@ -700,16 +798,14 @@ TEST_F(SSLTest, HTTPSPost)
       {"LIBPROCESS_SSL_CERT_FILE", certificate_path().string()}});
 
   ASSERT_SOME(server);
-  ASSERT_SOME(server.get().address());
-  ASSERT_SOME(server.get().address().get().hostname());
+  ASSERT_SOME(server->address());
+  ASSERT_SOME(server->address()->hostname());
 
-  Future<Socket> socket = server.get().accept();
+  Future<Socket> socket = server->accept();
 
   // Create URL from server hostname and port.
   const http::URL url(
-      "https",
-      server.get().address().get().hostname().get(),
-      server.get().address().get().port);
+      "https", server->address()->hostname().get(), server->address()->port);
 
   // Send POST request.
   Future<http::Response> response =
@@ -728,7 +824,7 @@ TEST_F(SSLTest, HTTPSPost)
 
   AWAIT_ASSERT_READY(response);
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
-  ASSERT_EQ(data, response.get().body);
+  ASSERT_EQ(data, response->body);
 }
 
 
@@ -754,7 +850,7 @@ TEST_F(SSLTest, SilentSocket)
   // not complete the SSL handshake, nor be downgraded.
   // As a result, we expect that the server will not see
   // an accepted socket for this connection.
-  Try<Socket> connection = Socket::create(Socket::POLL);
+  Try<Socket> connection = Socket::create(SocketImpl::Kind::POLL);
   ASSERT_SOME(connection);
   connection->connect(server->address().get());
 
@@ -788,6 +884,38 @@ TEST_F(SSLTest, SilentSocket)
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
   EXPECT_EQ(data, response->body);
+}
+
+
+// This test was added due to an OOM issue: MESOS-7934.
+TEST_F(SSLTest, ShutdownThenSend)
+{
+  Clock::pause();
+
+  Try<Socket> server = setup_server({
+      {"LIBPROCESS_SSL_ENABLED", "true"},
+      {"LIBPROCESS_SSL_KEY_FILE", key_path().string()},
+      {"LIBPROCESS_SSL_CERT_FILE", certificate_path().string()}});
+
+  ASSERT_SOME(server);
+  ASSERT_SOME(server->address());
+  ASSERT_SOME(server->address()->hostname());
+
+  Future<Socket> socket = server->accept();
+
+  Clock::settle();
+  EXPECT_TRUE(socket.isPending());
+
+  Try<Socket> client = Socket::create(SocketImpl::Kind::SSL);
+  ASSERT_SOME(client);
+  AWAIT_ASSERT_READY(client->connect(server->address().get()));
+
+  AWAIT_ASSERT_READY(socket);
+
+  EXPECT_SOME(Socket(socket.get()).shutdown());
+
+  // This send should fail now that the socket is shut down.
+  AWAIT_FAILED(Socket(socket.get()).send("Hello World"));
 }
 
 #endif // USE_SSL_SOCKET

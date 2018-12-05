@@ -47,17 +47,14 @@ namespace maintenance {
  *
  * TODO(josephw): allow more than one schedule.
  */
-class UpdateSchedule : public Operation
+class UpdateSchedule : public RegistryOperation
 {
 public:
   explicit UpdateSchedule(
       const mesos::maintenance::Schedule& _schedule);
 
 protected:
-  Try<bool> perform(
-      Registry* registry,
-      hashset<SlaveID>* slaveIDs,
-      bool strict);
+  Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs) override;
 
 private:
   const mesos::maintenance::Schedule schedule;
@@ -71,17 +68,14 @@ private:
  *
  * TODO(josephw): Allow a transition from `UP` to `DOWN`.
  */
-class StartMaintenance : public Operation
+class StartMaintenance : public RegistryOperation
 {
 public:
   explicit StartMaintenance(
       const google::protobuf::RepeatedPtrField<MachineID>& _ids);
 
 protected:
-  Try<bool> perform(
-      Registry* registry,
-      hashset<SlaveID>* slaveIDs,
-      bool strict);
+  Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs) override;
 
 private:
   hashset<MachineID> ids;
@@ -94,17 +88,14 @@ private:
  * schedule prior to executing this operation. The machines will be
  * removed from the maintenance schedule.
  */
-class StopMaintenance : public Operation
+class StopMaintenance : public RegistryOperation
 {
 public:
   explicit StopMaintenance(
       const google::protobuf::RepeatedPtrField<MachineID>& _ids);
 
 protected:
-  Try<bool> perform(
-      Registry* registry,
-      hashset<SlaveID>* slaveIDs,
-      bool strict);
+  Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs) override;
 
 private:
   hashset<MachineID> ids;

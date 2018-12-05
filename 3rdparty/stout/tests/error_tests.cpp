@@ -24,6 +24,7 @@
 
 using std::string;
 
+using testing::StartsWith;
 
 Error error1()
 {
@@ -71,3 +72,54 @@ TEST(ErrorTest, Test)
   r = error5(error1());
   EXPECT_ERROR(r);
 }
+
+
+TEST(ErrorTest, Errno)
+{
+#ifdef __WINDOWS__
+  DWORD einval = ERROR_INVALID_HANDLE;
+#else
+  int einval = EINVAL;
+#endif
+
+#ifdef __WINDOWS__
+  DWORD notsock = WSAENOTSOCK;
+#else
+  int notsock = ENOTSOCK;
+#endif
+
+  EXPECT_EQ(einval, ErrnoError(einval).code);
+  EXPECT_EQ(notsock, SocketError(notsock).code);
+
+  EXPECT_EQ(einval, ErrnoError(einval, "errno error").code);
+  EXPECT_THAT(
+    ErrnoError(einval, "errno error").message, StartsWith("errno error"));
+
+  EXPECT_EQ(notsock, SocketError(notsock, "socket error").code);
+  EXPECT_THAT(
+    SocketError(notsock, "socket error").message, StartsWith("socket error"));
+}
+
+
+#ifdef __WINDOWS__
+TEST(ErrorTest, Windows)
+{
+  // NOTE: This is an edge case where the implementation explicitly
+  // avoids calling `FormatMessage` when default constructed, and so
+  // the message is an empty string, NOT "The operation completed
+  // successfully."
+  EXPECT_EQ(WindowsError(ERROR_SUCCESS).message, "");
+
+  EXPECT_THAT(
+    WindowsError(ERROR_FILE_NOT_FOUND).message,
+    StartsWith("The system cannot find the file specified."));
+
+  EXPECT_THAT(
+    WindowsError(ERROR_INVALID_HANDLE).message,
+    StartsWith("The handle is invalid."));
+
+  EXPECT_THAT(
+    WindowsError(ERROR_INVALID_PARAMETER).message,
+    StartsWith("The parameter is incorrect."));
+}
+#endif // __WINDOWS__

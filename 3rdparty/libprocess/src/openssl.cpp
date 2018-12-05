@@ -12,7 +12,9 @@
 
 #include "openssl.hpp"
 
+#ifndef __WINDOWS__
 #include <sys/param.h>
+#endif // __WINDOWS__
 
 #include <openssl/err.h>
 #include <openssl/rand.h>
@@ -26,9 +28,19 @@
 
 #include <process/once.hpp>
 
-#include <stout/flags.hpp>
+#include <process/ssl/flags.hpp>
+
 #include <stout/os.hpp>
 #include <stout/strings.hpp>
+
+#ifdef __WINDOWS__
+// OpenSSL on Windows requires this adapter module to be compiled as part of the
+// consuming project to deal with Windows runtime library differences. Not doing
+// so manifests itself as the "no OPENSSL_Applink" runtime error.
+//
+// https://www.openssl.org/docs/faq.html
+#include <openssl/applink.c>
+#endif // __WINDOWS__
 
 using std::map;
 using std::ostringstream;
@@ -113,6 +125,16 @@ Flags::Flags()
       // DeveloperGuide/elb-security-policy-table.html
       "AES128-SHA:AES256-SHA:RC4-SHA:DHE-RSA-AES128-SHA:DHE-DSS-AES128-SHA:"
       "DHE-RSA-AES256-SHA:DHE-DSS-AES256-SHA");
+
+  add(&Flags::ecdh_curves,
+      "ecdh_curves",
+      "Colon separated list of curve NID or names, e.g. 'P-521:P-384:P-256'. "
+      "The curves are in preference order. If no list is provided, the most "
+      "appropriate curve for a client will be selected. This behavior can be "
+      "explicitly enabled by setting this flag to 'auto'."
+      "NOTE: Old versions of OpenSSL support only one curve, check "
+      "the documentation of your OpenSSL.",
+      "auto");
 
   // We purposely don't have a flag for SSLv2. We do this because most
   // systems have disabled SSLv2 at compilation due to having so many
@@ -280,11 +302,78 @@ string error_string(unsigned long code)
 }
 
 
+#if OPENSSL_VERSION_NUMBER >= 0x0090800fL && !defined(OPENSSL_NO_ECDH)
+// Sets the elliptic curve parameters for the given context in order
+// to enable ECDH ciphers.
+// Adapted from NGINX SSL initialization code:
+// https://github.com/nginx/nginx/blob/bfe36ba3185a477d2f8ce120577308646173b736/
+// src/event/ngx_event_openssl.c#L1080-L1161
+static Try<Nothing> initialize_ecdh_curve(SSL_CTX* ctx, const Flags& ssl_flags)
+{
+#if defined(SSL_OP_SINGLE_ECDH_USE)
+  // Let OpenSSL compute new ECDH parameters for each new handshake.
+  // In newer versions (1.0.2+) of OpenSSL this is the default, and
+  // this call has no effect.
+  SSL_CTX_set_options(ctx, SSL_OP_SINGLE_ECDH_USE);
+#endif // SSL_OP_SINGLE_ECDH_USE
+
+#if (defined SSL_CTX_set1_curves_list || defined SSL_CTRL_SET_CURVES_LIST)
+  // If `SSL_CTX_set_ecdh_auto` is not defined, OpenSSL will ignore the
+  // preference order of the curve list and use its own algorithm to chose
+  // the right curve for a connection.
+#if defined(SSL_CTX_set_ecdh_auto)
+  SSL_CTX_set_ecdh_auto(ctx, 1);
+#endif // SSL_CTX_set_ecdh_auto
+
+  if (ssl_flags.ecdh_curves == "auto") {
+    return Nothing();
+  }
+
+  if (SSL_CTX_set1_curves_list(ctx, ssl_flags.ecdh_curves.c_str()) != 1) {
+    unsigned long error = ERR_get_error();
+    return Error(
+        "Could not load ECDH curves '" + ssl_flags.ecdh_curves + "' " +
+        "(OpenSSL error #" + stringify(error) + "): " + error_string(error));
+  }
+
+  VLOG(2) << "Using ecdh curves: " << ssl_flags.ecdh_curves;
+#else // SSL_CTX_set1_curves_list || SSL_CTRL_SET_CURVES_LIST
+  string curve =
+      ssl_flags.ecdh_curves == "auto" ? "prime256v1" : ssl_flags.ecdh_curves;
+
+  int nid = OBJ_sn2nid(curve.c_str());
+  if (nid == 0) {
+    unsigned long error = ERR_get_error();
+    return Error(
+        "Unknown curve '" + curve + "' (OpenSSL error #" + stringify(error) +
+        "): " + error_string(error));
+  }
+
+  EC_KEY* ecdh = EC_KEY_new_by_curve_name(nid);
+  if (ecdh == nullptr) {
+    unsigned long error = ERR_get_error();
+    return Error(
+        "Error generating key from curve " + curve + "' (OpenSSL error #" +
+        stringify(error) + "): " + error_string(error));
+  }
+
+  SSL_CTX_set_tmp_ecdh(ctx, ecdh);
+  EC_KEY_free(ecdh);
+
+  VLOG(2) << "Using ecdh curve: " << ssl_flags.ecdh_curves;
+#endif // SSL_CTX_set1_curves_list || SSL_CTRL_SET_CURVES_LIST
+  return Nothing();
+}
+#endif // OPENSSL_VERSION_NUMBER >= 0x0090800fL && !OPENSSL_NO_ECDH
+
 // Tests can declare this function and use it to re-configure the SSL
 // environment variables programatically. Without explicitly declaring
 // this function, it is not visible. This is the preferred behavior as
 // we do not want applications changing these settings while they are
 // running (this would be undefined behavior).
+// NOTE: This does not change the configuration of existing sockets, such
+// as the server socket spawned during libprocess initialization.
+// See `reinitialize` in `process.cpp`.
 void reinitialize()
 {
   // Wipe out and recreate the default flags.
@@ -296,28 +385,28 @@ void reinitialize()
   // environment. See comment at top of openssl.hpp for a full list.
   //
   // NOTE: We used to look for environment variables prefixed by SSL_.
-  // To be backward compatible, for each environment variable prefixed
-  // by SSL_, we generate the corresponding LIBPROCESS_SSL_ version.
-  // See details in MESOS-5863.
-  map<string, string> environments = os::environment();
-  foreachpair (const string& key, const string& value, environments) {
-    if (strings::startsWith(key, "SSL_")) {
-      const string new_key = "LIBPROCESS_" + key;
-      if (environments.count(new_key) == 0) {
-        os::setenv(new_key, value);
-      } else if (environments[new_key] != value) {
-        LOG(WARNING) << "Mismatched SSL environment variables: "
-                     << key << "=" << value << ", "
-                     << new_key << "=" << environments[new_key];
-      }
+  // To be backward compatible, we interpret environment variables
+  // prefixed with either SSL_ and LIBPROCESS_SSL_ where the latter
+  // one takes precedence. See details in MESOS-5863.
+  map<string, Option<string>> environment_ssl =
+      ssl_flags->extract("SSL_");
+  map<string, Option<string>> environments =
+      ssl_flags->extract("LIBPROCESS_SSL_");
+  foreachpair (
+      const string& key, const Option<string>& value, environment_ssl) {
+    if (environments.count(key) > 0 && environments.at(key) != value) {
+      LOG(WARNING) << "Mismatched values for SSL environment variables "
+                   << "SSL_" << key << " and "
+                   << "LIBPROCESS_SSL_" << key;
     }
   }
+  environments.insert(environment_ssl.begin(), environment_ssl.end());
 
-  Try<flags::Warnings> load = ssl_flags->load("LIBPROCESS_SSL_");
+  Try<flags::Warnings> load = ssl_flags->load(environments);
   if (load.isError()) {
     EXIT(EXIT_FAILURE)
       << "Failed to load flags from environment variables "
-      << "prefixed by LIBPROCESS_SSL_ or SSL_ (deprecated):"
+      << "prefixed by LIBPROCESS_SSL_ or SSL_ (deprecated): "
       << load.error();
   }
 
@@ -412,39 +501,39 @@ void reinitialize()
   }
 
   if (ssl_flags->ca_file.isNone()) {
-    VLOG(2) << "CA file path is unspecified! NOTE: "
-            << "Set CA file path with LIBPROCESS_SSL_CA_FILE=<filepath>";
+    LOG(INFO) << "CA file path is unspecified! NOTE: "
+              << "Set CA file path with LIBPROCESS_SSL_CA_FILE=<filepath>";
   }
 
   if (ssl_flags->ca_dir.isNone()) {
-    VLOG(2) << "CA directory path unspecified! NOTE: "
-            << "Set CA directory path with LIBPROCESS_SSL_CA_DIR=<dirpath>";
+    LOG(INFO) << "CA directory path unspecified! NOTE: "
+              << "Set CA directory path with LIBPROCESS_SSL_CA_DIR=<dirpath>";
   }
 
   if (!ssl_flags->verify_cert) {
-    VLOG(2) << "Will not verify peer certificate!\n"
-            << "NOTE: Set LIBPROCESS_SSL_VERIFY_CERT=1 to enable "
-            << "peer certificate verification";
+    LOG(INFO) << "Will not verify peer certificate!\n"
+              << "NOTE: Set LIBPROCESS_SSL_VERIFY_CERT=1 to enable "
+              << "peer certificate verification";
   }
 
   if (!ssl_flags->require_cert) {
-    VLOG(2) << "Will only verify peer certificate if presented!\n"
-            << "NOTE: Set LIBPROCESS_SSL_REQUIRE_CERT=1 to require "
-            << "peer certificate verification";
+    LOG(INFO) << "Will only verify peer certificate if presented!\n"
+              << "NOTE: Set LIBPROCESS_SSL_REQUIRE_CERT=1 to require "
+              << "peer certificate verification";
   }
 
   if (ssl_flags->verify_ipadd) {
-    VLOG(2) << "Will use IP address verification in subject alternative name "
-            << "certificate extension.";
+    LOG(INFO) << "Will use IP address verification in subject alternative name "
+              << "certificate extension.";
   }
 
   if (ssl_flags->require_cert && !ssl_flags->verify_cert) {
     // Requiring a certificate implies that is should be verified.
     ssl_flags->verify_cert = true;
 
-    VLOG(2) << "LIBPROCESS_SSL_REQUIRE_CERT implies "
-            << "peer certificate verification.\n"
-            << "LIBPROCESS_SSL_VERIFY_CERT set to true";
+    LOG(INFO) << "LIBPROCESS_SSL_REQUIRE_CERT implies "
+              << "peer certificate verification.\n"
+              << "LIBPROCESS_SSL_VERIFY_CERT set to true";
   }
 
   // Initialize OpenSSL if we've been asked to do verification of peer
@@ -452,37 +541,58 @@ void reinitialize()
   if (ssl_flags->verify_cert) {
     // Set CA locations.
     if (ssl_flags->ca_file.isSome() || ssl_flags->ca_dir.isSome()) {
-      const char* ca_file = ssl_flags->ca_file.isSome()
-        ? ssl_flags->ca_file.get().c_str()
-        : nullptr;
+      const char* ca_file =
+        ssl_flags->ca_file.isSome() ? ssl_flags->ca_file->c_str() : nullptr;
 
-      const char* ca_dir = ssl_flags->ca_dir.isSome()
-        ? ssl_flags->ca_dir.get().c_str()
-        : nullptr;
+      const char* ca_dir =
+        ssl_flags->ca_dir.isSome() ? ssl_flags->ca_dir->c_str() : nullptr;
 
       if (SSL_CTX_load_verify_locations(ctx, ca_file, ca_dir) != 1) {
         unsigned long error = ERR_get_error();
         EXIT(EXIT_FAILURE)
-          << "Could not load CA file and/or directory ("
-          << stringify(error)  << "): "
+          << "Could not load CA file and/or directory (OpenSSL error #"
+          << stringify(error) << "): "
           << error_string(error) << " -> "
           << (ca_file != nullptr ? (stringify("FILE: ") + ca_file) : "")
           << (ca_dir != nullptr ? (stringify("DIR: ") + ca_dir) : "");
       }
 
       if (ca_file != nullptr) {
-        VLOG(2) << "Using CA file: " << ca_file;
+        LOG(INFO) << "Using CA file: " << ca_file;
       }
       if (ca_dir != nullptr) {
-        VLOG(2) << "Using CA dir: " << ca_dir;
+        LOG(INFO) << "Using CA dir: " << ca_dir;
       }
     } else {
       if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
         EXIT(EXIT_FAILURE) << "Could not load default CA file and/or directory";
       }
 
-      VLOG(2) << "Using default CA file '" << X509_get_default_cert_file()
-              << "' and/or directory '" << X509_get_default_cert_dir() << "'";
+      // For getting the defaults for ca-directory and/or ca-file from
+      // openssl, we have to mimic parts of its logic; if the user has
+      // set the openssl-specific environment variable, use that one -
+      // if the user has not set that variable, use the compiled in
+      // defaults.
+      string ca_dir;
+
+      const map<string, string> environment = os::environment();
+
+      if (environment.count(X509_get_default_cert_dir_env()) > 0) {
+        ca_dir = environment.at(X509_get_default_cert_dir_env());
+      } else {
+        ca_dir = X509_get_default_cert_dir();
+      }
+
+      string ca_file;
+
+      if (environment.count(X509_get_default_cert_file_env()) > 0) {
+        ca_file = environment.at(X509_get_default_cert_file_env());
+      } else {
+        ca_file = X509_get_default_cert_file();
+      }
+
+      LOG(INFO) << "Using default CA file '" << ca_file
+                << "' and/or directory '" << ca_dir << "'";
     }
 
     // Set SSL peer verification callback.
@@ -502,28 +612,37 @@ void reinitialize()
   // Set certificate chain.
   if (SSL_CTX_use_certificate_chain_file(
           ctx,
-          ssl_flags->cert_file.get().c_str()) != 1) {
-    EXIT(EXIT_FAILURE) << "Could not load cert file";
+          ssl_flags->cert_file->c_str()) != 1) {
+    unsigned long error = ERR_get_error();
+    EXIT(EXIT_FAILURE)
+      << "Could not load cert file '" << ssl_flags->cert_file.get() << "' "
+      << "(OpenSSL error #" << stringify(error) << "): " << error_string(error);
   }
 
   // Set private key.
   if (SSL_CTX_use_PrivateKey_file(
-          ctx,
-          ssl_flags->key_file.get().c_str(),
-          SSL_FILETYPE_PEM) != 1) {
-    EXIT(EXIT_FAILURE) << "Could not load key file";
+          ctx, ssl_flags->key_file->c_str(), SSL_FILETYPE_PEM) != 1) {
+    unsigned long error = ERR_get_error();
+    EXIT(EXIT_FAILURE)
+      << "Could not load key file '" << ssl_flags->key_file.get() << "' "
+      << "(OpenSSL error #" << stringify(error) << "): " << error_string(error);
   }
 
   // Validate key.
   if (SSL_CTX_check_private_key(ctx) != 1) {
+    unsigned long error = ERR_get_error();
     EXIT(EXIT_FAILURE)
-      << "Private key does not match the certificate public key";
+      << "Private key does not match the certificate public key "
+      << "(OpenSSL error #" << stringify(error) << "): " << error_string(error);
   }
 
   VLOG(2) << "Using ciphers: " << ssl_flags->ciphers;
 
   if (SSL_CTX_set_cipher_list(ctx, ssl_flags->ciphers.c_str()) == 0) {
-    EXIT(EXIT_FAILURE) << "Could not set ciphers: " << ssl_flags->ciphers;
+    unsigned long error = ERR_get_error();
+    EXIT(EXIT_FAILURE)
+      << "Could not set ciphers '" << ssl_flags->ciphers << "' "
+      << "(OpenSSL error #" << stringify(error) << "): " << error_string(error);
   }
 
   // Clear all the protocol options. They will be reset if needed
@@ -555,6 +674,13 @@ void reinitialize()
   if (!ssl_flags->enable_tls_v1_2) { ssl_options |= SSL_OP_NO_TLSv1_2; }
 
   SSL_CTX_set_options(ctx, ssl_options);
+
+#if OPENSSL_VERSION_NUMBER >= 0x0090800fL && !defined(OPENSSL_NO_ECDH)
+  Try<Nothing> ecdh_initialized = initialize_ecdh_curve(ctx, *ssl_flags);
+  if (ecdh_initialized.isError()) {
+    EXIT(EXIT_FAILURE) << ecdh_initialized.error();
+  }
+#endif // OPENSSL_VERSION_NUMBER >= 0x0090800fL && !OPENSSL_NO_ECDH
 }
 
 
@@ -699,7 +825,7 @@ Try<Nothing> verify(
     X509_NAME* name = X509_get_subject_name(cert);
 
     if (name != nullptr) {
-      char text[_POSIX_HOST_NAME_MAX] {};
+      char text[MAXHOSTNAMELEN] {};
 
       if (X509_NAME_get_text_by_NID(
               name,

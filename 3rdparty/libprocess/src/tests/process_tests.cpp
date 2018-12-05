@@ -13,28 +13,31 @@
 #include <errno.h>
 #include <time.h>
 
+#ifndef __WINDOWS__
 #include <arpa/inet.h>
+#endif // __WINDOWS__
 
 #include <gmock/gmock.h>
 
+#ifndef __WINDOWS__
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#endif // __WINDOWS__
 
 #include <atomic>
 #include <sstream>
 #include <string>
-#include <tuple>
 #include <vector>
 
 #include <process/async.hpp>
 #include <process/clock.hpp>
+#include <process/count_down_latch.hpp>
 #include <process/defer.hpp>
 #include <process/delay.hpp>
 #include <process/dispatch.hpp>
 #include <process/executor.hpp>
 #include <process/filter.hpp>
 #include <process/future.hpp>
-#include <process/gc.hpp>
 #include <process/gmock.hpp>
 #include <process/gtest.hpp>
 #include <process/network.hpp>
@@ -58,14 +61,19 @@
 #include <stout/try.hpp>
 
 #include <stout/os/killtree.hpp>
+#include <stout/os/write.hpp>
+
+#include <stout/tests/utils.hpp>
 
 #include "encoder.hpp"
 
 namespace http = process::http;
 namespace inject = process::inject;
+namespace inet4 = process::network::inet4;
 
 using process::async;
 using process::Clock;
+using process::CountDownLatch;
 using process::defer;
 using process::Deferred;
 using process::Event;
@@ -88,8 +96,8 @@ using process::UPID;
 using process::firewall::DisabledEndpointsFirewallRule;
 using process::firewall::FirewallRule;
 
-using process::network::Address;
-using process::network::Socket;
+using process::network::inet::Address;
+using process::network::inet::Socket;
 
 using std::move;
 using std::string;
@@ -98,14 +106,18 @@ using std::vector;
 using testing::_;
 using testing::Assign;
 using testing::DoAll;
+using testing::InvokeWithoutArgs;
 using testing::Return;
 using testing::ReturnArg;
 
 // TODO(bmahler): Move tests into their own files as appropriate.
 
-TEST(ProcessTest, Event)
+class ProcessTest : public TemporaryDirectoryTest {};
+
+
+TEST_F(ProcessTest, Event)
 {
-  Owned<Event> event(new TerminateEvent(UPID()));
+  Owned<Event> event(new TerminateEvent(UPID(), false));
   EXPECT_FALSE(event->is<MessageEvent>());
   EXPECT_FALSE(event->is<ExitedEvent>());
   EXPECT_TRUE(event->is<TerminateEvent>());
@@ -120,17 +132,13 @@ public:
 };
 
 
-TEST(ProcessTest, Spawn)
+TEST_F(ProcessTest, Spawn)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   SpawnProcess process;
 
-  EXPECT_CALL(process, initialize())
-    .Times(1);
+  EXPECT_CALL(process, initialize());
 
-  EXPECT_CALL(process, finalize())
-    .Times(1);
+  EXPECT_CALL(process, finalize());
 
   PID<SpawnProcess> pid = spawn(process);
 
@@ -143,6 +151,18 @@ TEST(ProcessTest, Spawn)
 }
 
 
+struct MoveOnly
+{
+  MoveOnly() {}
+
+  MoveOnly(const MoveOnly&) = delete;
+  MoveOnly(MoveOnly&&) = default;
+
+  MoveOnly& operator=(const MoveOnly&) = delete;
+  MoveOnly& operator=(MoveOnly&&) = default;
+};
+
+
 class DispatchProcess : public Process<DispatchProcess>
 {
 public:
@@ -151,17 +171,20 @@ public:
   MOCK_METHOD1(func2, Future<bool>(bool));
   MOCK_METHOD1(func3, int(int));
   MOCK_METHOD2(func4, Future<bool>(bool, int));
+
+  void func5(MoveOnly&& mo) { func5_(mo); }
+  MOCK_METHOD1(func5_, void(const MoveOnly&));
+
+  bool func6(MoveOnly&& m1, MoveOnly&& m2, bool b) { return func6_(m1, m2, b); }
+  MOCK_METHOD3(func6_, bool(const MoveOnly&, const MoveOnly&, bool));
 };
 
 
-TEST(ProcessTest, Dispatch)
+TEST_F(ProcessTest, Dispatch)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   DispatchProcess process;
 
-  EXPECT_CALL(process, func0())
-    .Times(1);
+  EXPECT_CALL(process, func0());
 
   EXPECT_CALL(process, func1(_))
     .WillOnce(ReturnArg<0>());
@@ -169,11 +192,14 @@ TEST(ProcessTest, Dispatch)
   EXPECT_CALL(process, func2(_))
     .WillOnce(ReturnArg<0>());
 
+  EXPECT_CALL(process, func5_(_));
+
   PID<DispatchProcess> pid = spawn(&process);
 
   ASSERT_FALSE(!pid);
 
   dispatch(pid, &DispatchProcess::func0);
+  dispatch(pid, &DispatchProcess::func5, MoveOnly());
 
   Future<bool> future;
 
@@ -190,14 +216,11 @@ TEST(ProcessTest, Dispatch)
 }
 
 
-TEST(ProcessTest, Defer1)
+TEST_F(ProcessTest, Defer1)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   DispatchProcess process;
 
-  EXPECT_CALL(process, func0())
-    .Times(1);
+  EXPECT_CALL(process, func0());
 
   EXPECT_CALL(process, func1(_))
     .WillOnce(ReturnArg<0>());
@@ -207,6 +230,11 @@ TEST(ProcessTest, Defer1)
 
   EXPECT_CALL(process, func4(_, _))
     .WillRepeatedly(ReturnArg<0>());
+
+  EXPECT_CALL(process, func5_(_));
+
+  EXPECT_CALL(process, func6_(_, _, _))
+    .WillRepeatedly(ReturnArg<2>());
 
   PID<DispatchProcess> pid = spawn(&process);
 
@@ -255,6 +283,26 @@ TEST(ProcessTest, Defer1)
     EXPECT_TRUE(future.get());
   }
 
+  {
+    lambda::CallableOnce<void()> func5 =
+      defer(pid, &DispatchProcess::func5, MoveOnly());
+    std::move(func5)();
+  }
+
+  {
+    lambda::CallableOnce<Future<bool>(MoveOnly&&)> func6 =
+      defer(pid, &DispatchProcess::func6, MoveOnly(), lambda::_1, true);
+    future = std::move(func6)(MoveOnly());
+    EXPECT_TRUE(future.get());
+  }
+
+  {
+    lambda::CallableOnce<Future<bool>(MoveOnly&&)> func6 =
+      defer(pid, &DispatchProcess::func6, MoveOnly(), lambda::_1, false);
+    future = std::move(func6)(MoveOnly());
+    EXPECT_FALSE(future.get());
+  }
+
   // Only take const &!
 
   terminate(pid);
@@ -288,10 +336,8 @@ private:
 };
 
 
-TEST(ProcessTest, Defer2)
+TEST_F(ProcessTest, Defer2)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   DeferProcess process;
 
   PID<DeferProcess> pid = spawn(process);
@@ -322,10 +368,8 @@ void set(T* t1, const T& t2)
 }
 
 
-TEST(ProcessTest, Defer3)
+TEST_F(ProcessTest, Defer3)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   std::atomic_bool bool1(false);
   std::atomic_bool bool2(false);
 
@@ -356,10 +400,8 @@ public:
 };
 
 
-TEST(ProcessTest, Handlers)
+TEST_F(ProcessTest, Handlers)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   HandlersProcess process;
 
   Future<Nothing> func;
@@ -381,10 +423,8 @@ TEST(ProcessTest, Handlers)
 
 // Tests DROP_MESSAGE and DROP_DISPATCH and in particular that an
 // event can get dropped before being processed.
-TEST(ProcessTest, Expect)
+TEST_F(ProcessTest, Expect)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   HandlersProcess process;
 
   EXPECT_CALL(process, func(_, _))
@@ -412,10 +452,8 @@ TEST(ProcessTest, Expect)
 
 
 // Tests the FutureArg<N> action.
-TEST(ProcessTest, Action)
+TEST_F(ProcessTest, Action)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   HandlersProcess process;
 
   PID<HandlersProcess> pid = spawn(&process);
@@ -459,17 +497,14 @@ public:
 };
 
 
-TEST(ProcessTest, Inheritance)
+TEST_F(ProcessTest, Inheritance)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   DerivedProcess process;
 
   EXPECT_CALL(process, func())
     .Times(2);
 
-  EXPECT_CALL(process, foo())
-    .Times(1);
+  EXPECT_CALL(process, foo());
 
   PID<DerivedProcess> pid1 = spawn(&process);
 
@@ -490,10 +525,8 @@ TEST(ProcessTest, Inheritance)
 }
 
 
-TEST(ProcessTest, Thunk)
+TEST_F(ProcessTest, Thunk)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   struct Thunk
   {
     static int run(int i)
@@ -535,10 +568,8 @@ public:
 };
 
 
-TEST(ProcessTest, Delegate)
+TEST_F(ProcessTest, Delegate)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   DelegateeProcess delegatee;
   DelegatorProcess delegator(delegatee.self());
 
@@ -568,10 +599,8 @@ public:
 };
 
 
-TEST(ProcessTest, Delay)
+TEST_F(ProcessTest, Delay)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   Clock::pause();
 
   std::atomic_bool timeoutCalled(false);
@@ -607,10 +636,8 @@ public:
 };
 
 
-TEST(ProcessTest, Order)
+TEST_F(ProcessTest, Order)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   Clock::pause();
 
   TimeoutProcess process1;
@@ -662,10 +689,8 @@ public:
 };
 
 
-TEST(ProcessTest, Donate)
+TEST_F(ProcessTest, Donate)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   DonateProcess process;
   spawn(process);
 
@@ -676,12 +701,14 @@ TEST(ProcessTest, Donate)
 }
 
 
+// TODO(bmahler): Use an RAII-wrapper here to prevent crashes
+// during test assertion failures.
 class ExitedProcess : public Process<ExitedProcess>
 {
 public:
   explicit ExitedProcess(const UPID& _pid) : pid(_pid) {}
 
-  virtual void initialize()
+  void initialize() override
   {
     link(pid);
   }
@@ -693,7 +720,7 @@ private:
 };
 
 
-TEST(ProcessTest, Exited)
+TEST_F(ProcessTest, Exited)
 {
   UPID pid = spawn(new ProcessBase(), true);
 
@@ -715,7 +742,7 @@ TEST(ProcessTest, Exited)
 }
 
 
-TEST(ProcessTest, InjectExited)
+TEST_F(ProcessTest, InjectExited)
 {
   UPID pid = spawn(new ProcessBase(), true);
 
@@ -737,17 +764,71 @@ TEST(ProcessTest, InjectExited)
 }
 
 
+// TODO(bmahler): Move all message interception / dropping tests
+// (of the gmock.hpp functionality) into a separate file.
+TEST_F(ProcessTest, FutureExited)
+{
+  UPID linkee = spawn(new ProcessBase(), true);
+  ExitedProcess linker(linkee);
+
+  Future<Nothing> exited = FUTURE_EXITED(linkee, linker.self());
+
+  Future<UPID> exitedPid;
+  EXPECT_CALL(linker, exited(linkee))
+    .WillOnce(FutureArg<0>(&exitedPid));
+
+  spawn(linker);
+
+  terminate(linkee);
+
+  AWAIT_READY(exited);
+  AWAIT_ASSERT_EQ(linkee, exitedPid);
+
+  terminate(linker);
+  wait(linker);
+}
+
+
+// TODO(bmahler): Move all message interception / dropping tests
+// (of the gmock.hpp functionality) into a separate file.
+TEST_F(ProcessTest, DropExited)
+{
+  UPID linkee = spawn(new ProcessBase(), true);
+  ExitedProcess linker(linkee);
+
+  Future<Nothing> exited = DROP_EXITED(linkee, linker.self());
+
+  Future<UPID> exitedPid;
+  EXPECT_CALL(linker, exited(linkee))
+    .WillRepeatedly(FutureArg<0>(&exitedPid));
+
+  spawn(linker);
+
+  terminate(linkee);
+
+  AWAIT_READY(exited);
+  EXPECT_TRUE(exitedPid.isPending());
+
+  terminate(linker);
+  wait(linker);
+}
+
+
 class MessageEventProcess : public Process<MessageEventProcess>
 {
 public:
-  MOCK_METHOD1(visit, void(const MessageEvent&));
+  // This is a workaround for mocking methods taking
+  // rvalue reference parameters.
+  // See https://github.com/google/googletest/issues/395
+  void consume(MessageEvent&& event) override { consume_(event.message); }
+  MOCK_METHOD1(consume_, void(const Message&));
 };
 
 
 class ProcessRemoteLinkTest : public ::testing::Test
 {
 protected:
-  virtual void SetUp()
+  void SetUp() override
   {
     // Spawn a process to coordinate with the subprocess (test-linkee).
     // The `test-linkee` will send us a message when it has finished
@@ -755,21 +836,41 @@ protected:
     MessageEventProcess coordinator;
     spawn(coordinator);
 
-    Future<MessageEvent> event;
-    EXPECT_CALL(coordinator, visit(_))
-      .WillOnce(FutureArg<0>(&event));
+    Future<Message> message;
+    EXPECT_CALL(coordinator, consume_(_))
+      .WillOnce(FutureArg<0>(&message));
 
+    // TODO(andschwa): Clean this up so that `BUILD_DIR` has the correct
+    // separator at compilation time.
+#ifdef __WINDOWS__
+    const std::string buildDir = strings::replace(BUILD_DIR, "/", "\\");
+#else
+    const std::string buildDir = BUILD_DIR;
+#endif // __WINDOWS__
+
+#ifdef __WINDOWS__
+    constexpr char LINKEENAME[] = "test-linkee.exe";
+#else
+    constexpr char LINKEENAME[] = "test-linkee";
+#endif // __WINDOWS__
+
+    const std::string linkeePath = path::join(buildDir, LINKEENAME);
+    ASSERT_TRUE(os::exists(linkeePath));
+
+    // NOTE: Because of the differences between Windows and POSIX
+    // shells when interpreting quotes, we use the second form of
+    // `subprocess` to call `test-linkee` directly with a set of
+    // arguments, rather than through the shell.
     Try<Subprocess> s = process::subprocess(
-        path::join(BUILD_DIR, "test-linkee") +
-          " '" + stringify(coordinator.self()) + "'");
+        linkeePath, {linkeePath, stringify(coordinator.self())});
     ASSERT_SOME(s);
     linkee = s.get();
 
     // Wait until the subprocess sends us a message.
-    AWAIT_ASSERT_READY(event);
+    AWAIT_ASSERT_READY(message);
 
     // Save the PID of the linkee.
-    pid = event->message->from;
+    pid = message->from;
 
     terminate(coordinator);
     wait(coordinator);
@@ -796,10 +897,10 @@ protected:
     }
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     if (linkee.isSome()) {
-      os::killtree(linkee->pid(), SIGKILL);
+      os::kill(linkee->pid(), SIGKILL);
       reap_linkee();
       linkee = None();
     }
@@ -825,7 +926,7 @@ TEST_F(ProcessRemoteLinkTest, RemoteLink)
 
   spawn(process);
 
-  os::killtree(linkee->pid(), SIGKILL);
+  os::kill(linkee->pid(), SIGKILL);
   reap_linkee();
   linkee = None();
 
@@ -853,7 +954,7 @@ public:
 
   void ping_linkee()
   {
-    send(pid, "whatever", "", 0);
+    send(pid, "whatever");
   }
 
   MOCK_METHOD1(exited, void(const UPID&));
@@ -878,7 +979,7 @@ TEST_F(ProcessRemoteLinkTest, RemoteRelink)
   spawn(process);
   process.relink();
 
-  os::killtree(linkee->pid(), SIGKILL);
+  os::kill(linkee->pid(), SIGKILL);
   reap_linkee();
   linkee = None();
 
@@ -904,7 +1005,7 @@ TEST_F(ProcessRemoteLinkTest, RemoteLinkRelink)
   process.linkup();
   process.relink();
 
-  os::killtree(linkee->pid(), SIGKILL);
+  os::kill(linkee->pid(), SIGKILL);
   reap_linkee();
   linkee = None();
 
@@ -936,7 +1037,7 @@ TEST_F(ProcessRemoteLinkTest, RemoteDoubleLinkRelink)
   relinker.linkup();
   relinker.relink();
 
-  os::killtree(linkee->pid(), SIGKILL);
+  os::kill(linkee->pid(), SIGKILL);
   reap_linkee();
   linkee = None();
 
@@ -945,6 +1046,46 @@ TEST_F(ProcessRemoteLinkTest, RemoteDoubleLinkRelink)
 
   terminate(linker);
   wait(linker);
+
+  terminate(relinker);
+  wait(relinker);
+}
+
+
+// Verifies that remote links will trigger an `ExitedEvent` if the link
+// fails during socket creation. The test instigates a socket creation
+// failure by hogging all available file descriptors.
+//
+// TODO(andschwa): Enable this test. The current logic will not work on Windows
+// as " The Microsoft Winsock provider limits the maximum number of sockets
+// supported only by available memory on the local computer." See MESOS-9093.
+//
+// https://docs.microsoft.com/en-us/windows/desktop/WinSock/maximum-number-of-sockets-supported-2 // NOLINT(whitespace/line_length)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteLinkLeak)
+{
+  RemoteLinkTestProcess relinker(pid);
+  Future<UPID> relinkerExitedPid;
+
+  EXPECT_CALL(relinker, exited(pid))
+    .WillOnce(FutureArg<0>(&relinkerExitedPid));
+
+  spawn(relinker);
+
+  // Open enough sockets to fill up all available FDs.
+  vector<Socket> fdHogs;
+  while (true) {
+    Try<Socket> hog = Socket::create();
+
+    if (hog.isError()) {
+      break;
+    }
+
+    fdHogs.push_back(hog.get());
+  }
+
+  relinker.linkup();
+
+  AWAIT_ASSERT_EQ(pid, relinkerExitedPid);
 
   terminate(relinker);
   wait(relinker);
@@ -960,6 +1101,9 @@ Option<int> get_persistent_socket(const UPID& to);
 } // namespace process {
 
 
+// TODO(hausdorff): Test disabled temporarily because `SHUT_WR` does not exist
+// on Windows. See MESOS-5817.
+#ifndef __WINDOWS__
 // Verifies that sending a message over a socket will fail if the
 // link to the target is broken (i.e. closed) outside of the
 // `SocketManager`s knowledge.
@@ -1013,8 +1157,12 @@ TEST_F(ProcessRemoteLinkTest, RemoteUseStaleLink)
   terminate(process);
   wait(process);
 }
+#endif // __WINDOWS__
 
 
+// TODO(hausdorff): Test disabled temporarily because `SHUT_WR` does not exist
+// on Windows. See MESOS-5817.
+#ifndef __WINDOWS__
 // Verifies that, in a situation where an existing remote link has become
 // "stale", "relinking" prior to sending a message will lead to successful
 // message passing. The existing remote link is broken in the same way as
@@ -1075,6 +1223,7 @@ TEST_F(ProcessRemoteLinkTest, RemoteStaleLinkRelink)
   terminate(process);
   wait(process);
 }
+#endif // __WINDOWS__
 
 
 class SettleProcess : public Process<SettleProcess>
@@ -1082,7 +1231,7 @@ class SettleProcess : public Process<SettleProcess>
 public:
   SettleProcess() : calledDispatch(false) {}
 
-  virtual void initialize()
+  void initialize() override
   {
     os::sleep(Milliseconds(10));
     delay(Seconds(0), self(), &SettleProcess::afterDelay);
@@ -1108,10 +1257,8 @@ public:
 };
 
 
-TEST(ProcessTest, Settle)
+TEST_F(ProcessTest, Settle)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   Clock::pause();
   SettleProcess process;
   spawn(process);
@@ -1123,10 +1270,8 @@ TEST(ProcessTest, Settle)
 }
 
 
-TEST(ProcessTest, Pid)
+TEST_F(ProcessTest, Pid)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   TimeoutProcess process;
 
   PID<TimeoutProcess> pid = process;
@@ -1158,17 +1303,13 @@ public:
 };
 
 
-TEST(ProcessTest, Listener)
+TEST_F(ProcessTest, Listener)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   MultipleListenerProcess process;
 
-  EXPECT_CALL(process, event1())
-    .Times(1);
+  EXPECT_CALL(process, event1());
 
-  EXPECT_CALL(process, event2())
-    .Times(1);
+  EXPECT_CALL(process, event2());
 
   spawn(process);
 
@@ -1188,22 +1329,17 @@ public:
 };
 
 
-TEST(ProcessTest, Executor)
+TEST_F(ProcessTest, Executor_Defer)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
-  std::atomic_bool event1Called(false);
-  std::atomic_bool event2Called(false);
-
   EventReceiver receiver;
+  Executor executor;
+
+  CountDownLatch event1Called;
 
   EXPECT_CALL(receiver, event1(42))
-    .WillOnce(Assign(&event1Called, true));
-
-  EXPECT_CALL(receiver, event2("event2"))
-    .WillOnce(Assign(&event2Called, true));
-
-  Executor executor;
+    .WillOnce(InvokeWithoutArgs([&]() {
+      event1Called.decrement();
+    }));
 
   Deferred<void(int)> event1 =
     executor.defer([&receiver](int i) {
@@ -1212,6 +1348,15 @@ TEST(ProcessTest, Executor)
 
   event1(42);
 
+  AWAIT_READY(event1Called.triggered());
+
+  CountDownLatch event2Called;
+
+  EXPECT_CALL(receiver, event2("event2"))
+    .WillOnce(InvokeWithoutArgs([&]() {
+      event2Called.decrement();
+    }));
+
   Deferred<void(const string&)> event2 =
     executor.defer([&receiver](const string& s) {
       return receiver.event2(s);
@@ -1219,15 +1364,70 @@ TEST(ProcessTest, Executor)
 
   event2("event2");
 
-  while (event1Called.load() == false);
-  while (event2Called.load() == false);
+  AWAIT_READY(event2Called.triggered());
+}
+
+
+TEST_F(ProcessTest, Executor_Execute)
+{
+  Executor executor;
+
+  // A void immutable lambda.
+  CountDownLatch f1Result;
+  auto f1 = [&f1Result] {
+    f1Result.decrement();
+  };
+
+  // Specify the return type explicitly for type checking. Same below.
+  Future<Nothing> f1Called = executor.execute(f1);
+
+  AWAIT_READY(f1Called);
+  AWAIT_READY(f1Result.triggered());
+
+  // A void mutable bind.
+  CountDownLatch f2Result;
+  int f2State = 0;
+  auto f2 = [&f2Result, f2State](int) mutable -> void {
+    f2State++;
+    f2Result.decrement();
+  };
+
+  Future<Nothing> f2Called = executor.execute(std::bind(f2, 42));
+
+  AWAIT_READY(f2Called);
+  AWAIT_READY(f2Result.triggered());
+
+  // A non-void immutable lambda.
+  // NOTE: It appears that g++ throws away the cv-qualifiers when doing
+  // the lvalue-to-rvalue conversion for the returned string but clang
+  // does not, so `f3` should return a non-constant string.
+  string f3Result = "f3";
+  auto f3 = [&f3Result] {
+    return f3Result;
+  };
+
+  Future<string> f3Called = executor.execute(f3);
+
+  AWAIT_EXPECT_EQ(f3Result, f3Called);
+
+  // A mutable bind returning a future.
+  const string f4Result = "f4";
+  int f4State = 0;
+  auto f4 = [&f4Result, f4State](int) mutable -> Future<string> {
+    f4State++;
+    return f4Result;
+  };
+
+  Future<string> f4Called = executor.execute(std::bind(f4, 42));
+
+  AWAIT_EXPECT_EQ(f4Result, f4Called);
 }
 
 
 class RemoteProcess : public Process<RemoteProcess>
 {
 public:
-  RemoteProcess()
+  RemoteProcess() : ProcessBase(process::ID::generate("remote"))
   {
     install("handler", &RemoteProcess::handler);
   }
@@ -1236,10 +1436,8 @@ public:
 };
 
 
-TEST(ProcessTest, Remote)
+TEST_F(ProcessTest, Remote)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   RemoteProcess process;
   spawn(process);
 
@@ -1254,12 +1452,15 @@ TEST(ProcessTest, Remote)
 
   AWAIT_READY(socket.connect(process.self().address));
 
+  Try<Address> sender = socket.address();
+  ASSERT_SOME(sender);
+
   Message message;
   message.name = "handler";
-  message.from = UPID();
+  message.from = UPID("sender", sender.get());
   message.to = process.self();
 
-  const string data = MessageEncoder::encode(&message);
+  const string data = MessageEncoder::encode(message);
 
   AWAIT_READY(socket.send(data));
 
@@ -1271,10 +1472,8 @@ TEST(ProcessTest, Remote)
 
 
 // Like the 'remote' test but uses http::connect.
-TEST(ProcessTest, Http1)
+TEST_F(ProcessTest, Http1)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   RemoteProcess process;
   spawn(process);
 
@@ -1289,6 +1488,11 @@ TEST(ProcessTest, Http1)
 
   http::Connection connection = connect.get();
 
+  Try<process::network::Address> address = connection.localAddress;
+  ASSERT_SOME(address);
+
+  UPID from("sender", process::network::convert<Address>(address.get()).get());
+
   Future<UPID> pid;
   Future<string> body;
   EXPECT_CALL(process, handler(_, _))
@@ -1298,21 +1502,19 @@ TEST(ProcessTest, Http1)
   http::Request request;
   request.method = "POST";
   request.url = url;
-  request.headers["User-Agent"] = "libprocess/";
+  request.headers["User-Agent"] = "libprocess/" + stringify(from);
+  request.keepAlive = true;
   request.body = "hello world";
 
-  // Send the libprocess request. Note that we will not
-  // receive a 202 due to the use of the `User-Agent`
-  // header, therefore we need to explicitly disconnect!
   Future<http::Response> response = connection.send(request);
 
   AWAIT_READY(body);
   ASSERT_EQ("hello world", body.get());
 
   AWAIT_READY(pid);
-  ASSERT_EQ(UPID(), pid.get());
+  ASSERT_EQ(from, pid.get());
 
-  EXPECT_TRUE(response.isPending());
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::Accepted().status, response);
 
   AWAIT_READY(connection.disconnect());
 
@@ -1323,10 +1525,8 @@ TEST(ProcessTest, Http1)
 
 // Like 'http1' but uses the 'Libprocess-From' header. We can
 // also use http::post here since we expect a 202 response.
-TEST(ProcessTest, Http2)
+TEST_F(ProcessTest, Http2)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   RemoteProcess process;
   spawn(process);
 
@@ -1336,14 +1536,14 @@ TEST(ProcessTest, Http2)
 
   Socket socket = create.get();
 
-  ASSERT_SOME(socket.bind(Address()));
+  ASSERT_SOME(socket.bind(inet4::Address::ANY_ANY()));
 
   // Create a UPID for 'Libprocess-From' based on the IP and port we
   // got assigned.
   Try<Address> address = socket.address();
   ASSERT_SOME(address);
 
-  UPID from("", address.get());
+  UPID from("", process.self().address.ip, address->port);
 
   ASSERT_SOME(socket.listen(1));
 
@@ -1419,12 +1619,6 @@ static int foo4(int a, int b, int c, int d)
 }
 
 
-static void bar(int a)
-{
-  return;
-}
-
-
 static Future<string> itoa1(int* const& i)
 {
   std::ostringstream out;
@@ -1441,10 +1635,8 @@ static string itoa2(int* const& i)
 }
 
 
-TEST(ProcessTest, Async)
+TEST_F(ProcessTest, Async)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   // Non-void functions with different no.of args.
   EXPECT_EQ(1, async(&foo).get());
   EXPECT_EQ(10, async(&foo1, 10).get());
@@ -1457,7 +1649,7 @@ TEST(ProcessTest, Async)
   EXPECT_EQ("42", async(&itoa2, &i).get());
 
   // Non-void function that returns a future.
-  EXPECT_EQ("42", async(&itoa1, &i).get().get());
+  EXPECT_EQ("42", async(&itoa1, &i)->get());
 }
 
 
@@ -1467,7 +1659,7 @@ public:
   explicit FileServer(const string& _path)
     : path(_path) {}
 
-  virtual void initialize()
+  void initialize() override
   {
     provide("", path);
   }
@@ -1476,11 +1668,8 @@ public:
 };
 
 
-TEST(ProcessTest, Provide)
+TEST_F(ProcessTest, Provide)
 {
-  const Try<string> mkdtemp = os::mkdtemp();
-  ASSERT_SOME(mkdtemp);
-
   const string LOREM_IPSUM =
       "Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do "
       "eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad "
@@ -1490,7 +1679,7 @@ TEST(ProcessTest, Provide)
       "sint occaecat cupidatat non proident, sunt in culpa qui officia "
       "deserunt mollit anim id est laborum.";
 
-  const string path = path::join(mkdtemp.get(), "lorem.txt");
+  const string path = path::join(sandbox.get(), "lorem.txt");
   ASSERT_SOME(os::write(path, LOREM_IPSUM));
 
   FileServer server(path);
@@ -1500,7 +1689,7 @@ TEST(ProcessTest, Provide)
 
   AWAIT_READY(response);
 
-  ASSERT_EQ(LOREM_IPSUM, response.get().body);
+  ASSERT_EQ(LOREM_IPSUM, response->body);
 
   terminate(server);
   wait(server);
@@ -1515,7 +1704,7 @@ static int baz(string s) { return 42; }
 static Future<int> bam(string s) { return 42; }
 
 
-TEST(ProcessTest, Defers)
+TEST_F(ProcessTest, Defers)
 {
   {
     std::function<Future<int>(string)> f =
@@ -1571,7 +1760,7 @@ TEST(ProcessTest, Defers)
   }
 
 //   {
-//     // CAN NOT DO IN CLANG!
+//     // CANNOT DO IN CLANG!
 //     std::function<void(string)> f =
 //       defer(std::bind(baz, std::placeholders::_1));
 
@@ -1583,7 +1772,7 @@ TEST(ProcessTest, Defers)
 //   }
 
 //   {
-//     // CAN NOT DO WITH GCC OR CLANG!
+//     // CANNOT DO WITH GCC OR CLANG!
 //     std::function<int(int)> f =
 //       defer(std::bind(baz, std::placeholders::_1));
 //   }
@@ -1660,7 +1849,7 @@ public:
   PercentEncodedIDProcess()
     : ProcessBase("id(42)") {}
 
-  virtual void initialize()
+  void initialize() override
   {
     install("handler1", &Self::handler1);
     route("/handler2", None(), &Self::handler2);
@@ -1671,7 +1860,7 @@ public:
 };
 
 
-TEST(ProcessTest, PercentEncodedURLs)
+TEST_F(ProcessTest, PercentEncodedURLs)
 {
   PercentEncodedIDProcess process;
   spawn(process);
@@ -1693,18 +1882,19 @@ TEST(ProcessTest, PercentEncodedURLs)
   EXPECT_CALL(process, handler1(_, _))
     .WillOnce(FutureSatisfy(&handler1));
 
+  UPID from("sender", process.self().address.ip, 99);
+
   http::Request request;
   request.method = "POST";
   request.url = url;
-  request.headers["User-Agent"] = "libprocess/";
+  request.headers["User-Agent"] = "libprocess/" + stringify(from);
+  request.keepAlive = true;
 
-  // Send the libprocess request. Note that we will not
-  // receive a 202 due to the use of the `User-Agent`
-  // header, therefore we need to explicitly disconnect!
   Future<http::Response> response = connection.send(request);
 
   AWAIT_READY(handler1);
-  EXPECT_TRUE(response.isPending());
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::Accepted().status, response);
 
   AWAIT_READY(connection.disconnect());
 
@@ -1717,9 +1907,7 @@ TEST(ProcessTest, PercentEncodedURLs)
 
   response = http::get(pid, "handler2");
 
-  AWAIT_READY(response);
-  EXPECT_EQ(http::Status::OK, response->code);
-  EXPECT_EQ(http::Status::string(http::Status::OK), response->status);
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
 
   terminate(process);
   wait(process);
@@ -1732,7 +1920,7 @@ public:
   explicit HTTPEndpointProcess(const string& id)
     : ProcessBase(id) {}
 
-  virtual void initialize()
+  void initialize() override
   {
     route(
         "/handler1",
@@ -1756,16 +1944,15 @@ public:
 
 // Sets firewall rules which disable endpoints on a process and then
 // attempts to connect to those endpoints.
-TEST(ProcessTest, FirewallDisablePaths)
+TEST_F(ProcessTest, FirewallDisablePaths)
 {
   const string id = "testprocess";
 
   hashset<string> endpoints = {
-    path::join("", id, "handler1"),
-    path::join("", id, "handler2/nested"),
+    strings::join("/", "", id, "handler1"),
+    strings::join("/", "", id, "handler2", "nested"),
     // Patterns are not supported, so this should do nothing.
-    path::join("", id, "handler3/*")
-  };
+    strings::join("/", "", id, "handler3", "*")};
 
   process::firewall::install(
       {Owned<FirewallRule>(new DisabledEndpointsFirewallRule(endpoints))});
@@ -1841,14 +2028,12 @@ TEST(ProcessTest, FirewallDisablePaths)
 
 // Test that firewall rules can be changed by changing the vector.
 // An empty vector should allow all paths.
-TEST(ProcessTest, FirewallUninstall)
+TEST_F(ProcessTest, FirewallUninstall)
 {
   const string id = "testprocess";
 
-  hashset<string> endpoints = {
-    path::join("", id, "handler1"),
-    path::join("", id, "handler2")
-  };
+  hashset<string> endpoints = {strings::join("/", "", id, "handler1"),
+                               strings::join("/", "", id, "handler2")};
 
   process::firewall::install(
       {Owned<FirewallRule>(new DisabledEndpointsFirewallRule(endpoints))});

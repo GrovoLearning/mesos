@@ -20,6 +20,7 @@
 
 #include <process/defer.hpp>
 #include <process/dispatch.hpp>
+#include <process/id.hpp>
 #include <process/owned.hpp>
 #include <process/process.hpp>
 
@@ -40,7 +41,8 @@ public:
   FixedResourceEstimatorProcess(
       const lambda::function<Future<ResourceUsage>()>& _usage,
       const Resources& _totalRevocable)
-    : usage(_usage),
+    : ProcessBase(process::ID::generate("fixed-resource-estimator")),
+      usage(_usage),
       totalRevocable(_totalRevocable) {}
 
   Future<Resources> oversubscribable()
@@ -55,7 +57,13 @@ public:
       allocatedRevocable += Resources(executor.allocated()).revocable();
     }
 
-    return totalRevocable - allocatedRevocable;
+    auto unallocated = [](const Resources& resources) {
+      Resources result = resources;
+      result.unallocate();
+      return result;
+    };
+
+    return totalRevocable - unallocated(allocatedRevocable);
   }
 
 protected:
@@ -76,7 +84,7 @@ public:
     }
   }
 
-  virtual ~FixedResourceEstimator()
+  ~FixedResourceEstimator() override
   {
     if (process.get() != nullptr) {
       terminate(process.get());
@@ -84,8 +92,8 @@ public:
     }
   }
 
-  virtual Try<Nothing> initialize(
-      const lambda::function<Future<ResourceUsage>()>& usage)
+  Try<Nothing> initialize(
+      const lambda::function<Future<ResourceUsage>()>& usage) override
   {
     if (process.get() != nullptr) {
       return Error("Fixed resource estimator has already been initialized");
@@ -97,7 +105,7 @@ public:
     return Nothing();
   }
 
-  virtual Future<Resources> oversubscribable()
+  Future<Resources> oversubscribable() override
   {
     if (process.get() == nullptr) {
       return Failure("Fixed resource estimator is not initialized");

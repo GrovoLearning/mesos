@@ -16,7 +16,7 @@
 
 #include <string>
 
-#include <process/metrics/gauge.hpp>
+#include <process/metrics/pull_gauge.hpp>
 #include <process/metrics/metrics.hpp>
 
 #include <stout/foreach.hpp>
@@ -30,7 +30,7 @@ namespace mesos {
 namespace internal {
 namespace slave {
 
-using process::metrics::Gauge;
+using process::metrics::PullGauge;
 
 Metrics::Metrics(const Slave& slave)
   : uptime_secs(
@@ -64,6 +64,8 @@ Metrics::Metrics(const Slave& slave)
         "slave/tasks_killed"),
     tasks_lost(
         "slave/tasks_lost"),
+    tasks_gone(
+        "slave/tasks_gone"),
     executors_registering(
         "slave/executors_registering",
         defer(slave, &Slave::_executors_registering)),
@@ -107,6 +109,7 @@ Metrics::Metrics(const Slave& slave)
   process::metrics::add(tasks_failed);
   process::metrics::add(tasks_killed);
   process::metrics::add(tasks_lost);
+  process::metrics::add(tasks_gone);
 
   process::metrics::add(executors_registering);
   process::metrics::add(executors_running);
@@ -130,15 +133,15 @@ Metrics::Metrics(const Slave& slave)
   const string resources[] = {"cpus", "gpus", "mem", "disk"};
 
   foreach (const string& resource, resources) {
-    Gauge total(
+    PullGauge total(
         "slave/" + resource + "_total",
         defer(slave, &Slave::_resources_total, resource));
 
-    Gauge used(
+    PullGauge used(
         "slave/" + resource + "_used",
         defer(slave, &Slave::_resources_used, resource));
 
-    Gauge percent(
+    PullGauge percent(
         "slave/" + resource + "_percent",
         defer(slave, &Slave::_resources_percent, resource));
 
@@ -152,15 +155,15 @@ Metrics::Metrics(const Slave& slave)
   }
 
   foreach (const string& resource, resources) {
-    Gauge total(
+    PullGauge total(
         "slave/" + resource + "_revocable_total",
         defer(slave, &Slave::_resources_revocable_total, resource));
 
-    Gauge used(
+    PullGauge used(
         "slave/" + resource + "_revocable_used",
         defer(slave, &Slave::_resources_revocable_used, resource));
 
-    Gauge percent(
+    PullGauge percent(
         "slave/" + resource + "_revocable_percent",
         defer(slave, &Slave::_resources_revocable_percent, resource));
 
@@ -193,6 +196,7 @@ Metrics::~Metrics()
   process::metrics::remove(tasks_failed);
   process::metrics::remove(tasks_killed);
   process::metrics::remove(tasks_lost);
+  process::metrics::remove(tasks_gone);
 
   process::metrics::remove(executors_registering);
   process::metrics::remove(executors_running);
@@ -210,35 +214,53 @@ Metrics::~Metrics()
 
   process::metrics::remove(container_launch_errors);
 
-  foreach (const Gauge& gauge, resources_total) {
+  foreach (const PullGauge& gauge, resources_total) {
     process::metrics::remove(gauge);
   }
   resources_total.clear();
 
-  foreach (const Gauge& gauge, resources_used) {
+  foreach (const PullGauge& gauge, resources_used) {
     process::metrics::remove(gauge);
   }
   resources_used.clear();
 
-  foreach (const Gauge& gauge, resources_percent) {
+  foreach (const PullGauge& gauge, resources_percent) {
     process::metrics::remove(gauge);
   }
   resources_percent.clear();
 
-  foreach (const Gauge& gauge, resources_revocable_total) {
+  foreach (const PullGauge& gauge, resources_revocable_total) {
     process::metrics::remove(gauge);
   }
   resources_revocable_total.clear();
 
-  foreach (const Gauge& gauge, resources_revocable_used) {
+  foreach (const PullGauge& gauge, resources_revocable_used) {
     process::metrics::remove(gauge);
   }
   resources_revocable_used.clear();
 
-  foreach (const Gauge& gauge, resources_revocable_percent) {
+  foreach (const PullGauge& gauge, resources_revocable_percent) {
     process::metrics::remove(gauge);
   }
   resources_revocable_percent.clear();
+
+  if (recovery_time_secs.isSome()) {
+    process::metrics::remove(recovery_time_secs.get());
+  }
+}
+
+
+void Metrics::setRecoveryTime(const Duration& duration)
+{
+  CHECK_NONE(recovery_time_secs);
+
+  const double recovery_seconds = duration.secs();
+
+  recovery_time_secs = process::metrics::PullGauge(
+        "slave/recovery_time_secs",
+        [recovery_seconds]() { return recovery_seconds;});
+
+  process::metrics::add(recovery_time_secs.get());
 }
 
 } // namespace slave {

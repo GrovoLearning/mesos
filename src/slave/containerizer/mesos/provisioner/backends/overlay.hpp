@@ -41,19 +41,22 @@ class OverlayBackendProcess;
 //                        |-- <rootfs_id> (the scratch space)
 //                            |-- upperdir
 //                            |-- workdir
+//                            |-- links (symlink to temp dir with links to layers) // NOLINT(whitespace/line_length)
 class OverlayBackend : public Backend
 {
 public:
-  virtual ~OverlayBackend();
+  ~OverlayBackend() override;
 
   static Try<process::Owned<Backend>> create(const Flags&);
 
-  virtual process::Future<Nothing> provision(
+  process::Future<Nothing> provision(
       const std::vector<std::string>& layers,
       const std::string& rootfs,
-      const std::string& backendDir);
+      const std::string& backendDir) override;
 
-  virtual process::Future<bool> destroy(const std::string& rootfs);
+  process::Future<bool> destroy(
+      const std::string& rootfs,
+      const std::string& backendDir) override;
 
 private:
   explicit OverlayBackend(process::Owned<OverlayBackendProcess> process);

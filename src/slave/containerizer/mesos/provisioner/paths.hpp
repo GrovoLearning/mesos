@@ -36,17 +36,34 @@ namespace paths {
 // |-- provisioner
 //     |-- containers
 //         |-- <container_id>
+//             |-- layers (paths to all layers to provision)
 //             |-- backends
 //                 |-- <backend> (copy, bind, etc.)
 //                     |-- rootfses
 //                         |-- <rootfs_id> (the rootfs)
+//             |-- containers (nested containers)
+//                 |-- <container_id>
+//                     |-- layers (paths to all layers to provision)
+//                     |-- backends
+//                         |-- <backend> (copy, bind, etc.)
+//                             |-- rootfses
+//                                 |-- <rootfs_id> (the rootfs)
 //
 // There can be multiple backends due to the change of backend flags.
 // Under each backend a rootfs is identified by the 'rootfs_id' which
 // is a UUID.
 
 
+constexpr char LAYERS_FILE[] = "layers";
+
+
+// TODO(gilbert): rename this to `getContainerPath` for consistency.
 std::string getContainerDir(
+    const std::string& provisionerDir,
+    const ContainerID& containerId);
+
+
+std::string getLayersFilePath(
     const std::string& provisionerDir,
     const ContainerID& containerId);
 

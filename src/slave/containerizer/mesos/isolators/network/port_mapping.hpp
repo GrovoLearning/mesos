@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include <process/id.hpp>
 #include <process/owned.hpp>
 #include <process/subprocess.hpp>
 
@@ -148,32 +149,32 @@ class PortMappingIsolatorProcess : public MesosIsolatorProcess
 public:
   static Try<mesos::slave::Isolator*> create(const Flags& flags);
 
-  virtual ~PortMappingIsolatorProcess() {}
+  ~PortMappingIsolatorProcess() override {}
 
-  virtual process::Future<Nothing> recover(
-      const std::list<mesos::slave::ContainerState>& states,
-      const hashset<ContainerID>& orphans);
+  process::Future<Nothing> recover(
+      const std::vector<mesos::slave::ContainerState>& states,
+      const hashset<ContainerID>& orphans) override;
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig);
+      const mesos::slave::ContainerConfig& containerConfig) override;
 
-  virtual process::Future<Nothing> isolate(
+  process::Future<Nothing> isolate(
       const ContainerID& containerId,
-      pid_t pid);
+      pid_t pid) override;
 
-  virtual process::Future<mesos::slave::ContainerLimitation> watch(
-      const ContainerID& containerId);
+  process::Future<mesos::slave::ContainerLimitation> watch(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<Nothing> update(
+  process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources);
+      const Resources& resources) override;
 
-  virtual process::Future<ResourceStatistics> usage(
-      const ContainerID& containerId);
+  process::Future<ResourceStatistics> usage(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<Nothing> cleanup(
-      const ContainerID& containerId);
+  process::Future<Nothing> cleanup(
+      const ContainerID& containerId) override;
 
 private:
   struct Info
@@ -251,7 +252,7 @@ private:
       const std::string& _eth0,
       const std::string& _lo,
       const net::MAC& _hostMAC,
-      const net::IPNetwork& _hostIPNetwork,
+      const net::IP::Network& _hostIPNetwork,
       const size_t _hostEth0MTU,
       const net::IP& _hostDefaultGateway,
       const routing::Handle& _hostTxFqCodelHandle,
@@ -260,7 +261,8 @@ private:
       const IntervalSet<uint16_t>& _managedNonEphemeralPorts,
       const process::Owned<EphemeralPortsAllocator>& _ephemeralPortsAllocator,
       const std::set<uint16_t>& _flowIDs)
-    : flags(_flags),
+    : ProcessBase(process::ID::generate("mesos-port-mapping-isolator")),
+      flags(_flags),
       bindMountRoot(_bindMountRoot),
       eth0(_eth0),
       lo(_lo),
@@ -313,7 +315,7 @@ private:
   const std::string eth0;
   const std::string lo;
   const net::MAC hostMAC;
-  const net::IPNetwork hostIPNetwork;
+  const net::IP::Network hostIPNetwork;
   const size_t hostEth0MTU;
   const net::IP hostDefaultGateway;
   const routing::Handle hostTxFqCodelHandle;
@@ -350,7 +352,7 @@ class PortMappingUpdate : public Subcommand
 public:
   static const char* NAME;
 
-  struct Flags : public flags::FlagsBase
+  struct Flags : public virtual flags::FlagsBase
   {
     Flags();
 
@@ -366,8 +368,8 @@ public:
   Flags flags;
 
 protected:
-  virtual int execute();
-  virtual flags::FlagsBase* getFlags() { return &flags; }
+  int execute() override;
+  flags::FlagsBase* getFlags() override { return &flags; }
 };
 
 
@@ -379,7 +381,7 @@ class PortMappingStatistics : public Subcommand
 public:
   static const char* NAME;
 
-  struct Flags : public flags::FlagsBase
+  struct Flags : public virtual flags::FlagsBase
   {
     Flags();
 
@@ -395,8 +397,8 @@ public:
   Flags flags;
 
 protected:
-  virtual int execute();
-  virtual flags::FlagsBase* getFlags() { return &flags; }
+  int execute() override;
+  flags::FlagsBase* getFlags() override { return &flags; }
 };
 
 } // namespace slave {

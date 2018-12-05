@@ -19,7 +19,7 @@
 
 #include <mesos/mesos.hpp>
 
-#include <mesos/state/protobuf.hpp>
+#include <mesos/state/state.hpp>
 
 #include <process/future.hpp>
 #include <process/owned.hpp>
@@ -39,31 +39,21 @@ class RegistrarProcess;
 
 // Defines an abstraction for operations that can be applied on the
 // Registry.
-// TODO(xujyan): Make Operation generic so that we can apply them
-// against a generic "batch operation applier" abstraction, see TODO
-// below for more details.
-class Operation : public process::Promise<bool>
+// TODO(xujyan): Make RegistryOperation generic so that we can apply
+// them against a generic "batch operation applier" abstraction, see
+// the TODO below for more details.
+class RegistryOperation : public process::Promise<bool>
 {
 public:
-  Operation() : success(false) {}
-  virtual ~Operation() {}
-
   // Attempts to invoke the operation on the registry object.
   // Aided by accumulator(s):
   //   slaveIDs - is the set of registered slaves.
   //
-  // NOTE: the "strict" parameter only applies to operations that
-  // affect slaves (i.e. registration).  See Flags::registry_strict
-  // in master/flags.cpp for more information.
-  //
   // Returns whether the operation mutates 'registry', or an error if
   // the operation cannot be applied successfully.
-  Try<bool> operator()(
-      Registry* registry,
-      hashset<SlaveID>* slaveIDs,
-      bool strict)
+  Try<bool> operator()(Registry* registry, hashset<SlaveID>* slaveIDs)
   {
-    const Try<bool> result = perform(registry, slaveIDs, strict);
+    const Try<bool> result = perform(registry, slaveIDs);
 
     success = !result.isError();
 
@@ -74,13 +64,10 @@ public:
   bool set() { return process::Promise<bool>::set(success); }
 
 protected:
-  virtual Try<bool> perform(
-      Registry* registry,
-      hashset<SlaveID>* slaveIDs,
-      bool strict) = 0;
+  virtual Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs) = 0;
 
 private:
-  bool success;
+  bool success = false;
 };
 
 
@@ -101,12 +88,10 @@ private:
 class Registrar
 {
 public:
-  // If flags.registry_strict is true, all operations will be
-  // permitted.
   Registrar(const Flags& flags,
-            mesos::state::protobuf::State* state,
+            mesos::state::State* state,
             const Option<std::string>& authenticationRealm = None());
-  ~Registrar();
+  virtual ~Registrar();
 
   // Recovers the Registry, persisting the new Master information.
   // The Registrar must be recovered to allow other operations to
@@ -123,7 +108,8 @@ public:
   //   false if the operation is not permitted.
   //   Failure if the operation fails (possibly lost log leadership),
   //     or recovery failed.
-  process::Future<bool> apply(process::Owned<Operation> operation);
+  virtual process::Future<bool> apply(
+      process::Owned<RegistryOperation> operation);
 
   // Gets the pid of the underlying process.
   // Used in tests.

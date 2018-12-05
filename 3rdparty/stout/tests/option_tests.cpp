@@ -16,6 +16,7 @@
 #include <gmock/gmock.h>
 
 #include <stout/gtest.hpp>
+#include <stout/hashset.hpp>
 #include <stout/none.hpp>
 #include <stout/option.hpp>
 
@@ -102,8 +103,8 @@ TEST(OptionTest, Comparison)
   Option<int> two = 2;
   EXPECT_NE(one, two);
 
-  Option<Option<int> > someNone = Option<Option<int> >::some(None());
-  Option<Option<int> > noneNone = Option<Option<int> >::none();
+  Option<Option<int>> someNone = Option<Option<int>>::some(None());
+  Option<Option<int>> noneNone = Option<Option<int>>::none();
   EXPECT_NE(someNone, noneNone);
   EXPECT_NE(noneNone, someNone);
 }
@@ -172,4 +173,20 @@ TEST(OptionTest, GetOrElse)
   Option<string> none = None();
   EXPECT_EQ("Something", something.getOrElse("Else"));
   EXPECT_EQ("Else", none.getOrElse("Else"));
+}
+
+
+TEST(OptionTest, Hash)
+{
+  hashset<Option<int>> set;
+  set.insert(None());
+
+  EXPECT_EQ(1u, set.size());
+  EXPECT_TRUE(set.contains(None()));
+
+  set.insert(4);
+
+  EXPECT_EQ(2u, set.size());
+  EXPECT_TRUE(set.contains(None()));
+  EXPECT_TRUE(set.contains(4));
 }

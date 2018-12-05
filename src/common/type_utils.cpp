@@ -16,10 +16,14 @@
 
 #include <ostream>
 
+#include <google/protobuf/util/message_differencer.h>
+
 #include <mesos/attributes.hpp>
 #include <mesos/mesos.hpp>
 #include <mesos/resources.hpp>
 #include <mesos/type_utils.hpp>
+
+#include <stout/protobuf.hpp>
 
 #include "messages/messages.hpp"
 
@@ -76,9 +80,21 @@ bool operator==(const CommandInfo& left, const CommandInfo& right)
 
 bool operator==(const CommandInfo::URI& left, const CommandInfo::URI& right)
 {
+  // NOTE: We purposefully do not compare the value of the `cache` field
+  // because a URI downloaded from source or from the fetcher cache should
+  // be considered identical.
   return left.value() == right.value() &&
     left.executable() == right.executable() &&
-    left.extract() == right.extract();
+    left.extract() == right.extract() &&
+    left.output_file() == right.output_file();
+}
+
+
+bool operator==(const ContainerID& left, const ContainerID& right)
+{
+  return left.value() == right.value() &&
+    left.has_parent() == right.has_parent() &&
+    (!left.has_parent() || left.parent() == right.parent());
 }
 
 
@@ -86,6 +102,56 @@ bool operator==(const Credential& left, const Credential& right)
 {
   return left.principal() == right.principal() &&
     left.secret() == right.secret();
+}
+
+
+bool operator==(const CSIPluginInfo& left, const CSIPluginInfo& right)
+{
+  // Order of containers is important.
+  if (left.containers_size() != right.containers_size()) {
+    return false;
+  }
+
+  for (int i = 0; i < left.containers_size(); i++) {
+    if (left.containers(i) != right.containers(i)) {
+      return false;
+    }
+  }
+
+  return left.type() == right.type() &&
+    left.name() == right.name();
+}
+
+
+bool operator==(
+    const CSIPluginContainerInfo& left,
+    const CSIPluginContainerInfo& right)
+{
+  // Order of services is not important.
+  if (left.services_size() != right.services_size()) {
+    return false;
+  }
+
+  vector<bool> used(right.services_size(), false);
+
+  for (int i = 0; i < left.services_size(); i++) {
+    bool found = false;
+    for (int j = 0; j < right.services_size(); j++) {
+      if (left.services(i) == right.services(j) && !used[j]) {
+        found = used[j] = true;
+        break;
+      }
+    }
+    if (!found) {
+      return false;
+    }
+  }
+
+  return left.has_command() == right.has_command() &&
+    (!left.has_command() || left.command() == right.command()) &&
+    Resources(left.resources()) == Resources(right.resources()) &&
+    left.has_container() == right.has_container() &&
+    (!left.has_container() || left.container() == right.container());
 }
 
 
@@ -133,6 +199,12 @@ bool operator==(const Volume& left, const Volume& right)
 bool operator==(const URL& left, const URL& right)
 {
   return left.SerializeAsString() == right.SerializeAsString();
+}
+
+
+bool operator==(const UUID& left, const UUID& right)
+{
+  return left.value() == right.value();
 }
 
 
@@ -308,7 +380,9 @@ bool operator==(const DiscoveryInfo& left, const DiscoveryInfo& right)
 
 bool operator==(const ExecutorInfo& left, const ExecutorInfo& right)
 {
-  return left.executor_id() == right.executor_id() &&
+  return left.has_type() == right.has_type() &&
+    (!left.has_type() || left.type() == right.type()) &&
+    left.executor_id() == right.executor_id() &&
     left.data() == right.data() &&
     Resources(left.resources()) == Resources(right.resources()) &&
     left.command() == right.command() &&
@@ -320,6 +394,12 @@ bool operator==(const ExecutorInfo& left, const ExecutorInfo& right)
 }
 
 
+bool operator!=(const ExecutorInfo& left, const ExecutorInfo& right)
+{
+  return !(left == right);
+}
+
+
 bool operator==(const MasterInfo& left, const MasterInfo& right)
 {
   return left.id() == right.id() &&
@@ -327,7 +407,110 @@ bool operator==(const MasterInfo& left, const MasterInfo& right)
     left.port() == right.port() &&
     left.pid() == right.pid() &&
     left.hostname() == right.hostname() &&
-    left.version() == right.version();
+    left.version() == right.version() &&
+    left.domain() == right.domain();
+}
+
+
+bool operator==(
+    const ResourceProviderInfo::Storage& left,
+    const ResourceProviderInfo::Storage& right)
+{
+  return left.plugin() == right.plugin();
+}
+
+
+bool operator==(
+    const ResourceProviderInfo& left,
+    const ResourceProviderInfo& right)
+{
+  // Order of reservations is important.
+  if (left.default_reservations_size() != right.default_reservations_size()) {
+    return false;
+  }
+
+  for (int i = 0; i < left.default_reservations_size(); i++) {
+    if (left.default_reservations(i) != right.default_reservations(i)) {
+      return false;
+    }
+  }
+
+  return left.has_id() == right.has_id() &&
+    (!left.has_id() || left.id() == right.id()) &&
+    Attributes(left.attributes()) == Attributes(right.attributes()) &&
+    left.type() == right.type() &&
+    left.name() == right.name() &&
+    left.has_storage() == right.has_storage() &&
+    (!left.has_storage() || left.storage() == right.storage());
+}
+
+
+bool operator==(const Offer::Operation& left, const Offer::Operation& right)
+{
+  return google::protobuf::util::MessageDifferencer::Equals(left, right);
+}
+
+
+bool operator==(const Operation& left, const Operation& right)
+{
+  return google::protobuf::util::MessageDifferencer::Equals(left, right);
+}
+
+
+bool operator==(const OperationStatus& left, const OperationStatus& right)
+{
+  if (left.has_operation_id() != right.has_operation_id()) {
+    return false;
+  }
+
+  if (left.has_operation_id() && left.operation_id() != right.operation_id()) {
+    return false;
+  }
+
+  if (left.state() != right.state()) {
+    return false;
+  }
+
+  if (left.has_message() != right.has_message()) {
+    return false;
+  }
+
+  if (left.has_message() && left.message() != right.message()) {
+    return false;
+  }
+
+  if (Resources(left.converted_resources()) !=
+      Resources(right.converted_resources())) {
+    return false;
+  }
+
+  if (left.has_uuid() != right.has_uuid()) {
+    return false;
+  }
+
+  if (left.has_uuid() && left.uuid() != right.uuid()) {
+    return false;
+  }
+
+  return true;
+}
+
+
+bool operator!=(const Offer::Operation& left, const Offer::Operation& right)
+{
+  return !(left == right);
+}
+
+
+bool operator!=(const Operation& left, const Operation& right)
+{
+  return !(left == right);
+}
+
+
+bool operator!=(const OperationStatus& left, const OperationStatus& right)
+{
+  return !(left == right);
 }
 
 
@@ -346,7 +529,8 @@ bool operator==(const SlaveInfo& left, const SlaveInfo& right)
     Attributes(left.attributes()) == Attributes(right.attributes()) &&
     left.id() == right.id() &&
     left.checkpoint() == right.checkpoint() &&
-    left.port() == right.port();
+    left.port() == right.port() &&
+    left.domain() == right.domain();
 }
 
 
@@ -378,6 +562,37 @@ bool operator==(const Task& left, const Task& right)
 }
 
 
+bool operator==(const TaskGroupInfo& left, const TaskGroupInfo& right)
+{
+  // Order of tasks in a task group is not important.
+  if (left.tasks().size() != right.tasks().size()) {
+    return false;
+  }
+
+  for (int i = 0; i < left.tasks().size(); i++) {
+    bool found = false;
+    for (int j = 0; j < right.tasks().size(); j++) {
+      if (left.tasks().Get(i) == right.tasks().Get(j)) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
+// TODO(anand): Consider doing a field by field comparison instead.
+bool operator==(const TaskInfo& left, const TaskInfo& right)
+{
+  return left.SerializeAsString() == right.SerializeAsString();
+}
+
+
 // TODO(bmahler): Use SerializeToString here?
 bool operator==(const TaskStatus& left, const TaskStatus& right)
 {
@@ -401,15 +616,96 @@ bool operator!=(const TaskStatus& left, const TaskStatus& right)
 }
 
 
+bool operator==(const CheckStatusInfo& left, const CheckStatusInfo& right)
+{
+  return left.SerializeAsString() == right.SerializeAsString();
+}
+
+
+bool operator!=(const CheckStatusInfo& left, const CheckStatusInfo& right)
+{
+  return !(left == right);
+}
+
+
+ostream& operator<<(ostream& stream, const CapabilityInfo& capabilityInfo)
+{
+  return stream << JSON::protobuf(capabilityInfo);
+}
+
+
+ostream& operator<<(ostream& stream, const DeviceWhitelist& deviceWhitelist)
+{
+  return stream << JSON::protobuf(deviceWhitelist);
+}
+
+
+ostream& operator<<(ostream& stream, const CheckStatusInfo& checkStatusInfo)
+{
+  switch (checkStatusInfo.type()) {
+    case CheckInfo::COMMAND:
+      if (checkStatusInfo.has_command()) {
+        stream << "COMMAND";
+        if (checkStatusInfo.command().has_exit_code()) {
+          stream << " exit code " << checkStatusInfo.command().exit_code();
+        }
+      }
+      break;
+    case CheckInfo::HTTP:
+      if (checkStatusInfo.has_http()) {
+        stream << "HTTP";
+        if (checkStatusInfo.http().has_status_code()) {
+          stream << " status code " << checkStatusInfo.http().status_code();
+        }
+      }
+      break;
+    case CheckInfo::TCP:
+      if (checkStatusInfo.has_tcp()) {
+        stream << "TCP";
+        if (checkStatusInfo.tcp().has_succeeded()) {
+          stream << (checkStatusInfo.tcp().succeeded() ? " connection success"
+                                                       : " connection failure");
+        }
+      }
+      break;
+    case CheckInfo::UNKNOWN:
+      stream << "UNKNOWN";
+      break;
+  }
+
+  return stream;
+}
+
+
+ostream& operator<<(ostream& stream, const CommandInfo& commandInfo)
+{
+  return stream << JSON::protobuf(commandInfo);
+}
+
+
 ostream& operator<<(ostream& stream, const ContainerID& containerId)
 {
-  return stream << containerId.value();
+  return containerId.has_parent()
+    ? stream << containerId.parent() << "." << containerId.value()
+    : stream << containerId.value();
 }
 
 
 ostream& operator<<(ostream& stream, const ContainerInfo& containerInfo)
 {
   return stream << containerInfo.DebugString();
+}
+
+
+ostream& operator<<(ostream& stream, const DomainInfo& domainInfo)
+{
+  return stream << JSON::protobuf(domainInfo);
+}
+
+
+ostream& operator<<(ostream& stream, const Environment& environment)
+{
+  return stream << JSON::protobuf(environment);
 }
 
 
@@ -443,9 +739,43 @@ ostream& operator<<(ostream& stream, const OfferID& offerId)
 }
 
 
+ostream& operator<<(ostream& stream, const OperationID& operationId)
+{
+  return stream << operationId.value();
+}
+
+
+ostream& operator<<(ostream& stream, const OperationState& state)
+{
+  return stream << OperationState_Name(state);
+}
+
+
 ostream& operator<<(ostream& stream, const RateLimits& limits)
 {
   return stream << limits.DebugString();
+}
+
+
+ostream& operator<<(
+    ostream& stream,
+    const ResourceProviderID& resourceProviderId)
+{
+  return stream << resourceProviderId.value();
+}
+
+
+ostream& operator<<(
+    ostream& stream,
+    const ResourceProviderInfo& resourceProviderInfo)
+{
+  return stream << JSON::protobuf(resourceProviderInfo);
+}
+
+
+ostream& operator<<(ostream& stream, const RLimitInfo& rlimitInfo)
+{
+  return stream << JSON::protobuf(rlimitInfo);
 }
 
 
@@ -494,17 +824,28 @@ ostream& operator<<(ostream& stream, const TaskState& state)
 }
 
 
-ostream& operator<<(ostream& stream, const vector<TaskID>& taskIds)
+ostream& operator<<(ostream& stream, const UUID& uuid)
 {
-  stream << "[ ";
-  for (auto it = taskIds.begin(); it != taskIds.end(); ++it) {
-    if (it != taskIds.begin()) {
-      stream << ", ";
-    }
-    stream << *it;
+  Try<id::UUID> _uuid = id::UUID::fromBytes(uuid.value());
+  if (_uuid.isError()) {
+    return stream << "INVALID UUID";
   }
-  stream << " ]";
-  return stream;
+
+  return stream << _uuid->toString();
+}
+
+
+ostream& operator<<(ostream& stream, const CheckInfo::Type& type)
+{
+  return stream << CheckInfo::Type_Name(type);
+}
+
+
+ostream& operator<<(
+    ostream& stream,
+    const CSIPluginContainerInfo::Service& service)
+{
+  return stream << CSIPluginContainerInfo::Service_Name(service);
 }
 
 
@@ -522,9 +863,25 @@ ostream& operator<<(ostream& stream, const Image::Type& imageType)
 }
 
 
-ostream& operator<<(ostream& stream, const hashmap<string, string>& map)
+ostream& operator<<(ostream& stream, const Secret::Type& secretType)
 {
-  return stream << stringify(map);
+  return stream << Secret::Type_Name(secretType);
+}
+
+
+ostream& operator<<(
+    ostream& stream,
+    const Offer::Operation::Type& operationType)
+{
+  return stream << Offer::Operation::Type_Name(operationType);
+}
+
+
+ostream& operator<<(
+    ostream& stream,
+    const Resource::DiskInfo::Source::Type& sourceType)
+{
+  return stream << Resource::DiskInfo::Source::Type_Name(sourceType);
 }
 
 } // namespace mesos {

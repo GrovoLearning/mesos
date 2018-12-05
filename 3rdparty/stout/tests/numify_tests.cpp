@@ -10,6 +10,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <limits>
+
 #include <gtest/gtest.h>
 
 #include <stout/gtest.hpp>
@@ -23,6 +25,12 @@ TEST(NumifyTest, DecNumberTest)
 
   Try<int> num2 = numify<int>("-10");
   EXPECT_SOME_EQ(-10, num2);
+
+  // `numify<T>` does not return an error if T is an unsigned integral
+  // type and the input is a negative number; rather, it returns the
+  // result of casting the numeric input value to T.
+  Try<unsigned int> num3 = numify<unsigned int>("-1");
+  EXPECT_SOME_EQ(std::numeric_limits<unsigned int>::max(), num3);
 
   EXPECT_ERROR(numify<unsigned int>(""));
   EXPECT_ERROR(numify<int>("-10."));
@@ -38,8 +46,9 @@ TEST(NumifyTest, HexNumberTest)
   Try<unsigned int> num2 = numify<unsigned int>("0x10");
   EXPECT_SOME_EQ(16u, num2);
 
-  // TODO(neilc): This is inconsistent with the handling of non-hex numbers.
-  EXPECT_ERROR(numify<int>("-0x10"));
+  // Keep it consistent with the handling of non-hex numbers.
+  Try<int> num3 = numify<int>("-0x10");
+  EXPECT_SOME_EQ(-0x10, num3);
 
   EXPECT_ERROR(numify<unsigned int>(""));
   EXPECT_ERROR(numify<unsigned int>("0xxyz"));

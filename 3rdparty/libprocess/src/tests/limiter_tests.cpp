@@ -26,10 +26,9 @@ using process::Clock;
 using process::Future;
 using process::RateLimiter;
 
+
 TEST(LimiterTest, Acquire)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   int permits = 2;
   Duration duration = Milliseconds(5);
 
@@ -58,8 +57,6 @@ TEST(LimiterTest, Acquire)
 // be acquired according to the rate limit.
 TEST(LimiterTest, DiscardMiddle)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   int permits = 2;
   Duration duration = Milliseconds(5);
 
@@ -96,8 +93,6 @@ TEST(LimiterTest, DiscardMiddle)
 // 1st and 3rd permits should be acquired according to the rate limit.
 TEST(LimiterTest, DiscardLast)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   int permits = 2;
   Duration duration = Milliseconds(5);
 

@@ -28,6 +28,10 @@
 
 #include <mesos/v1/scheduler/scheduler.hpp>
 
+#include <process/future.hpp>
+
+#include <stout/option.hpp>
+
 namespace mesos {
 
 namespace master {
@@ -41,8 +45,20 @@ namespace scheduler {
 
 class MesosProcess; // Forward declaration.
 
-// Interface to Mesos for a scheduler. Abstracts master detection
-// (connection and disconnection).
+// Abstract interface for connecting a scheduler to Mesos.
+class MesosBase
+{
+public:
+  // Empty virtual destructor (necessary to instantiate subclasses).
+  virtual ~MesosBase() {}
+  virtual void send(const Call& call) = 0;
+  virtual process::Future<APIResult> call(const Call& callMessage) = 0;
+  virtual void reconnect() = 0;
+};
+
+
+// Concrete implementation that connects a scheduler to a Mesos master.
+// Abstracts master detection (connection and disconnection).
 //
 // Expects three callbacks, 'connected', 'disconnected', and
 // 'received' which will get invoked _serially_ when it's determined
@@ -51,7 +67,7 @@ class MesosProcess; // Forward declaration.
 // The library reconnects with the master upon a disconnection.
 //
 // NOTE: All calls and events are dropped while disconnected.
-class Mesos
+class Mesos : public MesosBase
 {
 public:
   // The credential will be used for authenticating with the master. Currently,
@@ -69,7 +85,7 @@ public:
   // Delete assignment operator.
   Mesos& operator=(const Mesos& other) = delete;
 
-  virtual ~Mesos();
+  ~Mesos() override;
 
   // Attempts to send a call to the master.
   //
@@ -81,7 +97,41 @@ public:
   // events without ever being sent to the master. This includes when
   // calls are sent but no master is currently detected (i.e., we're
   // disconnected).
-  virtual void send(const Call& call);
+  void send(const Call& call) override;
+
+  // Attempts to send a call to the master, returning the response.
+  //
+  // The scheduler should only invoke this method once it has received the
+  // 'connected' callback. Otherwise, a `Failure` will be returned.
+  //
+  // Some local validation of calls is performed, and the request will not be
+  // sent to the master if the validation fails.
+  //
+  // A `Failure` will be returned on validation failures or if an error happens
+  // when sending the request to the master, e.g., a master disconnection, or a
+  // deserialization error.
+  //
+  // If it was possible to receive a response from the server, the returned
+  // object will contain the HTTP response status code.
+  //
+  // There are three cases to consider depending on the HTTP response status
+  // code:
+  //
+  //  (1) '202 ACCEPTED': Indicates the call was accepted for processing and
+  //      neither `APIResult::response` nor `APIResult::error` will be set.
+  //
+  //  (2) '200 OK': Indicates the call completed successfully.
+  //      `APIResult::response` will be set if the `scheduler::Call::Type`
+  //      has a corresponding `scheduler::Response::Type`, `APIResult::error`
+  //      will not be set.
+  //
+  //  (3) For all other HTTP status codes, the `APIResult::response` field will
+  //      not be set and the `APIResult::error` field may be set to provide more
+  //      information.
+  //
+  // Note: This method cannot be used to send `SUBSCRIBE` calls, use `send()`
+  // instead.
+  process::Future<APIResult> call(const Call& callMessage) override;
 
   // Force a reconnection with the master.
   //
@@ -94,7 +144,7 @@ public:
   // This call would be ignored if the scheduler is already disconnected with
   // the master (e.g., no new master has been elected). Otherwise, the scheduler
   // would get a 'disconnected' callback followed by a 'connected' callback.
-  virtual void reconnect();
+  void reconnect() override;
 
 protected:
   // NOTE: This constructor is used for testing.

@@ -14,9 +14,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <sys/mount.h>
+
 #include <process/collect.hpp>
+#include <process/id.hpp>
 
 #include <stout/os.hpp>
+
+#include <stout/os/realpath.hpp>
+#include <stout/os/which.hpp>
+
+#include "common/protobuf_utils.hpp"
+
+#include "linux/ns.hpp"
 
 #include "slave/flags.hpp"
 #include "slave/state.hpp"
@@ -39,6 +49,7 @@ using mesos::internal::slave::docker::volume::DriverClient;
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::ContainerLimitation;
+using mesos::slave::ContainerMountInfo;
 using mesos::slave::ContainerState;
 using mesos::slave::Isolator;
 
@@ -50,7 +61,8 @@ DockerVolumeIsolatorProcess::DockerVolumeIsolatorProcess(
     const Flags& _flags,
     const string& _rootDir,
     const Owned<DriverClient>& _client)
-  : flags(_flags),
+  : ProcessBase(process::ID::generate("docker-volume-isolator")),
+    flags(_flags),
     rootDir(_rootDir),
     client(_client) {}
 
@@ -58,11 +70,29 @@ DockerVolumeIsolatorProcess::DockerVolumeIsolatorProcess(
 DockerVolumeIsolatorProcess::~DockerVolumeIsolatorProcess() {}
 
 
+bool DockerVolumeIsolatorProcess::supportsNesting()
+{
+  return true;
+}
+
+
+bool DockerVolumeIsolatorProcess::supportsStandalone()
+{
+  return true;
+}
+
+
 Try<Isolator*> DockerVolumeIsolatorProcess::create(const Flags& flags)
 {
   // Check for root permission.
   if (geteuid() != 0) {
     return Error("The 'docker/volume' isolator requires root permissions");
+  }
+
+  Try<bool> supported = ns::supported(CLONE_NEWNS);
+  if (supported.isError() || !supported.get()) {
+    return Error(
+        "The 'docker/volume' isolator requires mount namespace support");
   }
 
   // TODO(gyliu513): Check dvdcli version, the version need to be
@@ -127,7 +157,7 @@ Try<Isolator*> DockerVolumeIsolatorProcess::_create(
 
 
 Future<Nothing> DockerVolumeIsolatorProcess::recover(
-    const list<ContainerState>& states,
+    const vector<ContainerState>& states,
     const hashset<ContainerID>& orphans)
 {
   if (!os::exists(rootDir)) {
@@ -148,6 +178,20 @@ Future<Nothing> DockerVolumeIsolatorProcess::recover(
     }
   }
 
+  // Recover any orphan containers that we might have check pointed.
+  // These orphan containers will be destroyed by the containerizer
+  // through the regular cleanup path. See MESOS-2367 for details.
+  foreach (const ContainerID& containerId, orphans) {
+    Try<Nothing> recover = _recover(containerId);
+    if (recover.isError()) {
+      return Failure(
+          "Failed to recover docker volumes for orphan container " +
+          stringify(containerId) + ": " + recover.error());
+    }
+  }
+
+  // Walk through all the checkpointed containers to determine if
+  // there are any 'unknown orphan' containers.
   Try<list<string>> entries = os::ls(rootDir);
   if (entries.isError()) {
     return Failure(
@@ -159,22 +203,34 @@ Future<Nothing> DockerVolumeIsolatorProcess::recover(
     ContainerID containerId;
     containerId.set_value(Path(entry).basename());
 
-    if (infos.contains(containerId)) {
+    bool recovered = false;
+    // Check if this container has already been recovered.
+    //
+    // NOTE: We cannot use `infos.contains()` to check the recovery
+    // status of this container, since the recovered `ContainerID` has
+    // only the `value` set. We don't checkpoint the `parent`
+    // associated with the container. Therefore, since we don't know
+    // if the container is a nested container or not, we have to
+    // traverse each entry of the `infos` hashmap and compare the
+    // value fields to identify if the container has already been
+    // recovered.
+    foreachkey (const ContainerID& _containerId, infos) {
+      if (_containerId.value() == containerId.value()) {
+        recovered = true;
+        break;
+      }
+    }
+
+    if (recovered) {
       continue;
     }
 
-    // Recover docker volume information for orphan container.
+    // An unknown orphan container. Recover it and then clean it up.
     Try<Nothing> recover = _recover(containerId);
     if (recover.isError()) {
       return Failure(
           "Failed to recover docker volumes for orphan container " +
           stringify(containerId) + ": " + recover.error());
-    }
-
-    // Known orphan containers will be cleaned up by containerizer
-    // using the normal cleanup path. See MESOS-2367 for details.
-    if (orphans.contains(containerId)) {
-      continue;
     }
 
     LOG(INFO) << "Cleanup volumes for unknown orphaned "
@@ -218,7 +274,7 @@ Try<Nothing> DockerVolumeIsolatorProcess::_recover(
     return Nothing();
   }
 
-  Try<string> read = os::read(volumesPath);
+  Result<string> read = state::read<string>(volumesPath);
   if (read.isError()) {
     return Error(
         "Failed to read docker volumes checkpoint file '" +
@@ -261,20 +317,18 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
     const ContainerID& containerId,
     const ContainerConfig& containerConfig)
 {
-  const ExecutorInfo& executorInfo = containerConfig.executor_info();
-
-  if (!executorInfo.has_container()) {
+  if (!containerConfig.has_container_info()) {
     return None();
   }
 
-  if (executorInfo.container().type() != ContainerInfo::MESOS) {
+  if (containerConfig.container_info().type() != ContainerInfo::MESOS) {
     return Failure(
         "Can only prepare docker volume driver for a MESOS container");
   }
 
   // The hashset is used to check if there are duplicated docker
   // volume for the same container.
-  hashset<DockerVolume> volumes;
+  hashset<DockerVolume> volumeSet;
 
   // Represents mounts that will be sent to the driver client.
   struct Mount
@@ -283,12 +337,18 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
     hashmap<string, string> options;
   };
 
+
+  // TODO(qianzhang): Here we use vector to ensure the order of mount target,
+  // mount source and volume mode which is kind of hacky, we could consider
+  // to introduce a dedicated struct for it in future.
   vector<Mount> mounts;
 
   // The mount points in the container.
   vector<string> targets;
 
-  foreach (const Volume& _volume, executorInfo.container().volumes()) {
+  vector<Volume::Mode> volumeModes;
+
+  foreach (const Volume& _volume, containerConfig.container_info().volumes()) {
     if (!_volume.has_source()) {
       continue;
     }
@@ -314,7 +374,7 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
     volume.set_driver(driver);
     volume.set_name(name);
 
-    if (volumes.contains(volume)) {
+    if (volumeSet.contains(volume)) {
       return Failure(
           "Found duplicate docker volume with driver '" +
           driver + "' and name '" + name + "'");
@@ -391,15 +451,16 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
     mount.volume = volume;
     mount.options = options;
 
-    volumes.insert(volume);
+    volumeSet.insert(volume);
     mounts.push_back(mount);
     targets.push_back(target);
+    volumeModes.push_back(_volume.mode());
   }
 
   // It is possible that there is no external volume specified for
   // this container. We avoid checkpointing empty state and creating
   // an empty `Info`.
-  if (volumes.empty()) {
+  if (volumeSet.empty()) {
     return None();
   }
 
@@ -416,7 +477,7 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
 
   // Create DockerVolumes protobuf message to checkpoint.
   DockerVolumes state;
-  foreach (const DockerVolume& volume, volumes) {
+  foreach (const DockerVolume& volume, volumeSet) {
     state.add_volumes()->CopyFrom(volume);
   }
 
@@ -435,10 +496,11 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
 
   VLOG(1) << "Successfully created checkpoint at '" << volumesPath << "'";
 
-  infos.put(containerId, Owned<Info>(new Info(volumes)));
+  infos.put(containerId, Owned<Info>(new Info(volumeSet)));
 
   // Invoke driver client to create the mount.
-  list<Future<string>> futures;
+  vector<Future<string>> futures;
+  futures.reserve(mounts.size());
   foreach (const Mount& mount, mounts) {
     futures.push_back(this->mount(
         mount.volume.driver(),
@@ -455,6 +517,7 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
         &DockerVolumeIsolatorProcess::_prepare,
         containerId,
         targets,
+        volumeModes,
         lambda::_1));
 }
 
@@ -462,10 +525,11 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::prepare(
 Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::_prepare(
     const ContainerID& containerId,
     const vector<string>& targets,
-    const list<Future<string>>& futures)
+    const vector<Volume::Mode>& volumeModes,
+    const vector<Future<string>>& futures)
 {
   ContainerLaunchInfo launchInfo;
-  launchInfo.set_namespaces(CLONE_NEWNS);
+  launchInfo.add_clone_namespaces(CLONE_NEWNS);
 
   vector<string> messages;
   vector<string> sources;
@@ -483,17 +547,20 @@ Future<Option<ContainerLaunchInfo>> DockerVolumeIsolatorProcess::_prepare(
   }
 
   CHECK_EQ(sources.size(), targets.size());
+  CHECK_EQ(sources.size(), volumeModes.size());
 
   for (size_t i = 0; i < sources.size(); i++) {
     const string& source = sources[i];
     const string& target = targets[i];
+    const Volume::Mode volumeMode = volumeModes[i];
 
     LOG(INFO) << "Mounting docker volume mount point '" << source
-              << "' to '" << target  << "' for container " << containerId;
+              << "' to '" << target << "' for container " << containerId;
 
-    const string command = "mount -n --rbind " + source + " " + target;
-
-    launchInfo.add_pre_exec_commands()->set_value(command);
+    *launchInfo.add_mounts() = protobuf::slave::createContainerMount(
+        source,
+        target,
+        MS_BIND | MS_REC | (volumeMode == Volume::RO ? MS_RDONLY : 0));
   }
 
   return launchInfo;
@@ -509,6 +576,18 @@ Future<Nothing> DockerVolumeIsolatorProcess::cleanup(
     return Nothing();
   }
 
+  // Make sure the container we are cleaning up doesn't have any
+  // children (they should have already been cleaned up by a previous
+  // call if it had any).
+  foreachkey (const ContainerID& containerId_, infos) {
+    if (containerId_.has_parent() && containerId_.parent() == containerId) {
+      return Failure(
+          "Failed to clean up container " + stringify(containerId) +
+          ": it has child container " + stringify(containerId_) +
+          " which is not cleaned up yet");
+    }
+  }
+
   hashmap<DockerVolume, int> references;
   foreachvalue (const Owned<Info>& info, infos) {
     foreach (const DockerVolume& volume, info->volumes) {
@@ -520,7 +599,7 @@ Future<Nothing> DockerVolumeIsolatorProcess::cleanup(
     }
   }
 
-  list<Future<Nothing>> futures;
+  vector<Future<Nothing>> futures;
 
   foreach (const DockerVolume& volume, infos[containerId]->volumes) {
     if (references.contains(volume) && references[volume] > 1) {
@@ -550,7 +629,7 @@ Future<Nothing> DockerVolumeIsolatorProcess::cleanup(
 
 Future<Nothing> DockerVolumeIsolatorProcess::_cleanup(
     const ContainerID& containerId,
-    const list<Future<Nothing>>& futures)
+    const vector<Future<Nothing>>& futures)
 {
   CHECK(infos.contains(containerId));
 

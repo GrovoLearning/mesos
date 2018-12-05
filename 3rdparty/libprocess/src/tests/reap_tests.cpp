@@ -55,14 +55,14 @@ TEST(ReapTest, NonChildProcess)
   //  -+- child (exit 0)
   //  -+- grandchild sleep 10
   Try<ProcessTree> tree = Fork(None(),
-                               Fork(Exec("sleep 10")),
+                               Fork(Exec(SLEEP_COMMAND(10))),
                                Exec("exit 0"))();
   ASSERT_SOME(tree);
-  ASSERT_EQ(1u, tree.get().children.size());
-  pid_t grandchild = tree.get().children.front();
+  ASSERT_EQ(1u, tree->children.size());
+  pid_t grandchild = tree->children.front();
 
   // Reap the grandchild process.
-  Future<Option<int> > status = process::reap(grandchild);
+  Future<Option<int>> status = process::reap(grandchild);
 
   EXPECT_TRUE(status.isPending());
 
@@ -83,10 +83,10 @@ TEST(ReapTest, NonChildProcess)
   AWAIT_READY(status);
 
   // The status is None because pid is not an immediate child.
-  ASSERT_NONE(status.get()) << status.get().get();
+  ASSERT_NONE(status.get()) << status->get();
 
   // Reap the child as well to clean up after ourselves.
-  status = process::reap(tree.get().process.pid);
+  status = process::reap(tree->process.pid);
 
   // Now advance time until the child is reaped.
   while (status.isPending()) {
@@ -95,10 +95,7 @@ TEST(ReapTest, NonChildProcess)
   }
 
   // Check if the status is correct.
-  ASSERT_SOME(status.get());
-  int status_ = status.get().get();
-  ASSERT_TRUE(WIFEXITED(status_));
-  ASSERT_EQ(0, WEXITSTATUS(status_));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, status);
 
   Clock::resume();
 }
@@ -108,8 +105,6 @@ TEST(ReapTest, NonChildProcess)
 // the correct exit status.
 TEST(ReapTest, ChildProcess)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   // The child process sleeps and will be killed by the parent.
   Try<ProcessTree> tree = Fork(None(),
                                Exec("sleep 10"))();
@@ -118,7 +113,7 @@ TEST(ReapTest, ChildProcess)
   pid_t child = tree.get();
 
   // Reap the child process.
-  Future<Option<int> > status = process::reap(child);
+  Future<Option<int>> status = process::reap(child);
 
   // Now kill the child.
   EXPECT_EQ(0, kill(child, SIGKILL));
@@ -131,13 +126,8 @@ TEST(ReapTest, ChildProcess)
     Clock::settle();
   }
 
-  AWAIT_READY(status);
-
   // Check if the status is correct.
-  ASSERT_SOME(status.get());
-  int status_ = status.get().get();
-  ASSERT_TRUE(WIFSIGNALED(status_));
-  ASSERT_EQ(SIGKILL, WTERMSIG(status_));
+  AWAIT_EXPECT_WTERMSIG_EQ(SIGKILL, status);
 
   Clock::resume();
 }
@@ -146,8 +136,6 @@ TEST(ReapTest, ChildProcess)
 // Check that we can reap a child process that is already exited.
 TEST(ReapTest, TerminatedChildProcess)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   // The child process immediately exits.
   Try<ProcessTree> tree = Fork(None(),
                                Exec("exit 0"))();
@@ -163,7 +151,7 @@ TEST(ReapTest, TerminatedChildProcess)
     const Result<os::Process> process = os::process(child);
     ASSERT_SOME(process) << "Process " << child << " reaped unexpectedly";
 
-    if (process.get().zombie) {
+    if (process->zombie) {
       break;
     }
 
@@ -171,7 +159,7 @@ TEST(ReapTest, TerminatedChildProcess)
   }
 
   // Now that it's terminated, attempt to reap it.
-  Future<Option<int> > status = process::reap(child);
+  Future<Option<int>> status = process::reap(child);
 
   // Advance time until the reaper sends the notification.
   Clock::pause();
@@ -180,14 +168,8 @@ TEST(ReapTest, TerminatedChildProcess)
     Clock::settle();
   }
 
-  AWAIT_READY(status);
-
   // Expect to get the correct status.
-  ASSERT_SOME(status.get());
-
-  int status_ = status.get().get();
-  ASSERT_TRUE(WIFEXITED(status_));
-  ASSERT_EQ(0, WEXITSTATUS(status_));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, status);
 
   Clock::resume();
 }

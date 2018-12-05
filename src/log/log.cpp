@@ -36,6 +36,7 @@
 #include <stout/nothing.hpp>
 #include <stout/set.hpp>
 
+#include "log/catchup.hpp"
 #include "log/coordinator.hpp"
 #include "log/network.hpp"
 #include "log/recover.hpp"
@@ -94,7 +95,7 @@ LogProcess::LogProcess(
         timeout,
         znode,
         auth,
-        Set<UPID>((UPID) replica->pid()))),
+        {replica->pid()})),
     autoInitialize(_autoInitialize),
     group(new zookeeper::Group(servers, timeout, znode, auth)),
     metrics(*this, metricsPrefix) {}
@@ -128,13 +129,13 @@ void LogProcess::finalize()
 {
   if (recovering.isSome()) {
     // Stop the recovery if it is still pending.
-    Future<Owned<Replica> > future = recovering.get();
+    Future<Owned<Replica>> future = recovering.get();
     future.discard();
   }
 
   // If there exist operations that are gated by the recovery, we fail
   // all of them because the log is being deleted.
-  foreach (process::Promise<Shared<Replica> >* promise, promises) {
+  foreach (process::Promise<Shared<Replica>>* promise, promises) {
     promise->fail("Log is being deleted");
     delete promise;
   }
@@ -153,7 +154,7 @@ void LogProcess::finalize()
 }
 
 
-Future<Shared<Replica> > LogProcess::recover()
+Future<Shared<Replica>> LogProcess::recover()
 {
   // The future 'recovered' is used to mark the success (or the
   // failure) of the recovery. We do not use the future 'recovering'
@@ -174,8 +175,8 @@ Future<Shared<Replica> > LogProcess::recover()
   // Recovery has not finished yet. Create a promise and queue it such
   // that it can get notified once the recovery has finished (either
   // succeeded or failed).
-  process::Promise<Shared<Replica> >* promise =
-    new process::Promise<Shared<Replica> >();
+  process::Promise<Shared<Replica>>* promise =
+    new process::Promise<Shared<Replica>>();
 
   promises.push_back(promise);
 
@@ -205,7 +206,7 @@ void LogProcess::_recover()
 {
   CHECK_SOME(recovering);
 
-  Future<Owned<Replica> > future = recovering.get();
+  Future<Owned<Replica>> future = recovering.get();
 
   if (!future.isReady()) {
     VLOG(2) << "Log recovery failed";
@@ -218,7 +219,7 @@ void LogProcess::_recover()
     // Mark the failure of the recovery.
     recovered.fail(failure);
 
-    foreach (process::Promise<Shared<Replica> >* promise, promises) {
+    foreach (process::Promise<Shared<Replica>>* promise, promises) {
       promise->fail(failure);
       delete promise;
     }
@@ -233,7 +234,7 @@ void LogProcess::_recover()
     // Mark the success of the recovery.
     recovered.set(Nothing());
 
-    foreach (process::Promise<Shared<Replica> >* promise, promises) {
+    foreach (process::Promise<Shared<Replica>>* promise, promises) {
       promise->set(replica);
       delete promise;
     }
@@ -280,23 +281,6 @@ void LogProcess::discarded()
 }
 
 
-LogProcess::Metrics::Metrics(
-    const LogProcess& process,
-    const Option<string>& prefix)
-  : recovered(
-        prefix.getOrElse("") + "log/recovered",
-        defer(process, &LogProcess::_recovered))
-{
-  process::metrics::add(recovered);
-}
-
-
-LogProcess::Metrics::~Metrics()
-{
-  process::metrics::remove(recovered);
-}
-
-
 /////////////////////////////////////////////////
 // Implementation of LogReaderProcess.
 /////////////////////////////////////////////////
@@ -304,6 +288,8 @@ LogProcess::Metrics::~Metrics()
 
 LogReaderProcess::LogReaderProcess(Log* log)
   : ProcessBase(ID::generate("log-reader")),
+    quorum(log->process->quorum),
+    network(log->process->network),
     recovering(dispatch(log->process, &LogProcess::recover)) {}
 
 
@@ -399,7 +385,7 @@ Future<Log::Position> LogReaderProcess::_ending()
 }
 
 
-Future<list<Log::Entry> > LogReaderProcess::read(
+Future<list<Log::Entry>> LogReaderProcess::read(
     const Log::Position& from,
     const Log::Position& to)
 {
@@ -407,7 +393,7 @@ Future<list<Log::Entry> > LogReaderProcess::read(
 }
 
 
-Future<list<Log::Entry> > LogReaderProcess::_read(
+Future<list<Log::Entry>> LogReaderProcess::_read(
     const Log::Position& from,
     const Log::Position& to)
 {
@@ -418,7 +404,7 @@ Future<list<Log::Entry> > LogReaderProcess::_read(
 }
 
 
-Future<list<Log::Entry> > LogReaderProcess::__read(
+Future<list<Log::Entry>> LogReaderProcess::__read(
     const Log::Position& from,
     const Log::Position& to,
     const list<Action>& actions)
@@ -445,6 +431,21 @@ Future<list<Log::Entry> > LogReaderProcess::__read(
   }
 
   return entries;
+}
+
+
+Future<Log::Position> LogReaderProcess::catchup()
+{
+  return recover().then(defer(self(), &Self::_catchup));
+}
+
+
+Future<Log::Position> LogReaderProcess::_catchup()
+{
+  CHECK_READY(recovering);
+
+  return log::catchup(quorum, recovering.get(), network)
+    .then([](uint64_t end) { return Log::Position(end); });
 }
 
 
@@ -532,13 +533,13 @@ void LogWriterProcess::_recover()
 }
 
 
-Future<Option<Log::Position> > LogWriterProcess::start()
+Future<Option<Log::Position>> LogWriterProcess::start()
 {
   return recover().then(defer(self(), &Self::_start));
 }
 
 
-Future<Option<Log::Position> > LogWriterProcess::_start()
+Future<Option<Log::Position>> LogWriterProcess::_start()
 {
   // We delete the existing coordinator (if exists) and create a new
   // coordinator each time 'start' is called.
@@ -572,9 +573,9 @@ Option<Log::Position> LogWriterProcess::__start(
 }
 
 
-Future<Option<Log::Position> > LogWriterProcess::append(const string& bytes)
+Future<Option<Log::Position>> LogWriterProcess::append(const string& bytes)
 {
-  LOG(INFO) << "Attempting to append " << bytes.size() << " bytes to the log";
+  VLOG(1) << "Attempting to append " << bytes.size() << " bytes to the log";
 
   if (coordinator == nullptr) {
     return Failure("No election has been performed");
@@ -590,10 +591,10 @@ Future<Option<Log::Position> > LogWriterProcess::append(const string& bytes)
 }
 
 
-Future<Option<Log::Position> > LogWriterProcess::truncate(
+Future<Option<Log::Position>> LogWriterProcess::truncate(
     const Log::Position& to)
 {
-  LOG(INFO) << "Attempting to truncate the log to " << to.value;
+  VLOG(1) << "Attempting to truncate the log to " << to.value;
 
   if (coordinator == nullptr) {
     return Failure("No election has been performed");
@@ -711,7 +712,7 @@ Log::Reader::~Reader()
 }
 
 
-Future<list<Log::Entry> > Log::Reader::read(
+Future<list<Log::Entry>> Log::Reader::read(
     const Log::Position& from,
     const Log::Position& to)
 {
@@ -728,6 +729,12 @@ Future<Log::Position> Log::Reader::beginning()
 Future<Log::Position> Log::Reader::ending()
 {
   return dispatch(process, &LogReaderProcess::ending);
+}
+
+
+Future<Log::Position> Log::Reader::catchup()
+{
+  return dispatch(process, &LogReaderProcess::catchup);
 }
 
 
@@ -751,19 +758,19 @@ Log::Writer::~Writer()
 }
 
 
-Future<Option<Log::Position> > Log::Writer::start()
+Future<Option<Log::Position>> Log::Writer::start()
 {
   return dispatch(process, &LogWriterProcess::start);
 }
 
 
-Future<Option<Log::Position> > Log::Writer::append(const string& data)
+Future<Option<Log::Position>> Log::Writer::append(const string& data)
 {
   return dispatch(process, &LogWriterProcess::append, data);
 }
 
 
-Future<Option<Log::Position> > Log::Writer::truncate(const Log::Position& to)
+Future<Option<Log::Position>> Log::Writer::truncate(const Log::Position& to)
 {
   return dispatch(process, &LogWriterProcess::truncate, to);
 }

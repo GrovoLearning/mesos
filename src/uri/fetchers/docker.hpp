@@ -40,17 +40,27 @@ public:
     Flags();
 
     Option<JSON::Object> docker_config;
+    Option<Duration> docker_stall_timeout;
   };
+
+  static const char NAME[];
 
   static Try<process::Owned<Fetcher::Plugin>> create(const Flags& flags);
 
-  virtual ~DockerFetcherPlugin();
+  static std::string getBlobPath(
+      const std::string& directory,
+      const std::string& blobSum);
 
-  virtual std::set<std::string> schemes();
+  ~DockerFetcherPlugin() override;
 
-  virtual process::Future<Nothing> fetch(
+  std::set<std::string> schemes() const override;
+
+  std::string name() const override;
+
+  process::Future<Nothing> fetch(
       const URI& uri,
-      const std::string& directory);
+      const std::string& directory,
+      const Option<std::string>& data = None()) const override;
 
 private:
   explicit DockerFetcherPlugin(

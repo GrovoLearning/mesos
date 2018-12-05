@@ -63,10 +63,10 @@ public:
       executorId(_executorId),
       state(DISCONNECTED) {}
 
-  virtual ~LongLivedExecutor() = default;
+  ~LongLivedExecutor() override = default;
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // We initialize the library here to ensure that callbacks are only invoked
     // after the process has spawned.
@@ -111,9 +111,14 @@ protected:
           break;
         }
 
+        case Event::LAUNCH_GROUP: {
+          // TODO(vinod): Implement this.
+          break;
+        }
+
         case Event::ACKNOWLEDGED: {
           // Remove the corresponding update.
-          updates.erase(UUID::fromBytes(event.acknowledged().uuid()).get());
+          updates.erase(id::UUID::fromBytes(event.acknowledged().uuid()).get());
 
           // Remove the corresponding task.
           tasks.erase(event.acknowledged().task_id());
@@ -154,12 +159,12 @@ protected:
     Call::Subscribe* subscribe = call.mutable_subscribe();
 
     // Send all unacknowledged updates.
-    foreach (const Call::Update& update, updates.values()) {
+    foreachvalue (const Call::Update& update, updates) {
       subscribe->add_unacknowledged_updates()->MergeFrom(update);
     }
 
     // Send all unacknowledged tasks.
-    foreach (const TaskInfo& task, tasks.values()) {
+    foreachvalue (const TaskInfo& task, tasks) {
       subscribe->add_unacknowledged_tasks()->MergeFrom(task);
     }
 
@@ -170,13 +175,14 @@ protected:
 
   void update(const TaskInfo& task, const TaskState& state)
   {
-    UUID uuid = UUID::random();
+    id::UUID uuid = id::UUID::random();
 
     TaskStatus status;
     status.mutable_task_id()->CopyFrom(task.task_id());
     status.mutable_executor_id()->CopyFrom(executorId);
     status.set_state(state);
     status.set_source(TaskStatus::SOURCE_EXECUTOR);
+    status.set_timestamp(process::Clock::now().secs());
     status.set_uuid(uuid.toBytes());
 
     Call call;
@@ -221,7 +227,7 @@ private:
     SUBSCRIBED
   } state;
 
-  LinkedHashMap<UUID, Call::Update> updates; // Unacknowledged updates.
+  LinkedHashMap<id::UUID, Call::Update> updates; // Unacknowledged updates.
   LinkedHashMap<TaskID, TaskInfo> tasks; // Unacknowledged tasks.
 };
 

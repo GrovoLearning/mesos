@@ -21,9 +21,11 @@
 #include <mesos/mesos.hpp>
 
 #include <mesos/slave/container_logger.hpp>
+#include <mesos/slave/containerizer.hpp>
 
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
+#include <process/id.hpp>
 #include <process/owned.hpp>
 #include <process/process.hpp>
 #include <process/subprocess.hpp>
@@ -36,38 +38,43 @@
 
 #include "slave/container_loggers/sandbox.hpp"
 
-using namespace process;
+using process::Future;
+using process::Process;
+using process::ProcessBase;
 
+using process::dispatch;
+using process::spawn;
+using process::terminate;
+using process::wait;
+
+using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLogger;
+using mesos::slave::ContainerIO;
 
 namespace mesos {
 namespace internal {
 namespace slave {
 
-using SubprocessInfo = ContainerLogger::SubprocessInfo;
-
-
 class SandboxContainerLoggerProcess :
   public Process<SandboxContainerLoggerProcess>
 {
 public:
-  Future<Nothing> recover(
-      const ExecutorInfo& executorInfo,
-      const std::string& sandboxDirectory)
+  SandboxContainerLoggerProcess()
+    : ProcessBase(process::ID::generate("sandbox-logger")) {}
+
+  Future<ContainerIO> prepare(
+      const ContainerID& containerId,
+      const ContainerConfig& containerConfig)
   {
-    return Nothing();
-  }
+    ContainerIO io;
 
-  process::Future<ContainerLogger::SubprocessInfo> prepare(
-      const ExecutorInfo& executorInfo,
-      const std::string& sandboxDirectory)
-  {
-    ContainerLogger::SubprocessInfo info;
+    io.out = ContainerIO::IO::PATH(
+        path::join(containerConfig.directory(), "stdout"));
 
-    info.out = SubprocessInfo::IO::PATH(path::join(sandboxDirectory, "stdout"));
-    info.err = SubprocessInfo::IO::PATH(path::join(sandboxDirectory, "stderr"));
+    io.err = ContainerIO::IO::PATH(
+        path::join(containerConfig.directory(), "stderr"));
 
-    return info;
+    return io;
   }
 };
 
@@ -92,28 +99,15 @@ Try<Nothing> SandboxContainerLogger::initialize()
 }
 
 
-Future<Nothing> SandboxContainerLogger::recover(
-    const ExecutorInfo& executorInfo,
-    const std::string& sandboxDirectory)
-{
-  return dispatch(
-      process.get(),
-      &SandboxContainerLoggerProcess::recover,
-      executorInfo,
-      sandboxDirectory);
-}
-
-
-Future<ContainerLogger::SubprocessInfo>
-SandboxContainerLogger::prepare(
-    const ExecutorInfo& executorInfo,
-    const std::string& sandboxDirectory)
+Future<ContainerIO> SandboxContainerLogger::prepare(
+    const ContainerID& containerId,
+    const ContainerConfig& containerConfig)
 {
   return dispatch(
       process.get(),
       &SandboxContainerLoggerProcess::prepare,
-      executorInfo,
-      sandboxDirectory);
+      containerId,
+      containerConfig);
 }
 
 } // namespace slave {

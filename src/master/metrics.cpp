@@ -16,8 +16,13 @@
 
 #include <string>
 
+#include <mesos/scheduler/scheduler.hpp>
+
+#include <process/http.hpp>
+
 #include <process/metrics/counter.hpp>
-#include <process/metrics/gauge.hpp>
+#include <process/metrics/pull_gauge.hpp>
+#include <process/metrics/push_gauge.hpp>
 #include <process/metrics/metrics.hpp>
 
 #include <stout/foreach.hpp>
@@ -26,7 +31,8 @@
 #include "master/metrics.hpp"
 
 using process::metrics::Counter;
-using process::metrics::Gauge;
+using process::metrics::PullGauge;
+using process::metrics::PushGauge;
 
 using std::string;
 
@@ -56,6 +62,9 @@ Metrics::Metrics(const Master& master)
     slaves_inactive(
         "master/slaves_inactive",
         defer(master, &Master::_slaves_inactive)),
+    slaves_unreachable(
+        "master/slaves_unreachable",
+        defer(master, &Master::_slaves_unreachable)),
     frameworks_connected(
         "master/frameworks_connected",
         defer(master, &Master::_frameworks_connected)),
@@ -80,6 +89,9 @@ Metrics::Metrics(const Master& master)
     tasks_running(
         "master/tasks_running",
         defer(master, &Master::_tasks_running)),
+    tasks_unreachable(
+        "master/tasks_unreachable",
+        defer(master, &Master::_tasks_unreachable)),
     tasks_killing(
         "master/tasks_killing",
         defer(master, &Master::_tasks_killing)),
@@ -93,6 +105,12 @@ Metrics::Metrics(const Master& master)
         "master/tasks_lost"),
     tasks_error(
         "master/tasks_error"),
+    tasks_dropped(
+        "master/tasks_dropped"),
+    tasks_gone(
+        "master/tasks_gone"),
+    tasks_gone_by_operator(
+        "master/tasks_gone_by_operator"),
     dropped_messages(
         "master/dropped_messages"),
     messages_register_framework(
@@ -117,10 +135,14 @@ Metrics::Metrics(const Master& master)
         "master/messages_revive_offers"),
     messages_suppress_offers(
         "master/messages_suppress_offers"),
+    messages_reconcile_operations(
+        "master/messages_reconcile_operations"),
     messages_reconcile_tasks(
         "master/messages_reconcile_tasks"),
     messages_framework_to_executor(
         "master/messages_framework_to_executor"),
+    messages_operation_status_update_acknowledgement(
+        "master/messages_operation_status_update_acknowledgement"),
     messages_executor_to_framework(
         "master/messages_executor_to_framework"),
     messages_register_slave(
@@ -153,6 +175,10 @@ Metrics::Metrics(const Master& master)
         "master/valid_status_update_acknowledgements"),
     invalid_status_update_acknowledgements(
         "master/invalid_status_update_acknowledgements"),
+    valid_operation_status_update_acknowledgements(
+        "master/valid_operation_status_update_acknowledgements"),
+    invalid_operation_status_update_acknowledgements(
+        "master/invalid_operation_status_update_acknowledgements"),
     recovery_slave_removals(
         "master/recovery_slave_removals"),
     event_queue_messages(
@@ -181,7 +207,13 @@ Metrics::Metrics(const Master& master)
     slave_shutdowns_completed(
         "master/slave_shutdowns_completed"),
     slave_shutdowns_canceled(
-        "master/slave_shutdowns_canceled")
+        "master/slave_shutdowns_canceled"),
+    slave_unreachable_scheduled(
+        "master/slave_unreachable_scheduled"),
+    slave_unreachable_completed(
+        "master/slave_unreachable_completed"),
+    slave_unreachable_canceled(
+        "master/slave_unreachable_canceled")
 {
   // TODO(dhamon): Check return values of 'add'.
   process::metrics::add(uptime_secs);
@@ -191,6 +223,7 @@ Metrics::Metrics(const Master& master)
   process::metrics::add(slaves_disconnected);
   process::metrics::add(slaves_active);
   process::metrics::add(slaves_inactive);
+  process::metrics::add(slaves_unreachable);
 
   process::metrics::add(frameworks_connected);
   process::metrics::add(frameworks_disconnected);
@@ -208,6 +241,10 @@ Metrics::Metrics(const Master& master)
   process::metrics::add(tasks_killed);
   process::metrics::add(tasks_lost);
   process::metrics::add(tasks_error);
+  process::metrics::add(tasks_dropped);
+  process::metrics::add(tasks_unreachable);
+  process::metrics::add(tasks_gone);
+  process::metrics::add(tasks_gone_by_operator);
 
   process::metrics::add(dropped_messages);
 
@@ -218,11 +255,13 @@ Metrics::Metrics(const Master& master)
   process::metrics::add(messages_deactivate_framework);
   process::metrics::add(messages_kill_task);
   process::metrics::add(messages_status_update_acknowledgement);
+  process::metrics::add(messages_operation_status_update_acknowledgement);
   process::metrics::add(messages_resource_request);
   process::metrics::add(messages_launch_tasks);
   process::metrics::add(messages_decline_offers);
   process::metrics::add(messages_revive_offers);
   process::metrics::add(messages_suppress_offers);
+  process::metrics::add(messages_reconcile_operations);
   process::metrics::add(messages_reconcile_tasks);
   process::metrics::add(messages_framework_to_executor);
   process::metrics::add(messages_executor_to_framework);
@@ -250,6 +289,9 @@ Metrics::Metrics(const Master& master)
   process::metrics::add(valid_status_update_acknowledgements);
   process::metrics::add(invalid_status_update_acknowledgements);
 
+  process::metrics::add(valid_operation_status_update_acknowledgements);
+  process::metrics::add(invalid_operation_status_update_acknowledgements);
+
   process::metrics::add(recovery_slave_removals);
 
   process::metrics::add(event_queue_messages);
@@ -267,21 +309,25 @@ Metrics::Metrics(const Master& master)
   process::metrics::add(slave_shutdowns_completed);
   process::metrics::add(slave_shutdowns_canceled);
 
+  process::metrics::add(slave_unreachable_scheduled);
+  process::metrics::add(slave_unreachable_completed);
+  process::metrics::add(slave_unreachable_canceled);
+
   // Create resource gauges.
   // TODO(dhamon): Set these up dynamically when adding a slave based on the
   // resources the slave exposes.
   const string resources[] = {"cpus", "gpus", "mem", "disk"};
 
   foreach (const string& resource, resources) {
-    Gauge total(
+    PullGauge total(
         "master/" + resource + "_total",
         defer(master, &Master::_resources_total, resource));
 
-    Gauge used(
+    PullGauge used(
         "master/" + resource + "_used",
         defer(master, &Master::_resources_used, resource));
 
-    Gauge percent(
+    PullGauge percent(
         "master/" + resource + "_percent",
         defer(master, &Master::_resources_percent, resource));
 
@@ -295,15 +341,15 @@ Metrics::Metrics(const Master& master)
   }
 
   foreach (const string& resource, resources) {
-    Gauge total(
+    PullGauge total(
         "master/" + resource + "_revocable_total",
         defer(master, &Master::_resources_revocable_total, resource));
 
-    Gauge used(
+    PullGauge used(
         "master/" + resource + "_revocable_used",
         defer(master, &Master::_resources_revocable_used, resource));
 
-    Gauge percent(
+    PullGauge percent(
         "master/" + resource + "_revocable_percent",
         defer(master, &Master::_resources_revocable_percent, resource));
 
@@ -328,6 +374,7 @@ Metrics::~Metrics()
   process::metrics::remove(slaves_disconnected);
   process::metrics::remove(slaves_active);
   process::metrics::remove(slaves_inactive);
+  process::metrics::remove(slaves_unreachable);
 
   process::metrics::remove(frameworks_connected);
   process::metrics::remove(frameworks_disconnected);
@@ -345,6 +392,10 @@ Metrics::~Metrics()
   process::metrics::remove(tasks_killed);
   process::metrics::remove(tasks_lost);
   process::metrics::remove(tasks_error);
+  process::metrics::remove(tasks_dropped);
+  process::metrics::remove(tasks_unreachable);
+  process::metrics::remove(tasks_gone);
+  process::metrics::remove(tasks_gone_by_operator);
 
   process::metrics::remove(dropped_messages);
 
@@ -355,11 +406,13 @@ Metrics::~Metrics()
   process::metrics::remove(messages_deactivate_framework);
   process::metrics::remove(messages_kill_task);
   process::metrics::remove(messages_status_update_acknowledgement);
+  process::metrics::remove(messages_operation_status_update_acknowledgement);
   process::metrics::remove(messages_resource_request);
   process::metrics::remove(messages_launch_tasks);
   process::metrics::remove(messages_decline_offers);
   process::metrics::remove(messages_revive_offers);
   process::metrics::remove(messages_suppress_offers);
+  process::metrics::remove(messages_reconcile_operations);
   process::metrics::remove(messages_reconcile_tasks);
   process::metrics::remove(messages_framework_to_executor);
   process::metrics::remove(messages_executor_to_framework);
@@ -387,6 +440,9 @@ Metrics::~Metrics()
   process::metrics::remove(valid_status_update_acknowledgements);
   process::metrics::remove(invalid_status_update_acknowledgements);
 
+  process::metrics::remove(valid_operation_status_update_acknowledgements);
+  process::metrics::remove(invalid_operation_status_update_acknowledgements);
+
   process::metrics::remove(recovery_slave_removals);
 
   process::metrics::remove(event_queue_messages);
@@ -404,32 +460,36 @@ Metrics::~Metrics()
   process::metrics::remove(slave_shutdowns_completed);
   process::metrics::remove(slave_shutdowns_canceled);
 
-  foreach (const Gauge& gauge, resources_total) {
+  process::metrics::remove(slave_unreachable_scheduled);
+  process::metrics::remove(slave_unreachable_completed);
+  process::metrics::remove(slave_unreachable_canceled);
+
+  foreach (const PullGauge& gauge, resources_total) {
     process::metrics::remove(gauge);
   }
   resources_total.clear();
 
-  foreach (const Gauge& gauge, resources_used) {
+  foreach (const PullGauge& gauge, resources_used) {
     process::metrics::remove(gauge);
   }
   resources_used.clear();
 
-  foreach (const Gauge& gauge, resources_percent) {
+  foreach (const PullGauge& gauge, resources_percent) {
     process::metrics::remove(gauge);
   }
   resources_percent.clear();
 
-  foreach (const Gauge& gauge, resources_revocable_total) {
+  foreach (const PullGauge& gauge, resources_revocable_total) {
     process::metrics::remove(gauge);
   }
   resources_revocable_total.clear();
 
-  foreach (const Gauge& gauge, resources_revocable_used) {
+  foreach (const PullGauge& gauge, resources_revocable_used) {
     process::metrics::remove(gauge);
   }
   resources_revocable_used.clear();
 
-  foreach (const Gauge& gauge, resources_revocable_percent) {
+  foreach (const PullGauge& gauge, resources_revocable_percent) {
     process::metrics::remove(gauge);
   }
   resources_revocable_percent.clear();
@@ -442,6 +502,24 @@ Metrics::~Metrics()
     }
   }
   tasks_states.clear();
+}
+
+
+void Metrics::incrementInvalidSchedulerCalls(const scheduler::Call& call) {
+  if (call.type() == scheduler::Call::ACKNOWLEDGE) {
+    invalid_status_update_acknowledgements++;
+  }
+
+  if (call.type() == scheduler::Call::ACKNOWLEDGE_OPERATION_STATUS) {
+    invalid_operation_status_update_acknowledgements++;
+  }
+
+  if (call.type() == scheduler::Call::MESSAGE) {
+    invalid_framework_to_executor_messages++;
+  }
+
+  // TODO(gkleiman): Increment other metrics when we add counters for all
+  // the different types of scheduler calls. See MESOS-8533.
 }
 
 
@@ -473,6 +551,327 @@ void Metrics::incrementTasksStates(
   counter++;
 }
 
+
+FrameworkMetrics::FrameworkMetrics(
+    const FrameworkInfo& _frameworkInfo,
+    bool _publishPerFrameworkMetrics)
+  : frameworkInfo(_frameworkInfo),
+    publishPerFrameworkMetrics(_publishPerFrameworkMetrics),
+    subscribed(
+        getFrameworkMetricPrefix(frameworkInfo) + "subscribed"),
+    calls(
+        getFrameworkMetricPrefix(frameworkInfo) + "calls"),
+    events(
+        getFrameworkMetricPrefix(frameworkInfo) + "events"),
+    offers_sent(
+        getFrameworkMetricPrefix(frameworkInfo) + "offers/sent"),
+    offers_accepted(
+        getFrameworkMetricPrefix(frameworkInfo) + "offers/accepted"),
+    offers_declined(
+        getFrameworkMetricPrefix(frameworkInfo) + "offers/declined"),
+    offers_rescinded(
+        getFrameworkMetricPrefix(frameworkInfo) + "offers/rescinded"),
+    operations(
+        getFrameworkMetricPrefix(frameworkInfo) + "operations")
+{
+  addMetric(subscribed);
+  addMetric(offers_sent);
+  addMetric(offers_accepted);
+  addMetric(offers_declined);
+  addMetric(offers_rescinded);
+
+  // Add metrics for scheduler calls.
+  addMetric(calls);
+  for (int index = 0;
+       index < scheduler::Call::Type_descriptor()->value_count();
+       index++) {
+    const google::protobuf::EnumValueDescriptor* descriptor =
+      scheduler::Call::Type_descriptor()->value(index);
+
+    const scheduler::Call::Type type =
+      static_cast<scheduler::Call::Type>(descriptor->number());
+
+    if (type == scheduler::Call::UNKNOWN) {
+      continue;
+    }
+
+    Counter counter = Counter(
+        getFrameworkMetricPrefix(frameworkInfo) + "calls/" +
+        strings::lower(descriptor->name()));
+
+    call_types.put(type, counter);
+    addMetric(counter);
+  }
+
+  // Add metrics for scheduler events.
+  addMetric(events);
+  for (int index = 0;
+       index < scheduler::Event::Type_descriptor()->value_count();
+       index++) {
+    const google::protobuf::EnumValueDescriptor* descriptor =
+      scheduler::Event::Type_descriptor()->value(index);
+
+    const scheduler::Event::Type type =
+      static_cast<scheduler::Event::Type>(descriptor->number());
+
+    if (type == scheduler::Event::UNKNOWN) {
+      continue;
+    }
+
+    Counter counter = Counter(
+        getFrameworkMetricPrefix(frameworkInfo) + "events/" +
+        strings::lower(descriptor->name()));
+
+    event_types.put(type, counter);
+    addMetric(counter);
+  }
+
+  // Add metrics for both active and terminal task states.
+  for (int index = 0; index < TaskState_descriptor()->value_count(); index++) {
+    const google::protobuf::EnumValueDescriptor* descriptor =
+      TaskState_descriptor()->value(index);
+
+    const TaskState state = static_cast<TaskState>(descriptor->number());
+
+    if (protobuf::isTerminalState(state)) {
+      Counter counter = Counter(
+          getFrameworkMetricPrefix(frameworkInfo) + "tasks/terminal/" +
+          strings::lower(descriptor->name()));
+
+      terminal_task_states.put(state, counter);
+      addMetric(counter);
+    } else {
+      PushGauge gauge = PushGauge(
+          getFrameworkMetricPrefix(frameworkInfo) + "tasks/active/" +
+          strings::lower(TaskState_Name(state)));
+
+      active_task_states.put(state, gauge);
+      addMetric(gauge);
+    }
+  }
+
+  // Add metrics for offer operations.
+  addMetric(operations);
+  for (int index = 0;
+       index < Offer::Operation::Type_descriptor()->value_count();
+       index++) {
+    const google::protobuf::EnumValueDescriptor* descriptor =
+      Offer::Operation::Type_descriptor()->value(index);
+
+    const Offer::Operation::Type type =
+      static_cast<Offer::Operation::Type>(descriptor->number());
+
+    if (type == Offer::Operation::UNKNOWN) {
+      continue;
+    }
+
+    Counter counter =
+      Counter(getFrameworkMetricPrefix(frameworkInfo) +
+      "operations/" + strings::lower(descriptor->name()));
+
+    operation_types.put(type, counter);
+    addMetric(counter);
+  }
+}
+
+
+FrameworkMetrics::~FrameworkMetrics()
+{
+  removeMetric(subscribed);
+
+  removeMetric(calls);
+  foreachvalue (const Counter& counter, call_types) {
+    removeMetric(counter);
+  }
+
+  process::metrics::remove(events);
+  foreachvalue (const Counter& counter, event_types) {
+    removeMetric(counter);
+  }
+
+  removeMetric(offers_sent);
+  removeMetric(offers_accepted);
+  removeMetric(offers_declined);
+  removeMetric(offers_rescinded);
+
+  foreachvalue (const Counter& counter, terminal_task_states) {
+    removeMetric(counter);
+  }
+
+  foreachvalue (const PushGauge& gauge, active_task_states) {
+    removeMetric(gauge);
+  }
+
+  process::metrics::remove(operations);
+  foreachvalue (const Counter& counter, operation_types) {
+    removeMetric(counter);
+  }
+}
+
+
+void FrameworkMetrics::incrementCall(const scheduler::Call::Type& callType)
+{
+  CHECK(call_types.contains(callType));
+
+  call_types.get(callType).get()++;
+  calls++;
+}
+
+
+void FrameworkMetrics::incrementTaskState(const TaskState& state)
+{
+  if (protobuf::isTerminalState(state)) {
+    CHECK(terminal_task_states.contains(state));
+    terminal_task_states.get(state).get()++;
+  } else {
+    CHECK(active_task_states.contains(state));
+    active_task_states.get(state).get() += 1;
+  }
+}
+
+
+void FrameworkMetrics::decrementActiveTaskState(const TaskState& state)
+{
+  CHECK(active_task_states.contains(state));
+
+  active_task_states.get(state).get() -= 1;
+}
+
+
+void FrameworkMetrics::incrementOperation(const Offer::Operation& operation)
+{
+  CHECK(operation_types.contains(operation.type()));
+
+  operation_types.get(operation.type()).get()++;
+  operations++;
+}
+
+
+string getFrameworkMetricPrefix(const FrameworkInfo& frameworkInfo)
+{
+  // Percent-encode the framework name to avoid characters like '/' and ' '.
+  return "master/frameworks/" + process::http::encode(frameworkInfo.name()) +
+    "/" + stringify(frameworkInfo.id()) + "/";
+}
+
+
+template <typename T>
+void FrameworkMetrics::addMetric(const T& metric)  {
+  if (publishPerFrameworkMetrics) {
+    process::metrics::add(metric);
+  }
+}
+
+
+template <typename T>
+void FrameworkMetrics::removeMetric(const T& metric)  {
+  if (publishPerFrameworkMetrics) {
+    process::metrics::remove(metric);
+  }
+}
+
+
+void FrameworkMetrics::incrementEvent(const scheduler::Event& event)
+{
+  ++CHECK_NOTNONE(event_types.get(event.type()));
+  ++events;
+}
+
+
+void FrameworkMetrics::incrementEvent(
+    const FrameworkErrorMessage& message)
+{
+  ++CHECK_NOTNONE(event_types.get(scheduler::Event::ERROR));
+  ++events;
+}
+
+
+void FrameworkMetrics::incrementEvent(
+    const ExitedExecutorMessage& message)
+{
+  ++CHECK_NOTNONE(event_types.get(scheduler::Event::FAILURE));
+  ++events;
+}
+
+
+void FrameworkMetrics::incrementEvent(
+    const LostSlaveMessage& message)
+{
+  ++CHECK_NOTNONE(event_types.get(scheduler::Event::FAILURE));
+  ++events;
+}
+
+
+void FrameworkMetrics::incrementEvent(
+    const InverseOffersMessage& message)
+{
+  ++CHECK_NOTNONE(event_types.get(scheduler::Event::INVERSE_OFFERS));
+  ++events;
+}
+
+
+void FrameworkMetrics::incrementEvent(
+    const ExecutorToFrameworkMessage& message)
+{
+  ++CHECK_NOTNONE(event_types.get(scheduler::Event::MESSAGE));
+  ++events;
+}
+
+
+void FrameworkMetrics::incrementEvent(
+    const ResourceOffersMessage& message)
+{
+  ++CHECK_NOTNONE(event_types.get(scheduler::Event::OFFERS));
+  ++events;
+}
+
+
+void FrameworkMetrics::incrementEvent(
+    const RescindResourceOfferMessage& message)
+{
+  ++CHECK_NOTNONE(event_types.get(scheduler::Event::RESCIND));
+  ++events;
+}
+
+
+void FrameworkMetrics::incrementEvent(
+    const RescindInverseOfferMessage& message)
+{
+  ++CHECK_NOTNONE(event_types.get(scheduler::Event::RESCIND_INVERSE_OFFER));
+  ++events;
+}
+
+
+void FrameworkMetrics::incrementEvent(
+    const FrameworkRegisteredMessage& message)
+{
+  ++CHECK_NOTNONE(event_types.get(scheduler::Event::SUBSCRIBED));
+  ++events;
+}
+
+
+void FrameworkMetrics::incrementEvent(
+    const FrameworkReregisteredMessage& message)
+{
+  ++CHECK_NOTNONE(event_types.get(scheduler::Event::SUBSCRIBED));
+  ++events;
+}
+
+
+void FrameworkMetrics::incrementEvent(
+    const StatusUpdateMessage& message)
+{
+  ++CHECK_NOTNONE(event_types.get(scheduler::Event::UPDATE));
+  ++events;
+}
+
+
+void FrameworkMetrics::incrementEvent(
+    const UpdateOperationStatusMessage& message)
+{
+  ++CHECK_NOTNONE(event_types.get(scheduler::Event::UPDATE_OPERATION_STATUS));
+  ++events;
+}
 
 } // namespace master {
 } // namespace internal {

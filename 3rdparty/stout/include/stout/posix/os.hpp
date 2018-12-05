@@ -35,19 +35,25 @@
 #include <unistd.h>
 #include <utime.h>
 
+#include <sys/ioctl.h>
+
 #ifdef __linux__
 #include <linux/version.h>
 #include <sys/sysinfo.h>
 #endif // __linux__
 
+#include <sys/ioctl.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 
 #include <list>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
+
+#include <stout/synchronized.hpp>
 
 #include <stout/os/close.hpp>
 #include <stout/os/environment.hpp>
@@ -59,7 +65,6 @@
 #include <stout/os/os.hpp>
 #include <stout/os/permissions.hpp>
 #include <stout/os/read.hpp>
-#include <stout/os/realpath.hpp>
 #include <stout/os/rename.hpp>
 #include <stout/os/sendfile.hpp>
 #include <stout/os/signals.hpp>
@@ -161,6 +166,28 @@ inline void setenv(const std::string& key,
 // environment variables.
 inline void unsetenv(const std::string& key)
 {
+  // NOTE: This function explicitly does not clear from
+  // `/proc/$pid/environ` because that is defined to be the initial
+  // environment that was set when the process was started, so don't
+  // use this to delete secrets! Instead, see `os::eraseenv`.
+  ::unsetenv(key.c_str());
+}
+
+
+// Erases the value associated with the specified key from the set of
+// environment variables. By erase, we even clear it from
+// `/proc/$pid/environ` so that sensitive information conveyed via
+// environment variables (such as secrets) can be cleaned up.
+inline void eraseenv(const std::string& key)
+{
+  char* value = ::getenv(key.c_str());
+
+  // Erase the old value so that on Linux it can't be inspected
+  // through `/proc/$pid/environ`, useful for secrets.
+  if (value) {
+    ::memset(value, '\0', ::strlen(value));
+  }
+
   ::unsetenv(key.c_str());
 }
 
@@ -207,8 +234,6 @@ inline Try<Nothing> mknod(
 
   return Nothing();
 }
-
-
 
 
 // Suspends execution for the given duration.
@@ -356,21 +381,6 @@ inline Try<std::set<pid_t>> pids(Option<pid_t> group, Option<pid_t> session)
 }
 
 
-// Looks in the environment variables for the specified key and
-// returns a string representation of its value. If no environment
-// variable matching key is found, None() is returned.
-inline Option<std::string> getenv(const std::string& key)
-{
-  char* value = ::getenv(key.c_str());
-
-  if (value == nullptr) {
-    return None();
-  }
-
-  return std::string(value);
-}
-
-
 // Creates a tar 'archive' with gzip compression, of the given 'path'.
 inline Try<Nothing> tar(const std::string& path, const std::string& archive)
 {
@@ -398,68 +408,93 @@ inline Try<Version> release()
   // TODO(karya): Replace sscanf with Version::parse() once Version
   // starts supporting labels and build metadata.
   if (::sscanf(
-          info.get().release.c_str(),
+          info->release.c_str(),
           "%d.%d.%d",
           &major,
           &minor,
           &patch) != 3) {
-    return Error("Failed to parse: " + info.get().release);
+    return Error("Failed to parse: " + info->release);
   }
 #else
   // TODO(dforsyth): Handle FreeBSD patch versions (-pX).
-  if (::sscanf(info.get().release.c_str(), "%d.%d-%*s", &major, &minor) != 2) {
-    return Error("Failed to parse: " + info.get().release);
+  if (::sscanf(info->release.c_str(), "%d.%d-%*s", &major, &minor) != 2) {
+    return Error("Failed to parse: " + info->release);
   }
 #endif
   return Version(major, minor, patch);
 }
 
 
-inline Option<std::string> which(const std::string& command)
+inline Try<std::string> var()
 {
-  Option<std::string> path = getenv("PATH");
-  if (path.isNone()) {
-    return None();
-  }
-
-  std::vector<std::string> tokens = strings::tokenize(path.get(), ":");
-  foreach (const std::string& token, tokens) {
-    const std::string commandPath = path::join(token, command);
-    if (!os::exists(commandPath)) {
-      continue;
-    }
-
-    Try<os::Permissions> permissions = os::permissions(commandPath);
-    if (permissions.isError()) {
-      continue;
-    }
-
-    if (!permissions.get().owner.x &&
-        !permissions.get().group.x &&
-        !permissions.get().others.x) {
-      continue;
-    }
-
-    return commandPath;
-  }
-
-  return None();
+  return "/var";
 }
 
 
-inline std::string temp()
+inline Try<Nothing> dup2(int oldFd, int newFd)
 {
-  return "/tmp";
-}
-
-
-// Create pipes for interprocess communication.
-inline Try<Nothing> pipe(int pipe_fd[2])
-{
-  if (::pipe(pipe_fd) == -1) {
-    return ErrnoError();
+  while (::dup2(oldFd, newFd) == -1) {
+    if (errno == EINTR) {
+      continue;
+    } else {
+      return ErrnoError();
+    }
   }
   return Nothing();
+}
+
+
+inline Try<std::string> ptsname(int master)
+{
+  // 'ptsname' is not thread safe. Therefore, we use mutex here to
+  // make this method thread safe.
+  // TODO(jieyu): Consider using ptsname_r for linux.
+  static std::mutex* mutex = new std::mutex;
+
+  synchronized (mutex) {
+    const char* slavePath = ::ptsname(master);
+    if (slavePath == nullptr) {
+      return ErrnoError();
+    }
+    return slavePath;
+  }
+}
+
+
+inline Try<Nothing> setctty(int fd)
+{
+  if (ioctl(fd, TIOCSCTTY, nullptr) == -1) {
+    return ErrnoError();
+  }
+
+  return Nothing();
+}
+
+
+// Update the window size for
+// the terminal represented by fd.
+inline Try<Nothing> setWindowSize(
+    int fd,
+    unsigned short rows,
+    unsigned short columns)
+{
+  struct winsize winsize;
+  winsize.ws_row = rows;
+  winsize.ws_col = columns;
+
+  if (ioctl(fd, TIOCSWINSZ, &winsize) != 0) {
+    return ErrnoError();
+  }
+
+  return Nothing();
+}
+
+
+// Returns a host-specific default for the `PATH` environment variable, based
+// on the configuration of the host.
+inline std::string host_default_path()
+{
+  return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 }
 
 } // namespace os {

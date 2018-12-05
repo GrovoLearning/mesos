@@ -21,7 +21,9 @@
 #include <functional>
 #include <string>
 
+#include <process/defer.hpp>
 #include <process/dispatch.hpp>
+#include <process/id.hpp>
 #include <process/io.hpp>
 #include <process/process.hpp>
 
@@ -33,8 +35,12 @@
 #include <stout/stringify.hpp>
 #include <stout/try.hpp>
 
+#include <stout/os/pagesize.hpp>
 #include <stout/os/shell.hpp>
+#include <stout/os/su.hpp>
 #include <stout/os/write.hpp>
+
+#include "logging/logging.hpp"
 
 #include "slave/container_loggers/logrotate.hpp"
 
@@ -47,16 +53,17 @@ class LogrotateLoggerProcess : public Process<LogrotateLoggerProcess>
 {
 public:
   LogrotateLoggerProcess(const Flags& _flags)
-    : flags(_flags),
+    : ProcessBase(process::ID::generate("logrotate-logger")),
+      flags(_flags),
       leading(None()),
       bytesWritten(0)
   {
     // Prepare a buffer for reading from the `incoming` pipe.
-    length = sysconf(_SC_PAGE_SIZE);
+    length = os::pagesize();
     buffer = new char[length];
   }
 
-  virtual ~LogrotateLoggerProcess()
+  ~LogrotateLoggerProcess() override
   {
     if (buffer != nullptr) {
       delete[] buffer;
@@ -92,9 +99,9 @@ public:
     }
 
     // NOTE: This is a prerequisuite for `io::read`.
-    Try<Nothing> nonblock = os::nonblock(STDIN_FILENO);
-    if (nonblock.isError()) {
-      return Failure("Failed to set nonblocking pipe: " + nonblock.error());
+    Try<Nothing> async = io::prepare_async(STDIN_FILENO);
+    if (async.isError()) {
+      return Failure("Failed to set async pipe: " + async.error());
     }
 
     // NOTE: This does not block.
@@ -107,7 +114,7 @@ public:
   void loop()
   {
     io::read(STDIN_FILENO, buffer, length)
-      .then([&](size_t readSize) -> Future<Nothing> {
+      .then(defer(self(), [&](size_t readSize) -> Future<Nothing> {
         // Check if EOF has been reached on the input stream.
         // This indicates that the container (whose logs are being
         // piped to this process) has exited.
@@ -128,7 +135,7 @@ public:
         dispatch(self(), &LogrotateLoggerProcess::loop);
 
         return Nothing();
-      });
+      }));
   }
 
   // Writes the buffer from stdin to the leading log file.
@@ -221,9 +228,17 @@ int main(int argc, char** argv)
   // Load and validate flags from the environment and command line.
   Try<flags::Warnings> load = flags.load(None(), &argc, &argv);
 
-  if (load.isError()) {
-    EXIT(EXIT_FAILURE) << flags.usage(load.error());
+  if (flags.help) {
+    std::cout << flags.usage() << std::endl;
+    return EXIT_SUCCESS;
   }
+
+  if (load.isError()) {
+    std::cerr << flags.usage(load.error()) << std::endl;
+    return EXIT_FAILURE;
+  }
+
+  mesos::internal::logging::initialize(argv[0], false);
 
   // Log any flag warnings.
   foreach (const flags::Warning& warning, load->warnings) {
@@ -236,6 +251,16 @@ int main(int argc, char** argv)
   if (::setsid() == -1) {
     EXIT(EXIT_FAILURE)
       << ErrnoError("Failed to put child in a new session").message;
+  }
+
+  // If the `--user` flag is set, change the UID of this process to that user.
+  if (flags.user.isSome()) {
+    Try<Nothing> result = os::su(flags.user.get());
+
+    if (result.isError()) {
+      EXIT(EXIT_FAILURE)
+        << ErrnoError("Failed to switch user for logrotate process").message;
+    }
   }
 
   // Asynchronously control the flow and size of logs.

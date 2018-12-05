@@ -14,9 +14,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <sys/mount.h>
+
 #include <set>
 
+#include <process/id.hpp>
+
+#include <stout/os.hpp>
+
 #include <stout/os/strerror.hpp>
+
+#include "common/protobuf_utils.hpp"
 
 #include "linux/ns.hpp"
 
@@ -31,6 +39,7 @@ using std::string;
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::ContainerLimitation;
+using mesos::slave::ContainerMountInfo;
 using mesos::slave::ContainerState;
 using mesos::slave::Isolator;
 
@@ -40,7 +49,8 @@ namespace slave {
 
 SharedFilesystemIsolatorProcess::SharedFilesystemIsolatorProcess(
     const Flags& _flags)
-  : flags(_flags) {}
+  : ProcessBase(process::ID::generate("shared-filesystem-isolator")),
+    flags(_flags) {}
 
 
 SharedFilesystemIsolatorProcess::~SharedFilesystemIsolatorProcess() {}
@@ -48,14 +58,15 @@ SharedFilesystemIsolatorProcess::~SharedFilesystemIsolatorProcess() {}
 
 Try<Isolator*> SharedFilesystemIsolatorProcess::create(const Flags& flags)
 {
-  Result<string> user = os::user();
-  if (!user.isSome()) {
-    return Error("Failed to determine user: " +
-                 (user.isError() ? user.error() : "username not found"));
+  if (::geteuid() != 0) {
+    return Error("The 'filesystem/shared' isolator requires root privileges");
   }
 
-  if (user.get() != "root") {
-    return Error("SharedFilesystemIsolator requires root privileges");
+
+  Try<bool> supported = ns::supported(CLONE_NEWNS);
+  if (supported.isError() || !supported.get()) {
+    return Error(
+        "The 'filesystem/shared' isolator requires mount namespace support");
   }
 
   process::Owned<MesosIsolatorProcess> process(
@@ -63,6 +74,7 @@ Try<Isolator*> SharedFilesystemIsolatorProcess::create(const Flags& flags)
 
   return new MesosIsolator(process);
 }
+
 
 // We only need to implement the `prepare()` function in this
 // isolator. There is nothing to recover because we do not keep any
@@ -98,7 +110,7 @@ Future<Option<ContainerLaunchInfo>> SharedFilesystemIsolatorProcess::prepare(
   containerPaths.insert(containerConfig.directory());
 
   ContainerLaunchInfo launchInfo;
-  launchInfo.set_namespaces(CLONE_NEWNS);
+  launchInfo.add_clone_namespaces(CLONE_NEWNS);
 
   foreach (const Volume& volume, executorInfo.container().volumes()) {
     // Because the filesystem is shared we require the container path
@@ -203,8 +215,8 @@ Future<Option<ContainerLaunchInfo>> SharedFilesystemIsolatorProcess::prepare(
       }
     }
 
-    launchInfo.add_pre_exec_commands()->set_value(
-        "mount -n --bind " + hostPath + " " + volume.container_path());
+    *launchInfo.add_mounts() = protobuf::slave::createContainerMount(
+        hostPath, volume.container_path(), MS_BIND | MS_REC);
   }
 
   return launchInfo;

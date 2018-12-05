@@ -38,21 +38,16 @@ namespace fetcher {
  * The combined flags for all built-in plugins.
  */
 class Flags :
-  public CopyFetcherPlugin::Flags,
-#ifdef __WINDOWS__
-  // TODO(dpravat): Add support for Hadoop and Docker plugins. See MESOS-5473.
-  public CurlFetcherPlugin::Flags {};
-#else
-  public CurlFetcherPlugin::Flags,
-  public HadoopFetcherPlugin::Flags,
-  public DockerFetcherPlugin::Flags {};
-#endif // __WINDOWS__
+  public virtual CopyFetcherPlugin::Flags,
+  public virtual CurlFetcherPlugin::Flags,
+  public virtual HadoopFetcherPlugin::Flags,
+  public virtual DockerFetcherPlugin::Flags {};
 
 
 /**
  * Factory method for creating a Fetcher instance.
  */
-Try<process::Owned<Fetcher>> create(const Option<Flags>& flags = None());
+Try<process::Owned<Fetcher>> create(const Option<Flags>& _flags = None());
 
 } // namespace fetcher {
 } // namespace uri {

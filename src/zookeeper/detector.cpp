@@ -39,11 +39,11 @@ class LeaderDetectorProcess : public Process<LeaderDetectorProcess>
 {
 public:
   explicit LeaderDetectorProcess(Group* group);
-  virtual ~LeaderDetectorProcess();
-  virtual void initialize();
+  ~LeaderDetectorProcess() override;
+  void initialize() override;
 
   // LeaderDetector implementation.
-  Future<Option<Group::Membership> > detect(
+  Future<Option<Group::Membership>> detect(
       const Option<Group::Membership>& previous);
 
 private:
@@ -51,11 +51,11 @@ private:
   void watch(const set<Group::Membership>& expected);
 
   // Invoked when the group memberships have changed.
-  void watched(const Future<set<Group::Membership> >& memberships);
+  void watched(const Future<set<Group::Membership>>& memberships);
 
   Group* group;
   Option<Group::Membership> leader;
-  set<Promise<Option<Group::Membership> >*> promises;
+  set<Promise<Option<Group::Membership>>*> promises;
 
   // Potential non-retryable error.
   Option<Error> error;
@@ -63,14 +63,14 @@ private:
 
 
 LeaderDetectorProcess::LeaderDetectorProcess(Group* _group)
-  : ProcessBase(ID::generate("leader-detector")),
+  : ProcessBase(ID::generate("zookeeper-leader-detector")),
     group(_group),
     leader(None()) {}
 
 
 LeaderDetectorProcess::~LeaderDetectorProcess()
 {
-  foreach (Promise<Option<Group::Membership> >* promise, promises) {
+  foreach (Promise<Option<Group::Membership>>* promise, promises) {
     promise->future().discard();
     delete promise;
   }
@@ -84,13 +84,13 @@ void LeaderDetectorProcess::initialize()
 }
 
 
-Future<Option<Group::Membership> > LeaderDetectorProcess::detect(
+Future<Option<Group::Membership>> LeaderDetectorProcess::detect(
     const Option<Group::Membership>& previous)
 {
   // Return immediately if the detector is no longer operational due
   // to the non-retryable error.
   if (error.isSome()) {
-    return Failure(error.get().message);
+    return Failure(error->message);
   }
 
   // Return immediately if the incumbent leader is different from the
@@ -100,8 +100,8 @@ Future<Option<Group::Membership> > LeaderDetectorProcess::detect(
   }
 
   // Otherwise wait for the next election result.
-  Promise<Option<Group::Membership> >* promise =
-    new Promise<Option<Group::Membership> >();
+  Promise<Option<Group::Membership>>* promise =
+    new Promise<Option<Group::Membership>>();
   promises.insert(promise);
   return promise->future();
 }
@@ -115,7 +115,7 @@ void LeaderDetectorProcess::watch(const set<Group::Membership>& expected)
 
 
 void LeaderDetectorProcess::watched(
-    const Future<set<Group::Membership> >& memberships)
+    const Future<set<Group::Membership>>& memberships)
 {
   CHECK(!memberships.isDiscarded());
 
@@ -127,7 +127,7 @@ void LeaderDetectorProcess::watched(
     // will directly fail as a result.
     error = Error(memberships.failure());
     leader = None();
-    foreach (Promise<Option<Group::Membership> >* promise, promises) {
+    foreach (Promise<Option<Group::Membership>>* promise, promises) {
       promise->fail(memberships.failure());
       delete promise;
     }
@@ -136,8 +136,8 @@ void LeaderDetectorProcess::watched(
   }
 
   // Update leader status based on memberships.
-  if (leader.isSome() && memberships.get().count(leader.get()) == 0) {
-    VLOG(1) << "The current leader (id=" << leader.get().id() << ") is lost";
+  if (leader.isSome() && memberships->count(leader.get()) == 0) {
+    VLOG(1) << "The current leader (id=" << leader->id() << ") is lost";
   }
 
   // Run an "election". The leader is the oldest member (smallest
@@ -151,10 +151,10 @@ void LeaderDetectorProcess::watched(
   if (current != leader) {
     LOG(INFO) << "Detected a new leader: "
               << (current.isSome()
-                  ? "(id='" + stringify(current.get().id()) + "')"
+                  ? "(id='" + stringify(current->id()) + "')"
                   : "None");
 
-    foreach (Promise<Option<Group::Membership> >* promise, promises) {
+    foreach (Promise<Option<Group::Membership>>* promise, promises) {
       promise->set(current);
       delete promise;
     }
@@ -181,7 +181,7 @@ LeaderDetector::~LeaderDetector()
 }
 
 
-Future<Option<Group::Membership> > LeaderDetector::detect(
+Future<Option<Group::Membership>> LeaderDetector::detect(
     const Option<Group::Membership>& membership)
 {
   return dispatch(process, &LeaderDetectorProcess::detect, membership);

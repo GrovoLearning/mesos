@@ -17,8 +17,9 @@
 #ifndef __NVIDIA_GPU_ISOLATOR_HPP__
 #define __NVIDIA_GPU_ISOLATOR_HPP__
 
-#include <list>
+#include <map>
 #include <set>
+#include <vector>
 
 #include <process/future.hpp>
 
@@ -83,23 +84,26 @@ public:
       const Flags& flags,
       const NvidiaComponents& components);
 
-  virtual process::Future<Nothing> recover(
-      const std::list<mesos::slave::ContainerState>& states,
-      const hashset<ContainerID>& orphans);
+  bool supportsNesting() override;
+  bool supportsStandalone() override;
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  process::Future<Nothing> recover(
+      const std::vector<mesos::slave::ContainerState>& states,
+      const hashset<ContainerID>& orphans) override;
+
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig);
+      const mesos::slave::ContainerConfig& containerConfig) override;
 
-  virtual process::Future<Nothing> update(
+  process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources);
+      const Resources& resources) override;
 
-  virtual process::Future<ResourceStatistics> usage(
-      const ContainerID& containerId);
+  process::Future<ResourceStatistics> usage(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<Nothing> cleanup(
-      const ContainerID& containerId);
+  process::Future<Nothing> cleanup(
+      const ContainerID& containerId) override;
 
 private:
   NvidiaGpuIsolatorProcess(
@@ -107,9 +111,10 @@ private:
       const std::string& hierarchy,
       const NvidiaGpuAllocator& _allocator,
       const NvidiaVolume& _volume,
-      const map<Path, cgroups::devices::Entry>& _controlDeviceEntries);
+      const std::map<Path, cgroups::devices::Entry>& _controlDeviceEntries);
 
   virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> _prepare(
+      const ContainerID& containerId,
       const mesos::slave::ContainerConfig& containerConfig);
 
   process::Future<Nothing> _update(
@@ -137,7 +142,7 @@ private:
   NvidiaGpuAllocator allocator;
   NvidiaVolume volume;
 
-  const map<Path, cgroups::devices::Entry> controlDeviceEntries;
+  const std::map<Path, cgroups::devices::Entry> controlDeviceEntries;
 };
 
 } // namespace slave {

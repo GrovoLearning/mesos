@@ -32,6 +32,16 @@ namespace mesos {
 namespace internal {
 namespace log {
 
+// Runs the recover protocol. We will re-run the recover protocol if
+// it cannot be finished within 'timeout'.
+process::Future<Option<RecoverResponse>> runRecoverProtocol(
+    size_t quorum,
+    const process::Shared<Network>& network,
+    const Metadata::Status& status,
+    bool autoInitialize,
+    const Duration& timeout = Seconds(10));
+
+
 // Recovers a replica by catching up enough missing positions. A
 // replica starts with an empty log (e.g., in the case of a disk
 // failure) should not be allowed to vote. Otherwise, the new votes it
@@ -49,7 +59,7 @@ namespace log {
 // an empty replica will be allowed to vote if ALL replicas (i.e.,
 // quorum * 2 - 1) are empty. This allows us to bootstrap the
 // replicated log without explicitly using an initialization tool.
-extern process::Future<process::Owned<Replica> > recover(
+extern process::Future<process::Owned<Replica>> recover(
     size_t quorum,
     const process::Owned<Replica>& replica,
     const process::Shared<Network>& network,

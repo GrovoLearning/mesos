@@ -25,6 +25,8 @@
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
 
+#include <stout/os/realpath.hpp>
+
 #include "linux/cgroups.hpp"
 
 using process::Once;
@@ -133,8 +135,8 @@ Try<Nothing> initialize(const Flags& flags)
   // This allows the life-time of the process to be extended past the life-time
   // of the slave. See MESOS-3352.
   // This function takes responsibility for creating and starting this slice.
-  // We inject a `Subprocess::Hook` into the `subprocess` function that migrates
-  // pids into this slice if the `EXTEND_LIFETIME` option is set on the
+  // We inject a `Subprocess::ParentHook` into the `subprocess` function that
+  // migrates pids into this slice if the `EXTEND_LIFETIME` option is set on the
   // `subprocess` call.
 
   // Ensure that the `MESOS_EXECUTORS_SLICE` exists and is running.
@@ -176,13 +178,13 @@ Try<Nothing> initialize(const Flags& flags)
 
   // Now the `MESOS_EXECUTORS_SLICE` is ready for us to assign any pids. We can
   // verify that our cgroups assignments will work by testing the hierarchy.
-  Try<bool> exists = cgroups::exists(
+  Try<Nothing> cgroupsVerify = cgroups::verify(
       systemd::hierarchy(),
       mesos::MESOS_EXECUTORS_SLICE);
 
-  if (exists.isError() || !exists.get()) {
+  if (cgroupsVerify.isError()) {
     return Error("Failed to locate systemd cgroups hierarchy: " +
-                  (exists.isError() ? exists.error() : "does not exist"));
+                 cgroupsVerify.error());
   }
 
   initialized->done();
@@ -199,7 +201,8 @@ bool exists()
     const Result<string> realpath = os::realpath("/sbin/init");
     if (realpath.isError() || realpath.isNone()) {
       LOG(WARNING) << "Failed to test /sbin/init for systemd environment: "
-                   << realpath.error();
+                   << (realpath.isError() ? realpath.error()
+                                          : "does not exist");
 
       return false;
     }

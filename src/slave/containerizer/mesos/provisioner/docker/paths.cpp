@@ -14,10 +14,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "slave/containerizer/mesos/provisioner/constants.hpp"
+
 #include "slave/containerizer/mesos/provisioner/docker/paths.hpp"
 
+#include <process/clock.hpp>
+
+#include <stout/os.hpp>
 #include <stout/path.hpp>
 
+using std::list;
 using std::string;
 
 namespace mesos {
@@ -44,6 +50,13 @@ string getImageLayerPath(const string& storeDir, const string& layerId)
 }
 
 
+Try<list<string>> listLayers(const string& storeDir)
+{
+  const string layersDir = path::join(storeDir, "layers");
+  return os::ls(layersDir);
+}
+
+
 string getImageLayerManifestPath(const string& layerPath)
 {
   return path::join(layerPath, "json");
@@ -56,15 +69,22 @@ string getImageLayerManifestPath(const string& storeDir, const string& layerId)
 }
 
 
-string getImageLayerRootfsPath(const string& layerPath)
+string getImageLayerRootfsPath(const string& layerPath, const string& backend)
 {
+  if (backend == OVERLAY_BACKEND) {
+    return path::join(layerPath, "rootfs." + backend);
+  }
+
   return path::join(layerPath, "rootfs");
 }
 
 
-string getImageLayerRootfsPath(const string& storeDir, const string& layerId)
+string getImageLayerRootfsPath(
+    const string& storeDir,
+    const string& layerId,
+    const string& backend)
 {
-  return getImageLayerRootfsPath(getImageLayerPath(storeDir, layerId));
+  return getImageLayerRootfsPath(getImageLayerPath(storeDir, layerId), backend);
 }
 
 
@@ -89,6 +109,20 @@ string getImageArchiveTarPath(const string& discoveryDir, const string& name)
 string getStoredImagesPath(const string& storeDir)
 {
   return path::join(storeDir, "storedImages");
+}
+
+
+string getGcDir(const string& storeDir)
+{
+  return path::join(storeDir, "gc");
+}
+
+
+string getGcLayerPath(const string& storeDir, const string& layerId)
+{
+  return path::join(
+      getGcDir(storeDir),
+      layerId + "." + stringify(process::Clock::now().duration().ns()));
 }
 
 } // namespace paths {

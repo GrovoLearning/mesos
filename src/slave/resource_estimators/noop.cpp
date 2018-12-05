@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include <process/dispatch.hpp>
+#include <process/id.hpp>
 #include <process/process.hpp>
 
 #include <stout/error.hpp>
@@ -31,9 +32,12 @@ class NoopResourceEstimatorProcess :
   public Process<NoopResourceEstimatorProcess>
 {
 public:
+  NoopResourceEstimatorProcess()
+    : ProcessBase(process::ID::generate("noop-resource-estimator")) {}
+
   Future<Resources> oversubscribable()
   {
-    return Resources();
+    return Future<Resources>();
   }
 };
 

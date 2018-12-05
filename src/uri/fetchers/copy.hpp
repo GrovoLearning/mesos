@@ -32,15 +32,20 @@ class CopyFetcherPlugin : public Fetcher::Plugin
 public:
   class Flags : public virtual flags::FlagsBase {};
 
+  static const char NAME[];
+
   static Try<process::Owned<Fetcher::Plugin>> create(const Flags& flags);
 
-  virtual ~CopyFetcherPlugin() {}
+  ~CopyFetcherPlugin() override {}
 
-  virtual std::set<std::string> schemes();
+  std::set<std::string> schemes() const override;
 
-  virtual process::Future<Nothing> fetch(
+  std::string name() const override;
+
+  process::Future<Nothing> fetch(
       const URI& uri,
-      const std::string& directory);
+      const std::string& directory,
+      const Option<std::string>& data = None()) const override;
 
 private:
   CopyFetcherPlugin() {}

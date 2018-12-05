@@ -32,6 +32,7 @@
 #include <stout/none.hpp>
 #include <stout/strings.hpp>
 
+#include <stout/os/os.hpp>
 #include <stout/os/pagesize.hpp>
 #include <stout/os/process.hpp>
 #include <stout/os/sysctl.hpp>
@@ -45,7 +46,7 @@ inline Result<Process> process(pid_t pid)
 
   if (processes.isError()) {
     return Error("Failed to get process via sysctl: " + processes.error());
-  } else if (processes.get().size() != 1) {
+  } else if (processes->size() != 1) {
     return None();
   }
 
@@ -74,7 +75,7 @@ inline Result<Process> process(pid_t pid)
   Try<std::string> args = os::sysctl(CTL_KERN, KERN_PROCARGS2, pid).string();
 
   if (args.isSome()) {
-    int argc = *((int*) args.get().data());
+    int argc = *((int*) args->data());
 
     if (argc > 0) {
       // Now grab the arguments.
@@ -166,7 +167,7 @@ inline Result<Process> process(pid_t pid)
 }
 
 
-inline Try<std::set<pid_t> > pids()
+inline Try<std::set<pid_t>> pids()
 {
   const Try<int> maxproc = os::sysctl(CTL_KERN, KERN_MAXPROC).integer();
 
@@ -203,10 +204,7 @@ inline Try<Memory> memory()
 
   // Size of free memory is available in terms of number of
   // free pages on Mac OS X.
-  const int pageSize = os::pagesize();
-  if (pageSize < 0) {
-    return ErrnoError();
-  }
+  const size_t pageSize = os::pagesize();
 
   unsigned int freeCount;
   size_t length = sizeof(freeCount);

@@ -13,11 +13,16 @@
 #ifndef __OPENSSL_HPP__
 #define __OPENSSL_HPP__
 
+#ifdef __WINDOWS__
+// NOTE: This must be included before the OpenSSL headers as it includes
+// `WinSock2.h` and `Windows.h` in the correct order.
+#include <stout/windows.hpp>
+#endif // __WINDOWS__
+
 #include <openssl/ssl.h>
 
 #include <string>
 
-#include <stout/flags.hpp>
 #include <stout/ip.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
@@ -26,32 +31,6 @@
 namespace process {
 namespace network {
 namespace openssl {
-
-// Capture the environment variables that influence how we initialize
-// the OpenSSL library via flags.
-class Flags : public virtual flags::FlagsBase
-{
-public:
-  Flags();
-
-  bool enabled;
-  bool support_downgrade;
-  Option<std::string> cert_file;
-  Option<std::string> key_file;
-  bool verify_cert;
-  bool require_cert;
-  bool verify_ipadd;
-  unsigned int verification_depth;
-  Option<std::string> ca_dir;
-  Option<std::string> ca_file;
-  std::string ciphers;
-  bool enable_ssl_v3;
-  bool enable_tls_v1_0;
-  bool enable_tls_v1_1;
-  bool enable_tls_v1_2;
-};
-
-const Flags& flags();
 
 // Initializes the _global_ OpenSSL context (SSL_CTX) as well as the
 // crypto library in order to support multi-threading. The global
@@ -72,6 +51,7 @@ const Flags& flags();
 //    LIBPROCESS_SSL_ENABLE_TLS_V1_0=(false|0,true|1)
 //    LIBPROCESS_SSL_ENABLE_TLS_V1_1=(false|0,true|1)
 //    LIBPROCESS_SSL_ENABLE_TLS_V1_2=(false|0,true|1)
+//    LIBPROCESS_SSL_ECDH_CURVES=(auto|list of curves separated by ':')
 //
 // TODO(benh): When/If we need to support multiple contexts in the
 // same process, for example for Server Name Indication (SNI), then

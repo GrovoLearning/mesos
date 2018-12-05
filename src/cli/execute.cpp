@@ -27,7 +27,6 @@
 #include <process/delay.hpp>
 #include <process/future.hpp>
 #include <process/owned.hpp>
-#include <process/pid.hpp>
 #include <process/protobuf.hpp>
 
 #include <stout/check.hpp>
@@ -38,7 +37,7 @@
 #include <stout/none.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
-#include <stout/unreachable.hpp>
+#include <stout/stringify.hpp>
 
 #include "common/parse.hpp"
 #include "common/protobuf_utils.hpp"
@@ -46,6 +45,10 @@
 #include "hdfs/hdfs.hpp"
 
 #include "internal/devolve.hpp"
+
+#include "logging/logging.hpp"
+
+#include "v1/parse.hpp"
 
 using std::cerr;
 using std::cout;
@@ -59,17 +62,24 @@ using google::protobuf::RepeatedPtrField;
 using mesos::internal::devolve;
 
 using mesos::v1::AgentID;
+using mesos::v1::CapabilityInfo;
+using mesos::v1::CheckInfo;
+using mesos::v1::CheckStatusInfo;
 using mesos::v1::CommandInfo;
 using mesos::v1::ContainerInfo;
 using mesos::v1::Credential;
 using mesos::v1::Environment;
+using mesos::v1::ExecutorInfo;
 using mesos::v1::FrameworkID;
 using mesos::v1::FrameworkInfo;
 using mesos::v1::Image;
 using mesos::v1::Label;
 using mesos::v1::Labels;
 using mesos::v1::Offer;
+using mesos::v1::Resource;
 using mesos::v1::Resources;
+using mesos::v1::RLimitInfo;
+using mesos::v1::TaskGroupInfo;
 using mesos::v1::TaskID;
 using mesos::v1::TaskInfo;
 using mesos::v1::TaskState;
@@ -82,23 +92,95 @@ using mesos::v1::scheduler::Mesos;
 
 using process::Future;
 using process::Owned;
-using process::UPID;
 
 
-class Flags : public flags::FlagsBase
+class Flags : public virtual flags::FlagsBase
 {
 public:
   Flags()
   {
-    add(&master,
+    add(&Flags::master,
         "master",
         "Mesos master (e.g., IP:PORT).");
 
-    add(&name,
+    add(&Flags::task,
+        "task",
+        "The value could be a JSON-formatted string of `TaskInfo` or a\n"
+        "file path containing the JSON-formatted `TaskInfo`. Path must\n"
+        "be of the form `file:///path/to/file` or `/path/to/file`.\n"
+        "\n"
+        "See the `TaskInfo` message in `mesos.proto` for the expected\n"
+        "format. NOTE: `agent_id` need not to be set.\n"
+        "\n"
+        "Example:\n"
+        "{\n"
+        "  \"name\": \"Name of the task\",\n"
+        "  \"task_id\": {\"value\" : \"Id of the task\"},\n"
+        "  \"agent_id\": {\"value\" : \"\"},\n"
+        "  \"resources\": [\n"
+        "    {\n"
+        "      \"name\": \"cpus\",\n"
+        "      \"type\": \"SCALAR\",\n"
+        "      \"scalar\": {\n"
+        "        \"value\": 0.1\n"
+        "      }\n"
+        "    },\n"
+        "    {\n"
+        "      \"name\": \"mem\",\n"
+        "      \"type\": \"SCALAR\",\n"
+        "      \"scalar\": {\n"
+        "        \"value\": 32\n"
+        "      }\n"
+        "    }\n"
+        "  ],\n"
+        "  \"command\": {\n"
+        "    \"value\": \"sleep 1000\"\n"
+        "  }\n"
+        "}");
+
+    add(&Flags::task_group,
+        "task_group",
+        "The value could be a JSON-formatted string of `TaskGroupInfo` or a\n"
+        "file path containing the JSON-formatted `TaskGroupInfo`. Path must\n"
+        "be of the form `file:///path/to/file` or `/path/to/file`.\n"
+        "\n"
+        "See the `TaskGroupInfo` message in `mesos.proto` for the expected\n"
+        "format. NOTE: `agent_id` need not to be set.\n"
+        "\n"
+        "Example:\n"
+        "{\n"
+        "  \"tasks\":\n"
+        "     [\n"
+        "        {\n"
+        "         \"name\": \"Name of the task\",\n"
+        "         \"task_id\": {\"value\" : \"Id of the task\"},\n"
+        "         \"agent_id\": {\"value\" : \"\"},\n"
+        "         \"resources\": [{\n"
+        "            \"name\": \"cpus\",\n"
+        "            \"type\": \"SCALAR\",\n"
+        "            \"scalar\": {\n"
+        "                \"value\": 0.1\n"
+        "             }\n"
+        "           },\n"
+        "           {\n"
+        "            \"name\": \"mem\",\n"
+        "            \"type\": \"SCALAR\",\n"
+        "            \"scalar\": {\n"
+        "                \"value\": 32\n"
+        "             }\n"
+        "          }],\n"
+        "         \"command\": {\n"
+        "            \"value\": \"sleep 1000\"\n"
+        "           }\n"
+        "       }\n"
+        "     ]\n"
+        "}");
+
+    add(&Flags::name,
         "name",
         "Name for the command.");
 
-    add(&shell,
+    add(&Flags::shell,
         "shell",
         "Determine the command is a shell or not. If not, 'command' will be\n"
         "treated as executable value and arguments (TODO).",
@@ -106,11 +188,11 @@ public:
 
     // TODO(alexr): Once MESOS-4882 lands, elaborate on what `command` can
     // mean: an executable, a shell command, an entrypoint for a container.
-    add(&command,
+    add(&Flags::command,
         "command",
         "Command to launch.");
 
-    add(&environment,
+    add(&Flags::environment,
         "env",
         "Shell command environment variables.\n"
         "The value could be a JSON formatted string of environment variables\n"
@@ -118,80 +200,125 @@ public:
         "formatted environment variables. Path should be of the form\n"
         "'file:///path/to/file'.");
 
-    add(&resources,
+    add(&Flags::resources,
         "resources",
         "Resources for the command.",
         "cpus:1;mem:128");
 
-    add(&hadoop,
+    add(&Flags::hadoop,
         "hadoop",
         "Path to 'hadoop' script (used for copying packages).",
         "hadoop");
 
-    add(&hdfs,
+    add(&Flags::hdfs,
         "hdfs",
         "The ip:port of the NameNode service.",
         "localhost:9000");
 
-    add(&package,
+    add(&Flags::package,
         "package",
         "Package to upload into HDFS and copy into command's\n"
         "working directory (requires 'hadoop', see --hadoop).");
 
-    add(&overwrite,
+    add(&Flags::overwrite,
         "overwrite",
         "Overwrite the package in HDFS if it already exists.",
         false);
 
-    add(&checkpoint,
+    add(&Flags::checkpoint,
         "checkpoint",
         "Enable checkpointing for the framework.",
         false);
 
-    add(&appc_image,
+    add(&Flags::appc_image,
         "appc_image",
         "Appc image name that follows the Appc spec\n"
         "(e.g., ubuntu, example.com/reduce-worker).");
 
-    add(&docker_image,
+    add(&Flags::docker_image,
         "docker_image",
         "Docker image that follows the Docker CLI naming <image>:<tag>\n"
         "(i.e., ubuntu, busybox:latest).");
 
-    add(&framework_capabilities,
+    add(&Flags::framework_capabilities,
         "framework_capabilities",
-        "Comma separated list of optional framework capabilities to enable.\n"
-        "(the only valid value is currently 'GPU_RESOURCES')");
+        "Comma-separated list of optional framework capabilities to enable.\n"
+        "RESERVATION_REFINEMENT and TASK_KILLING_STATE are always enabled.\n"
+        "PARTITION_AWARE is enabled unless --no-partition-aware is specified.");
 
-    add(&containerizer,
+    add(&Flags::containerizer,
         "containerizer",
         "Containerizer to be used (i.e., docker, mesos).",
         "mesos");
 
-    add(&role,
+    add(&Flags::effective_capabilities,
+        "effective_capabilities",
+        "JSON representation of effective system capabilities that should be\n"
+        "granted to the command.\n"
+        "\n"
+        "Example:\n"
+        "{\n"
+        "   \"capabilities\": [\n"
+        "       \"NET_RAW\",\n"
+        "       \"SYS_ADMIN\"\n"
+        "     ]\n"
+        "}");
+
+    add(&Flags::bounding_capabilities,
+        "bounding_capabilities",
+        "JSON representation of system capabilities bounding set that should\n"
+        "be applied to the command.\n"
+        "\n"
+        "Example:\n"
+        "{\n"
+        "   \"capabilities\": [\n"
+        "       \"NET_RAW\",\n"
+        "       \"SYS_ADMIN\"\n"
+        "     ]\n"
+        "}");
+
+    add(&Flags::rlimits,
+        "rlimits",
+        "JSON representation of resource limits for the command. For\n"
+        "example, the following sets the limit for CPU time to be one\n"
+        "second, and the size of created files to be unlimited:\n"
+        "{\n"
+        "  \"rlimits\": [\n"
+        "    {\n"
+        "      \"type\":\"RLMT_CPU\",\n"
+        "      \"soft\":\"1\",\n"
+        "      \"hard\":\"1\"\n"
+        "    },\n"
+        "    {\n"
+        "      \"type\":\"RLMT_FSIZE\"\n"
+        "    }\n"
+        "  ]\n"
+        "}");
+
+    add(&Flags::role,
         "role",
         "Role to use when registering.",
         "*");
 
-    add(&kill_after,
+    add(&Flags::kill_after,
         "kill_after",
         "Specifies a delay after which the task is killed\n"
         "(e.g., 10secs, 2mins, etc).");
 
-    add(&networks,
+    add(&Flags::networks,
         "networks",
         "Comma-separated list of networks that the container will join,\n"
         "e.g., `net1,net2`.");
 
-    add(&principal,
+    add(&Flags::principal,
         "principal",
         "The principal to use for framework authentication.");
 
-    add(&secret,
+    add(&Flags::secret,
         "secret",
         "The secret to use for framework authentication.");
 
-    add(&volumes,
+    add(&Flags::volumes,
         "volumes",
         "The value could be a JSON-formatted string of volumes or a\n"
         "file path containing the JSON-formatted volumes. Path must\n"
@@ -202,14 +329,14 @@ public:
         "Example:\n"
         "[\n"
         "  {\n"
-        "    \"container_path\":\"/path/to/container\"\n"
-        "    \"mode\":\"RW\"\n"
+        "    \"container_path\":\"/path/to/container\",\n"
+        "    \"mode\":\"RW\",\n"
         "    \"source\":\n"
         "    {\n"
         "      \"docker_volume\":\n"
         "        {\n"
         "          \"driver\": \"volume_driver\",\n"
-        "          \"docker_options\":\n"
+        "          \"driver_options\":\n"
         "            {\"parameter\":[\n"
         "              {\n"
         "                \"key\": \"key\",\n"
@@ -222,10 +349,28 @@ public:
         "    }\n"
         "  }\n"
         "]");
+
+    add(&Flags::content_type,
+        "content_type",
+        "The content type to use for scheduler protocol messages. 'json'\n"
+        "and 'protobuf' are valid choices.",
+        "protobuf");
+
+    add(&Flags::tty,
+        "tty",
+        "Attach a TTY to the task being launched",
+        false);
+
+    add(&Flags::partition_aware,
+        "partition_aware",
+        "Enable partition-awareness for the framework.",
+        true);
   }
 
-  Option<string> master;
+  string master;
   Option<string> name;
+  Option<TaskInfo> task;
+  Option<TaskGroupInfo> task_group;
   bool shell;
   Option<string> command;
   Option<hashmap<string, string>> environment;
@@ -240,11 +385,17 @@ public:
   Option<std::set<string>> framework_capabilities;
   Option<JSON::Array> volumes;
   string containerizer;
+  Option<CapabilityInfo> effective_capabilities;
+  Option<CapabilityInfo> bounding_capabilities;
+  Option<RLimitInfo> rlimits;
   string role;
   Option<Duration> kill_after;
   Option<string> networks;
   Option<string> principal;
   Option<string> secret;
+  string content_type;
+  bool partition_aware;
+  bool tty;
 };
 
 
@@ -254,47 +405,34 @@ public:
   CommandScheduler(
       const FrameworkInfo& _frameworkInfo,
       const string& _master,
-      const string& _name,
-      const bool _shell,
-      const Option<string>& _command,
-      const Option<hashmap<string, string>>& _environment,
-      const string& _resources,
-      const Option<string>& _uri,
-      const Option<string>& _appcImage,
-      const Option<string>& _dockerImage,
-      const vector<Volume>& _volumes,
-      const string& _containerizer,
+      mesos::ContentType _contentType,
       const Option<Duration>& _killAfter,
-      const Option<string>& _networks,
-      const Option<Credential> _credential)
+      const Option<Credential>& _credential,
+      const Option<TaskInfo>& _task,
+      const Option<TaskGroupInfo>& _taskGroup,
+      const Option<string>& _networks)
     : state(DISCONNECTED),
       frameworkInfo(_frameworkInfo),
       master(_master),
-      name(_name),
-      shell(_shell),
-      command(_command),
-      environment(_environment),
-      resources(_resources),
-      uri(_uri),
-      appcImage(_appcImage),
-      dockerImage(_dockerImage),
-      volumes(_volumes),
-      containerizer(_containerizer),
+      contentType(_contentType),
       killAfter(_killAfter),
-      networks(_networks),
       credential(_credential),
-      launched(false) {}
+      task(_task),
+      taskGroup(_taskGroup),
+      networks(_networks),
+      launched(false),
+      terminatedTaskCount(0) {}
 
-  virtual ~CommandScheduler() {}
+  ~CommandScheduler() override {}
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // We initialize the library here to ensure that callbacks are only invoked
     // after the process has spawned.
     mesos.reset(new Mesos(
       master,
-      mesos::ContentType::PROTOBUF,
+      contentType,
       process::defer(self(), &Self::connected),
       process::defer(self(), &Self::disconnected),
       process::defer(self(), &Self::received, lambda::_1),
@@ -356,90 +494,134 @@ protected:
   {
     CHECK_EQ(SUBSCRIBED, state);
 
-    static const Try<Resources> TASK_RESOURCES = Resources::parse(resources);
-
-    if (TASK_RESOURCES.isError()) {
-      EXIT(EXIT_FAILURE)
-        << "Failed to parse resources '" << resources << "': "
-        << TASK_RESOURCES.error();
-    }
-
     foreach (const Offer& offer, offers) {
+      // Strip the allocation from the offer since we use a single role.
       Resources offered = offer.resources();
+      offered.unallocate();
 
-      if (!launched && offered.flatten().contains(TASK_RESOURCES.get())) {
-        TaskInfo task;
-        task.set_name(name);
-        task.mutable_task_id()->set_value(name);
-        task.mutable_agent_id()->MergeFrom(offer.agent_id());
+      Resources requiredResources;
 
-        // Takes resources first from the specified role, then from '*'.
-        Option<Resources> resources =
-          offered.find(TASK_RESOURCES.get().flatten(frameworkInfo.role()));
+      CHECK_NE(task.isSome(), taskGroup.isSome())
+        << "Either task or task group should be set but not both";
 
-        CHECK_SOME(resources);
+      if (task.isSome()) {
+        requiredResources = Resources(task->resources());
+      } else {
+        foreach (const TaskInfo& _task, taskGroup->tasks()) {
+          requiredResources += Resources(_task.resources());
+        }
+      }
 
-        task.mutable_resources()->CopyFrom(resources.get());
+      if (!launched && offered.toUnreserved().contains(requiredResources)) {
+        TaskInfo _task;
+        TaskGroupInfo _taskGroup;
 
-        CommandInfo* commandInfo = task.mutable_command();
+        if (task.isSome()) {
+          _task = task.get();
+          _task.mutable_agent_id()->MergeFrom(offer.agent_id());
 
-        if (shell) {
-          CHECK_SOME(command);
+          // Takes resources first from the specified role, then from '*'.
+          Option<Resources> resources = [&]() {
+            if (frameworkInfo.role() == "*") {
+              return offered.find(Resources(_task.resources()));
+            } else {
+              Resource::ReservationInfo reservation;
+              reservation.set_type(Resource::ReservationInfo::STATIC);
+              reservation.set_role(frameworkInfo.role());
 
-          commandInfo->set_shell(true);
-          commandInfo->set_value(command.get());
+              return offered.find(
+                  Resources(_task.resources()).pushReservation(reservation));
+            }
+          }();
+
+          CHECK_SOME(resources);
+
+          _task.mutable_resources()->CopyFrom(resources.get());
         } else {
-          // TODO(gilbert): Treat 'command' as executable value and arguments.
-          commandInfo->set_shell(false);
-        }
+          foreach (TaskInfo _task, taskGroup->tasks()) {
+            _task.mutable_agent_id()->MergeFrom(offer.agent_id());
 
-        if (environment.isSome()) {
-          Environment* environment_ = commandInfo->mutable_environment();
-          foreachpair (
-              const string& name, const string& value, environment.get()) {
-            Environment::Variable* environmentVariable =
-              environment_->add_variables();
+            // Takes resources first from the specified role, then from '*'.
+            Option<Resources> resources = [&]() {
+              if (frameworkInfo.role() == "*") {
+                return offered.find(Resources(_task.resources()));
+              } else {
+                Resource::ReservationInfo reservation;
+                reservation.set_type(Resource::ReservationInfo::STATIC);
+                reservation.set_role(frameworkInfo.role());
 
-            environmentVariable->set_name(name);
-            environmentVariable->set_value(value);
+                return offered.find(
+                    Resources(_task.resources()).pushReservation(reservation));
+              }
+            }();
+
+            CHECK_SOME(resources);
+
+            _task.mutable_resources()->CopyFrom(resources.get());
+            _taskGroup.add_tasks()->CopyFrom(_task);
           }
-        }
+       }
+       Call call;
+       call.set_type(Call::ACCEPT);
 
-        if (uri.isSome()) {
-          task.mutable_command()->add_uris()->set_value(uri.get());
-        }
+       CHECK(frameworkInfo.has_id());
+       call.mutable_framework_id()->CopyFrom(frameworkInfo.id());
 
-        Result<ContainerInfo> containerInfo = getContainerInfo();
+       Call::Accept* accept = call.mutable_accept();
+       accept->add_offer_ids()->CopyFrom(offer.id());
 
-        if (containerInfo.isError()){
-          EXIT(EXIT_FAILURE) << containerInfo.error();
-          return;
-        }
+       Offer::Operation* operation = accept->add_operations();
 
-        if (containerInfo.isSome()) {
-          task.mutable_container()->CopyFrom(containerInfo.get());
-        }
+       if (task.isSome()) {
+         operation->set_type(Offer::Operation::LAUNCH);
+         operation->mutable_launch()->add_task_infos()->CopyFrom(_task);
+       } else {
+         operation->set_type(Offer::Operation::LAUNCH_GROUP);
 
-        Call call;
-        call.set_type(Call::ACCEPT);
+         ExecutorInfo* executorInfo =
+           operation->mutable_launch_group()->mutable_executor();
 
-        CHECK(frameworkInfo.has_id());
-        call.mutable_framework_id()->CopyFrom(frameworkInfo.id());
+         executorInfo->set_type(ExecutorInfo::DEFAULT);
+         executorInfo->mutable_executor_id()->set_value(
+             "default-executor");
 
-        Call::Accept* accept = call.mutable_accept();
-        accept->add_offer_ids()->CopyFrom(offer.id());
+         executorInfo->mutable_framework_id()->CopyFrom(frameworkInfo.id());
+         executorInfo->mutable_resources()->CopyFrom(
+             Resources::parse("cpus:0.1;mem:32;disk:32").get());
 
-        Offer::Operation* operation = accept->add_operations();
-        operation->set_type(Offer::Operation::LAUNCH);
+         // Setup any CNI networks that the `task_group` needs to
+         // join, in case the `--networks` flag was specified.
+         if (networks.isSome() && !networks->empty()) {
+           ContainerInfo* containerInfo = executorInfo->mutable_container();
+           containerInfo->set_type(ContainerInfo::MESOS);
 
-        operation->mutable_launch()->add_task_infos()->CopyFrom(task);
+           foreach (const string& network,
+                    strings::tokenize(networks.get(), ",")) {
+             containerInfo->add_network_infos()->set_name(network);
+           }
+         }
 
-        mesos->send(call);
+         operation->mutable_launch_group()->mutable_task_group()->CopyFrom(
+             _taskGroup);
+       }
 
-        cout << "Submitted task '" << name << "' to agent '"
-             << offer.agent_id() << "'" << endl;
+       mesos->send(call);
 
-        launched = true;
+       if (task.isSome()) {
+         cout << "Submitted task '" << task->name() << "' to agent '"
+              << offer.agent_id() << "'" << endl;
+       } else {
+         vector<TaskID> taskIds;
+
+         foreach (const TaskInfo& _task, taskGroup->tasks()) {
+           taskIds.push_back(_task.task_id());
+         }
+
+         cout << "Submitted task group with tasks "<< taskIds
+              << " to agent '" << offer.agent_id() << "'" << endl;
+       }
+
+       launched = true;
       } else {
         Call call;
         call.set_type(Call::DECLINE);
@@ -449,6 +631,12 @@ protected:
 
         Call::Decline* decline = call.mutable_decline();
         decline->add_offer_ids()->CopyFrom(offer.id());
+
+        mesos->send(call);
+
+        call.Clear();
+        call.set_type(Call::SUPPRESS);
+        call.mutable_framework_id()->CopyFrom(frameworkInfo.id());
 
         mesos->send(call);
       }
@@ -494,6 +682,7 @@ protected:
         case Event::FAILURE:
         case Event::RESCIND:
         case Event::RESCIND_INVERSE_OFFER:
+        case Event::UPDATE_OPERATION_STATUS:
         case Event::MESSAGE: {
           break;
         }
@@ -509,10 +698,10 @@ protected:
   void update(const TaskStatus& status)
   {
     CHECK_EQ(SUBSCRIBED, state);
-    CHECK_EQ(name, status.task_id().value());
 
     cout << "Received status update " << status.state()
          << " for task '" << status.task_id() << "'" << endl;
+
     if (status.has_message()) {
       cout << "  message: '" << status.message() << "'" << endl;
     }
@@ -524,6 +713,13 @@ protected:
     }
     if (status.has_healthy()) {
       cout << "  healthy?: " << status.healthy() << endl;
+    }
+    if (status.has_check_status()) {
+      cout << "  check status: " << status.check_status() << endl;
+    }
+    if (status.has_limitation() && !status.limitation().resources().empty()) {
+      cout << "  resource limit violation: "
+           << status.limitation().resources() << endl;
     }
 
     if (status.has_uuid()) {
@@ -551,7 +747,18 @@ protected:
     }
 
     if (mesos::internal::protobuf::isTerminalState(devolve(status).state())) {
-      terminate(self());
+      CHECK_NE(task.isSome(), taskGroup.isSome())
+        << "Either task or task group should be set but not both";
+
+      if (task.isSome()) {
+        terminate(self());
+      } else {
+        terminatedTaskCount++;
+
+        if (terminatedTaskCount == taskGroup->tasks().size()) {
+          terminate(self());
+        }
+      }
     }
   }
 
@@ -563,125 +770,158 @@ private:
     SUBSCRIBED
   } state;
 
-  // TODO(jojy): Consider breaking down the method for each 'containerizer'.
-  Result<ContainerInfo> getContainerInfo() const
-  {
-    if (containerizer.empty()) {
+  FrameworkInfo frameworkInfo;
+  const string master;
+  mesos::ContentType contentType;
+  const Option<Duration> killAfter;
+  const Option<Credential> credential;
+  const Option<TaskInfo> task;
+  const Option<TaskGroupInfo> taskGroup;
+  const Option<string> networks;
+  bool launched;
+  int terminatedTaskCount;
+  Owned<Mesos> mesos;
+};
+
+
+// TODO(jojy): Consider breaking down the method for each 'containerizer'.
+static Result<ContainerInfo> getContainerInfo(
+    const string& containerizer,
+    const Option<vector<Volume>>& volumes,
+    const Option<string>& networks,
+    const Option<string>& appcImage,
+    const Option<string>& dockerImage,
+    const Option<CapabilityInfo>& effective_capabilities,
+    const Option<CapabilityInfo>& bounding_capabilities,
+    const Option<RLimitInfo>& rlimits,
+    const bool tty)
+{
+  if (containerizer.empty()) {
+    return None();
+  }
+
+  ContainerInfo containerInfo;
+
+  if (volumes.isSome()) {
+    foreach (const Volume& volume, volumes.get()) {
+      containerInfo.add_volumes()->CopyFrom(volume);
+    }
+  }
+
+  // Mesos containerizer supports 'appc' and 'docker' images.
+  if (containerizer == "mesos") {
+    if (!tty &&
+        appcImage.isNone() &&
+        dockerImage.isNone() &&
+        effective_capabilities.isNone() &&
+        bounding_capabilities.isNone() &&
+        rlimits.isNone() &&
+        (networks.isNone() || networks->empty()) &&
+        (volumes.isNone() || volumes->empty())) {
       return None();
     }
 
-    ContainerInfo containerInfo;
+    containerInfo.set_type(ContainerInfo::MESOS);
 
-    foreach (const Volume& volume, volumes) {
-      containerInfo.add_volumes()->CopyFrom(volume);
+    if (dockerImage.isSome()) {
+      Image* image = containerInfo.mutable_mesos()->mutable_image();
+      image->set_type(Image::DOCKER);
+      image->mutable_docker()->set_name(dockerImage.get());
+    } else if (appcImage.isSome()) {
+      Image::Appc appc;
+
+      appc.set_name(appcImage.get());
+
+      // TODO(jojy): Labels are hard coded right now. Consider
+      // adding label flags for customization.
+      Label arch;
+      arch.set_key("arch");
+      arch.set_value("amd64");
+
+      Label os;
+      os.set_key("os");
+      os.set_value("linux");
+
+      Labels labels;
+      labels.add_labels()->CopyFrom(os);
+      labels.add_labels()->CopyFrom(arch);
+
+      appc.mutable_labels()->CopyFrom(labels);
+
+      Image* image = containerInfo.mutable_mesos()->mutable_image();
+      image->set_type(Image::APPC);
+      image->mutable_appc()->CopyFrom(appc);
     }
 
-    // Mesos containerizer supports 'appc' and 'docker' images.
-    if (containerizer == "mesos") {
-      if (dockerImage.isNone() && appcImage.isNone() &&
-          (networks.isNone() || networks->empty()) &&
-          volumes.empty()) {
-        return None();
+    if (networks.isSome() && !networks->empty()) {
+      foreach (const string& network,
+               strings::tokenize(networks.get(), ",")) {
+        containerInfo.add_network_infos()->set_name(network);
       }
-
-      containerInfo.set_type(ContainerInfo::MESOS);
-
-      if (dockerImage.isSome()) {
-        Image* image = containerInfo.mutable_mesos()->mutable_image();
-        image->set_type(Image::DOCKER);
-        image->mutable_docker()->set_name(dockerImage.get());
-      } else if (appcImage.isSome()) {
-        Image::Appc appc;
-
-        appc.set_name(appcImage.get());
-
-        // TODO(jojy): Labels are hard coded right now. Consider
-        // adding label flags for customization.
-        Label arch;
-        arch.set_key("arch");
-        arch.set_value("amd64");
-
-        Label os;
-        os.set_key("os");
-        os.set_value("linux");
-
-        Labels labels;
-        labels.add_labels()->CopyFrom(os);
-        labels.add_labels()->CopyFrom(arch);
-
-        appc.mutable_labels()->CopyFrom(labels);
-
-        Image* image = containerInfo.mutable_mesos()->mutable_image();
-        image->set_type(Image::APPC);
-        image->mutable_appc()->CopyFrom(appc);
-      }
-
-      if (networks.isSome() && !networks->empty()) {
-        foreach (const string& network,
-                 strings::tokenize(networks.get(), ",")) {
-          containerInfo.add_network_infos()->set_name(network);
-        }
-      }
-
-      return containerInfo;
-    } else if (containerizer == "docker") {
-      // 'docker' containerizer only supports 'docker' images.
-      if (dockerImage.isNone()) {
-        return Error("'Docker' containerizer requires docker image name");
-      }
-
-      containerInfo.set_type(ContainerInfo::DOCKER);
-      containerInfo.mutable_docker()->set_image(dockerImage.get());
-
-      if (networks.isSome() && !networks->empty()) {
-        vector<string> tokens = strings::tokenize(networks.get(), ",");
-        if (tokens.size() > 1) {
-          EXIT(EXIT_FAILURE)
-            << "'Docker' containerizer can only support a single network";
-        } else {
-          containerInfo.mutable_docker()->set_network(
-              ContainerInfo::DockerInfo::USER);
-          containerInfo.add_network_infos()->set_name(tokens.front());
-        }
-      }
-
-      return containerInfo;
     }
 
-    return Error("Unsupported containerizer: " + containerizer);
+    if (effective_capabilities.isSome()) {
+      containerInfo
+        .mutable_linux_info()
+        ->mutable_effective_capabilities()
+        ->CopyFrom(effective_capabilities.get());
+    }
+
+    if (bounding_capabilities.isSome()) {
+      containerInfo
+        .mutable_linux_info()
+        ->mutable_bounding_capabilities()
+        ->CopyFrom(bounding_capabilities.get());
+    }
+
+    if (rlimits.isSome()) {
+      containerInfo.mutable_rlimit_info()->CopyFrom(rlimits.get());
+    }
+
+    if (tty) {
+      containerInfo.mutable_tty_info();
+    }
+
+    return containerInfo;
+  } else if (containerizer == "docker") {
+    // 'docker' containerizer only supports 'docker' images.
+    if (dockerImage.isNone()) {
+      return Error("'Docker' containerizer requires docker image name");
+    }
+
+    containerInfo.set_type(ContainerInfo::DOCKER);
+    containerInfo.mutable_docker()->set_image(dockerImage.get());
+
+    if (networks.isSome() && !networks->empty()) {
+      vector<string> tokens = strings::tokenize(networks.get(), ",");
+      if (tokens.size() > 1) {
+        EXIT(EXIT_FAILURE)
+          << "'Docker' containerizer can only support a single network";
+      } else {
+        containerInfo.mutable_docker()->set_network(
+            ContainerInfo::DockerInfo::USER);
+        containerInfo.add_network_infos()->set_name(tokens.front());
+      }
+    }
+
+    if (tty) {
+      return Error("'Docker' containerizer does not allow attaching a TTY");
+    }
+
+    return containerInfo;
   }
 
-  FrameworkInfo frameworkInfo;
-  const string master;
-  const string name;
-  bool shell;
-  const Option<string> command;
-  const Option<hashmap<string, string>> environment;
-  const string resources;
-  const Option<string> uri;
-  const Option<string> appcImage;
-  const Option<string> dockerImage;
-  const vector<Volume> volumes;
-  const string containerizer;
-  const Option<Duration> killAfter;
-  const Option<string> networks;
-  const Option<Credential> credential;
-  bool launched;
-  Owned<Mesos> mesos;
-};
+  return Error("Unsupported containerizer: " + containerizer);
+}
 
 
 int main(int argc, char** argv)
 {
   Flags flags;
+  mesos::ContentType contentType = mesos::ContentType::PROTOBUF;
 
   // Load flags from command line only.
   Try<flags::Warnings> load = flags.load(None(), argc, argv);
-
-  if (load.isError()) {
-    cerr << flags.usage(load.error()) << endl;
-    return EXIT_FAILURE;
-  }
 
   // TODO(marco): this should be encapsulated entirely into the
   // FlagsBase API - possibly with a 'guard' that prevents FlagsBase
@@ -692,41 +932,73 @@ int main(int argc, char** argv)
     return EXIT_SUCCESS;
   }
 
+  if (load.isError()) {
+    cerr << flags.usage(load.error()) << endl;
+    return EXIT_FAILURE;
+  }
+
+  mesos::internal::logging::initialize(argv[0], false);
+
   // Log any flag warnings.
   foreach (const flags::Warning& warning, load->warnings) {
     LOG(WARNING) << warning.message;
   }
 
-  if (flags.master.isNone()) {
-    cerr << flags.usage("Missing required option --master") << endl;
-    return EXIT_FAILURE;
+  if (flags.task.isSome() && flags.task_group.isSome()) {
+    EXIT(EXIT_FAILURE) << flags.usage(
+        "Either task or task group should be set but not both."
+        " Provide either '--task' OR '--task_group'");
+  } else if (flags.task.isNone() && flags.task_group.isNone()) {
+    if (flags.name.isNone()) {
+      EXIT(EXIT_FAILURE) << flags.usage("Missing required option --name");
+    }
+
+    if (flags.shell && flags.command.isNone()) {
+      EXIT(EXIT_FAILURE) << flags.usage("Missing required option --command");
+    }
+  } else {
+    // Either --task or --task_group is set.
+    if (flags.name.isSome() ||
+        flags.command.isSome() ||
+        flags.environment.isSome() ||
+        flags.appc_image.isSome()  ||
+        flags.docker_image.isSome() ||
+        flags.volumes.isSome()) {
+      EXIT(EXIT_FAILURE) << flags.usage(
+          "'--name, --command, --env, --appc_image, --docker_image,"
+          " --volumes' can only be set when both '--task'"
+          " and '--task_group' are not set");
+    }
+
+    if (flags.task.isSome() && flags.networks.isSome()) {
+      EXIT(EXIT_FAILURE) << flags.usage(
+          "'--networks' can only be set when"
+          " '--task' is not set");
+    }
   }
 
-  UPID master("master@" + flags.master.get());
-  if (!master) {
-    cerr << flags.usage("Could not parse --master=" + flags.master.get())
-         << endl;
-    return EXIT_FAILURE;
-  }
-
-  if (flags.name.isNone()) {
-    cerr << flags.usage("Missing required option --name") << endl;
-    return EXIT_FAILURE;
-  }
-
-  if (flags.shell && flags.command.isNone()) {
-    cerr << flags.usage("Missing required option --command") << endl;
-    return EXIT_FAILURE;
+  if (flags.content_type == "json" ||
+      flags.content_type == mesos::APPLICATION_JSON) {
+    contentType = mesos::ContentType::JSON;
+  } else if (flags.content_type == "protobuf" ||
+             flags.content_type == mesos::APPLICATION_PROTOBUF) {
+    contentType = mesos::ContentType::PROTOBUF;
+  } else {
+    EXIT(EXIT_FAILURE) << "Invalid content type '" << flags.content_type << "'";
   }
 
   Result<string> user = os::user();
   if (!user.isSome()) {
     if (user.isError()) {
-      cerr << "Failed to get username: " << user.error() << endl;
+      EXIT(EXIT_FAILURE) << "Failed to get username: " << user.error();
     } else {
-      cerr << "No username for uid " << ::getuid() << endl;
+#ifndef __WINDOWS__
+      EXIT(EXIT_FAILURE) << "No username for uid " << ::getuid();
+#else
+      // NOTE: The `::getuid()` function does not exist on Windows.
+      EXIT(EXIT_FAILURE) << "No username for current user";
+#endif // __WINDOWS__
     }
-    return EXIT_FAILURE;
   }
 
   Option<hashmap<string, string>> environment = None();
@@ -735,15 +1007,14 @@ int main(int argc, char** argv)
     environment = flags.environment.get();
   }
 
-  // Copy the package to HDFS if requested save it's location as a URI
-  // for passing to the command (in CommandInfo).
+  // Copy the package to HDFS, if requested. Save its location
+  // as a URI for passing to the command (in CommandInfo).
   Option<string> uri = None();
 
   if (flags.package.isSome()) {
     Try<Owned<HDFS>> hdfs = HDFS::create(flags.hadoop);
     if (hdfs.isError()) {
-      cerr << "Failed to create HDFS client: " << hdfs.error() << endl;
-      return EXIT_FAILURE;
+      EXIT(EXIT_FAILURE) << "Failed to create HDFS client: " << hdfs.error();
     }
 
     // TODO(benh): If HDFS is not properly configured with
@@ -761,30 +1032,29 @@ int main(int argc, char** argv)
     exists.await();
 
     if (!exists.isReady()) {
-      cerr << "Failed to check if file exists: "
-           << (exists.isFailed() ? exists.failure() : "discarded") << endl;
-      return EXIT_FAILURE;
+      EXIT(EXIT_FAILURE)
+        << "Failed to check if file exists: "
+        << (exists.isFailed() ? exists.failure() : "discarded");
     } else if (exists.get() && flags.overwrite) {
       Future<Nothing> rm = hdfs.get()->rm(path);
       rm.await();
 
       if (!rm.isReady()) {
-        cerr << "Failed to remove existing file: "
-             << (rm.isFailed() ? rm.failure() : "discarded") << endl;
-        return EXIT_FAILURE;
+        EXIT(EXIT_FAILURE)
+          << "Failed to remove existing file: "
+          << (rm.isFailed() ? rm.failure() : "discarded");
       }
     } else if (exists.get()) {
-      cerr << "File already exists (see --overwrite)" << endl;
-      return EXIT_FAILURE;
+      EXIT(EXIT_FAILURE) << "File already exists (see --overwrite)";
     }
 
     Future<Nothing> copy = hdfs.get()->copyFromLocal(flags.package.get(), path);
     copy.await();
 
     if (!copy.isReady()) {
-      cerr << "Failed to copy package: "
-           << (copy.isFailed() ? copy.failure() : "discarded") << endl;
-      return EXIT_FAILURE;
+      EXIT(EXIT_FAILURE)
+        << "Failed to copy package: "
+        << (copy.isFailed() ? copy.failure() : "discarded");
     }
 
     // Now save the URI.
@@ -802,50 +1072,61 @@ int main(int argc, char** argv)
   }
 
   if (appcImage.isSome() && dockerImage.isSome()) {
-    cerr << "Flags '--docker-image' and '--appc-image' are both set" << endl;
-    return EXIT_FAILURE;
+    EXIT(EXIT_FAILURE)
+      << "Flags '--docker-image' and '--appc-image' are both set";
   }
 
-  // We set the TASK_KILLING_STATE capability by default.
-  vector<FrameworkInfo::Capability::Type> capabilities =
-    { FrameworkInfo::Capability::TASK_KILLING_STATE };
+  // Always enable the following capabilities.
+  vector<FrameworkInfo::Capability::Type> frameworkCapabilities = {
+    FrameworkInfo::Capability::RESERVATION_REFINEMENT,
+    FrameworkInfo::Capability::TASK_KILLING_STATE,
+    FrameworkInfo::Capability::REVOCABLE_RESOURCES,
+  };
+
+  // Enable PARTITION_AWARE unless disabled by the user.
+  if (flags.partition_aware) {
+    frameworkCapabilities.push_back(
+        FrameworkInfo::Capability::PARTITION_AWARE);
+  }
 
   if (flags.framework_capabilities.isSome()) {
     foreach (const string& capability, flags.framework_capabilities.get()) {
       FrameworkInfo::Capability::Type type;
 
       if (!FrameworkInfo::Capability::Type_Parse(capability, &type)) {
-        cerr << "Flags '--framework_capabilities'"
-                " specifes an unknown capability"
-                " '" << capability << "'" << endl;
-        return EXIT_FAILURE;
+        EXIT(EXIT_FAILURE)
+          << "Flags '--framework_capabilities' specifies an unknown"
+          << " capability '" << capability << "'";
       }
 
       if (type != FrameworkInfo::Capability::GPU_RESOURCES) {
-        cerr << "Flags '--framework_capabilities'"
-                " specifes an unsupported capability"
-                " '" << capability << "'" << endl;
-        return EXIT_FAILURE;
+        EXIT(EXIT_FAILURE)
+          << "Flags '--framework_capabilities' specifies an unsupported"
+          << " capability '" << capability << "'";
       }
 
-      capabilities.push_back(type);
+      frameworkCapabilities.push_back(type);
     }
   }
 
-  vector<Volume> volumes;
+  Option<vector<Volume>> volumes = None();
+
   if (flags.volumes.isSome()) {
-    Try<RepeatedPtrField<Volume>> _volumes =
+    Try<RepeatedPtrField<Volume>> parse =
       ::protobuf::parse<RepeatedPtrField<Volume>>(flags.volumes.get());
 
-    if (_volumes.isError()) {
-      cerr << "Failed to convert '--volumes' to protobuf: "
-           << _volumes.error() << endl;
-      return EXIT_FAILURE;
+    if (parse.isError()) {
+      EXIT(EXIT_FAILURE)
+        << "Failed to convert '--volumes' to protobuf: " << parse.error();
     }
 
-    foreach (const Volume& volume, _volumes.get()) {
-      volumes.push_back(volume);
+    vector<Volume> _volumes;
+
+    foreach (const Volume& volume, parse.get()) {
+      _volumes.push_back(volume);
     }
+
+    volumes = _volumes;
   }
 
   FrameworkInfo frameworkInfo;
@@ -853,7 +1134,8 @@ int main(int argc, char** argv)
   frameworkInfo.set_name("mesos-execute instance");
   frameworkInfo.set_role(flags.role);
   frameworkInfo.set_checkpoint(flags.checkpoint);
-  foreach (const FrameworkInfo::Capability::Type& capability, capabilities) {
+  foreach (const FrameworkInfo::Capability::Type& capability,
+           frameworkCapabilities) {
     frameworkInfo.add_capabilities()->set_type(capability);
   }
 
@@ -870,23 +1152,84 @@ int main(int argc, char** argv)
     }
   }
 
+  Option<TaskInfo> taskInfo = flags.task;
+
+  if (flags.task.isNone() && flags.task_group.isNone()) {
+    TaskInfo task;
+    task.set_name(flags.name.get());
+    task.mutable_task_id()->set_value(flags.name.get());
+
+    static const Try<Resources> resources = Resources::parse(flags.resources);
+
+    if (resources.isError()) {
+      EXIT(EXIT_FAILURE)
+        << "Failed to parse resources '" << flags.resources << "': "
+        << resources.error();
+    }
+
+    task.mutable_resources()->CopyFrom(resources.get());
+
+    CommandInfo* commandInfo = task.mutable_command();
+
+    if (flags.shell) {
+      CHECK_SOME(flags.command);
+
+      commandInfo->set_shell(true);
+      commandInfo->set_value(flags.command.get());
+    } else {
+      // TODO(gilbert): Treat 'command' as executable value and arguments.
+      commandInfo->set_shell(false);
+    }
+
+    if (flags.environment.isSome()) {
+      Environment* environment_ = commandInfo->mutable_environment();
+      foreachpair (
+          const string& name, const string& value, environment.get()) {
+        Environment::Variable* environmentVariable =
+          environment_->add_variables();
+
+        environmentVariable->set_name(name);
+        environmentVariable->set_value(value);
+      }
+    }
+
+    if (uri.isSome()) {
+      task.mutable_command()->add_uris()->set_value(uri.get());
+    }
+
+    Result<ContainerInfo> containerInfo =
+      getContainerInfo(
+        flags.containerizer,
+        volumes,
+        flags.networks,
+        appcImage,
+        dockerImage,
+        flags.effective_capabilities,
+        flags.bounding_capabilities,
+        flags.rlimits,
+        flags.tty);
+
+    if (containerInfo.isError()){
+      EXIT(EXIT_FAILURE) << containerInfo.error();
+    }
+
+    if (containerInfo.isSome()) {
+      task.mutable_container()->CopyFrom(containerInfo.get());
+    }
+
+    taskInfo = task;
+  }
+
   Owned<CommandScheduler> scheduler(
       new CommandScheduler(
         frameworkInfo,
-        flags.master.get(),
-        flags.name.get(),
-        flags.shell,
-        flags.command,
-        environment,
-        flags.resources,
-        uri,
-        appcImage,
-        dockerImage,
-        volumes,
-        flags.containerizer,
+        flags.master,
+        contentType,
         flags.kill_after,
-        flags.networks,
-        credential));
+        credential,
+        taskInfo,
+        flags.task_group,
+        flags.networks));
 
   process::spawn(scheduler.get());
   process::wait(scheduler.get());

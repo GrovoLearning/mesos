@@ -14,9 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+syntax = "proto2";
+
 import "mesos/v1/mesos.proto";
 
 package mesos.v1.allocator;
+
+option java_package = "org.apache.mesos.v1.allocator";
+option java_outer_classname = "Protos";
 
 
 /**
@@ -37,7 +42,7 @@ message InverseOfferStatus {
     // violated its SLAs.
     ACCEPT = 2;
     // The framework wants to block the maintenance operation from happening. An
-    // example would be that it can not meet its SLA by losing resources.
+    // example would be that it cannot meet its SLA by losing resources.
     DECLINE = 3;
   }
 

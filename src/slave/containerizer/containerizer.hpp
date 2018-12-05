@@ -22,9 +22,12 @@
 #include <mesos/mesos.hpp>
 #include <mesos/resources.hpp>
 
-#include <mesos/containerizer/containerizer.hpp>
+#include <mesos/secret/resolver.hpp>
+
+#include <mesos/slave/containerizer.hpp>
 
 #include <process/future.hpp>
+#include <process/http.hpp>
 #include <process/owned.hpp>
 #include <process/process.hpp>
 
@@ -32,6 +35,8 @@
 #include <stout/hashset.hpp>
 #include <stout/option.hpp>
 #include <stout/try.hpp>
+
+#include "slave/gc.hpp"
 
 #include "slave/containerizer/fetcher.hpp"
 
@@ -54,12 +59,20 @@ struct SlaveState;
 class Containerizer
 {
 public:
+  enum class LaunchResult {
+    SUCCESS,
+    ALREADY_LAUNCHED,
+    NOT_SUPPORTED,
+  };
+
   // Attempts to create a containerizer as specified by 'isolation' in
   // flags.
   static Try<Containerizer*> create(
       const Flags& flags,
       bool local,
-      Fetcher* fetcher);
+      Fetcher* fetcher,
+      GarbageCollector* gc,
+      SecretResolver* secretResolver = nullptr);
 
   // Determine slave resources from flags, probing the system or
   // querying a delegate.
@@ -77,32 +90,25 @@ public:
   virtual process::Future<Nothing> recover(
       const Option<state::SlaveState>& state) = 0;
 
-  // Launch a containerized executor. Returns true if launching this
-  // ExecutorInfo is supported and it has been launched, otherwise
-  // false or a failure is something went wrong.
-  virtual process::Future<bool> launch(
+  // Launch a container with the specified ContainerConfig.
+  //
+  // If the ContainerID has a parent, this will attempt to launch
+  // a nested container.
+  // NOTE: For nested containers, the required `directory` field of
+  // the ContainerConfig will be determined by the containerizer.
+  virtual process::Future<LaunchResult> launch(
       const ContainerID& containerId,
-      const ExecutorInfo& executorInfo,
-      const std::string& directory,
-      const Option<std::string>& user,
-      const SlaveID& slaveId,
-      const process::PID<Slave>& slavePid,
-      bool checkpoint) = 0;
+      const mesos::slave::ContainerConfig& containerConfig,
+      const std::map<std::string, std::string>& environment,
+      const Option<std::string>& pidCheckpointPath) = 0;
 
-  // Launch a containerized task. Returns true if launching this
-  // TaskInfo/ExecutorInfo is supported and it has been launched,
-  // otherwise false or a failure is something went wrong.
-  // TODO(nnielsen): Obsolete the executorInfo argument when the slave
-  // doesn't require executors to run standalone tasks.
-  virtual process::Future<bool> launch(
-      const ContainerID& containerId,
-      const TaskInfo& taskInfo,
-      const ExecutorInfo& executorInfo,
-      const std::string& directory,
-      const Option<std::string>& user,
-      const SlaveID& slaveId,
-      const process::PID<Slave>& slavePid,
-      bool checkpoint) = 0;
+  // Create an HTTP connection that can be used to "attach" (i.e.,
+  // stream input to or stream output from) a container.
+  virtual process::Future<process::http::Connection> attach(
+      const ContainerID& containerId)
+  {
+    return process::Failure("Unsupported");
+  }
 
   // Update the resources for a container.
   virtual process::Future<Nothing> update(
@@ -123,44 +129,51 @@ public:
     return ContainerStatus();
   }
 
-  // Wait on the container's 'Termination'. If the executor
-  // terminates, the containerizer should also destroy the
-  // containerized context. The future may be failed if an error
-  // occurs during termination of the executor or destruction of the
-  // container.
-  virtual process::Future<containerizer::Termination> wait(
+  // Wait on the 'ContainerTermination'. If the executor terminates,
+  // the containerizer should also destroy the containerized context.
+  // The future may be failed if an error occurs during termination of
+  // the executor or destruction of the container.
+  //
+  // Returns `None` if the container cannot be found.
+  // NOTE: For terminated nested containers, whose parent container is
+  // still running, the checkpointed `ContainerTermination` must be returned.
+  virtual process::Future<Option<mesos::slave::ContainerTermination>> wait(
       const ContainerID& containerId) = 0;
 
-  // Destroy a running container, killing all processes and releasing
-  // all resources.
-  // NOTE: You cannot wait() on containers that have been destroyed,
-  // so you should always call wait() before destroy().
-  virtual void destroy(const ContainerID& containerId) = 0;
+  // Destroy a starting or running container, killing all processes and
+  // releasing all resources. Returns the same result as `wait()` method,
+  // therefore calling `wait()` right before `destroy()` is not required.
+  virtual process::Future<Option<mesos::slave::ContainerTermination>> destroy(
+      const ContainerID& containerId) = 0;
+
+  // Sends a signal to a running container. Returns false when the container
+  // cannot be found. The future may be failed if an error occurs in sending
+  // the signal to the running container.
+  virtual process::Future<bool> kill(
+      const ContainerID& containerId,
+      int signal)
+  {
+    return process::Failure("Unsupported");
+  };
 
   virtual process::Future<hashset<ContainerID>> containers() = 0;
+
+  // Remove a nested container, including its sandbox and runtime directories.
+  //
+  // NOTE: You can only remove a a nested container that has been fully
+  // destroyed and whose parent has not been destroyed yet. If the parent has
+  // already been destroyed, then the sandbox and runtime directories will be
+  // eventually garbage collected. The caller is responsible for ensuring that
+  // `containerId` belongs to a nested container.
+  virtual process::Future<Nothing> remove(const ContainerID& containerId)
+  {
+    return process::Failure("Unsupported");
+  }
+
+  // Prune unused images from supported image stores.
+  virtual process::Future<Nothing> pruneImages(
+      const std::vector<Image>& excludedImages) = 0;
 };
-
-
-/**
- * Returns a map of environment variables necessary in order to launch
- * an executor.
- *
- * @param executorInfo ExecutorInfo being launched.
- * @param directory Path to the sandbox directory.
- * @param slaveId SlaveID where this executor is being launched.
- * @param slavePid PID of the slave launching the executor.
- * @param checkpoint Whether or not the framework is checkpointing.
- * @param flags Flags used to launch the slave.
- *
- * @return Map of environment variables (name, value).
- */
-std::map<std::string, std::string> executorEnvironment(
-    const ExecutorInfo& executorInfo,
-    const std::string& directory,
-    const SlaveID& slaveId,
-    const process::PID<Slave>& slavePid,
-    bool checkpoint,
-    const Flags& flags);
 
 } // namespace slave {
 } // namespace internal {

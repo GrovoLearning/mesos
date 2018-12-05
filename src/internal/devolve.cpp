@@ -20,6 +20,8 @@
 
 using std::string;
 
+using google::protobuf::RepeatedPtrField;
+
 namespace mesos {
 namespace internal {
 
@@ -38,13 +40,101 @@ static T devolve(const google::protobuf::Message& message)
     << " while devolving to " << t.GetTypeName();
 
   // NOTE: We need to use 'ParsePartialFromString' instead of
-  // 'ParsePartialFromString' because some required fields might not
+  // 'ParseFromString' because some required fields might not
   // be set and we don't want an exception to get thrown.
   CHECK(t.ParsePartialFromString(data))
     << "Failed to parse " << t.GetTypeName()
     << " while devolving from " << message.GetTypeName();
 
   return t;
+}
+
+
+CommandInfo devolve(const v1::CommandInfo& command)
+{
+  return devolve<CommandInfo>(command);
+}
+
+
+ContainerID devolve(const v1::ContainerID& containerId)
+{
+  return devolve<ContainerID>(containerId);
+}
+
+
+Credential devolve(const v1::Credential& credential)
+{
+  return devolve<Credential>(credential);
+}
+
+
+ExecutorID devolve(const v1::ExecutorID& executorId)
+{
+  return devolve<ExecutorID>(executorId);
+}
+
+
+FrameworkID devolve(const v1::FrameworkID& frameworkId)
+{
+  return devolve<FrameworkID>(frameworkId);
+}
+
+
+FrameworkInfo devolve(const v1::FrameworkInfo& frameworkInfo)
+{
+  return devolve<FrameworkInfo>(frameworkInfo);
+}
+
+
+HealthCheck devolve(const v1::HealthCheck& check)
+{
+  return devolve<HealthCheck>(check);
+}
+
+
+InverseOffer devolve(const v1::InverseOffer& inverseOffer)
+{
+  return devolve<InverseOffer>(inverseOffer);
+}
+
+
+Offer devolve(const v1::Offer& offer)
+{
+  return devolve<Offer>(offer);
+}
+
+
+OperationStatus devolve(const v1::OperationStatus& status)
+{
+  return devolve<OperationStatus>(status);
+}
+
+
+Resource devolve(const v1::Resource& resource)
+{
+  return devolve<Resource>(resource);
+}
+
+
+ResourceProviderID devolve(const v1::ResourceProviderID& resourceProviderId)
+{
+  // NOTE: We do not use the common 'devolve' call for performance.
+  ResourceProviderID id;
+  id.set_value(resourceProviderId.value());
+  return id;
+}
+
+ResourceProviderInfo devolve(
+    const v1::ResourceProviderInfo& resourceProviderInfo)
+{
+  return devolve<ResourceProviderInfo>(resourceProviderInfo);
+}
+
+
+Resources devolve(const v1::Resources& resources)
+{
+  return devolve<Resource>(
+      static_cast<const RepeatedPtrField<v1::Resource>&>(resources));
 }
 
 
@@ -73,48 +163,6 @@ SlaveInfo devolve(const v1::AgentInfo& agentInfo)
 }
 
 
-FrameworkID devolve(const v1::FrameworkID& frameworkId)
-{
-  return devolve<FrameworkID>(frameworkId);
-}
-
-
-FrameworkInfo devolve(const v1::FrameworkInfo& frameworkInfo)
-{
-  return devolve<FrameworkInfo>(frameworkInfo);
-}
-
-
-ExecutorID devolve(const v1::ExecutorID& executorId)
-{
-  return devolve<ExecutorID>(executorId);
-}
-
-
-HealthCheck devolve(const v1::HealthCheck& check)
-{
-  return devolve<HealthCheck>(check);
-}
-
-
-Offer devolve(const v1::Offer& offer)
-{
-  return devolve<Offer>(offer);
-}
-
-
-InverseOffer devolve(const v1::InverseOffer& inverseOffer)
-{
-  return devolve<InverseOffer>(inverseOffer);
-}
-
-
-Credential devolve(const v1::Credential& credential)
-{
-  return devolve<Credential>(credential);
-}
-
-
 TaskID devolve(const v1::TaskID& taskId)
 {
   return devolve<TaskID>(taskId);
@@ -127,21 +175,52 @@ TaskStatus devolve(const v1::TaskStatus& status)
 }
 
 
-CommandInfo devolve(const v1::CommandInfo& command)
-{
-  return devolve<CommandInfo>(command);
-}
-
-
 executor::Call devolve(const v1::executor::Call& call)
 {
   return devolve<executor::Call>(call);
 }
 
 
+executor::Event devolve(const v1::executor::Event& event)
+{
+  return devolve<executor::Event>(event);
+}
+
+
+mesos::resource_provider::Call devolve(const v1::resource_provider::Call& call)
+{
+  return devolve<mesos::resource_provider::Call>(call);
+}
+
+
+mesos::resource_provider::Event devolve(
+    const v1::resource_provider::Event& event)
+{
+  return devolve<mesos::resource_provider::Event>(event);
+}
+
+
 scheduler::Call devolve(const v1::scheduler::Call& call)
 {
-  return devolve<scheduler::Call>(call);
+  scheduler::Call _call = devolve<scheduler::Call>(call);
+
+  // Certain conversions require special handling.
+  if (call.type() == v1::scheduler::Call::SUBSCRIBE &&
+      call.has_subscribe()) {
+    // v1 Subscribe.suppressed_roles cannot be automatically converted
+    // because its tag is used by another field in the internal Subscribe.
+    *(_call.mutable_subscribe()->mutable_suppressed_roles()) =
+      call.subscribe().suppressed_roles();
+  }
+
+  if (call.type() == v1::scheduler::Call::ACKNOWLEDGE_OPERATION_STATUS &&
+      call.has_acknowledge_operation_status() &&
+      call.acknowledge_operation_status().has_agent_id()) {
+    *_call.mutable_acknowledge_operation_status()->mutable_slave_id() =
+      devolve(call.acknowledge_operation_status().agent_id());
+  }
+
+  return _call;
 }
 
 
@@ -154,6 +233,12 @@ scheduler::Event devolve(const v1::scheduler::Event& event)
 mesos::agent::Call devolve(const v1::agent::Call& call)
 {
   return devolve<mesos::agent::Call>(call);
+}
+
+
+mesos::agent::Response devolve(const v1::agent::Response& response)
+{
+  return devolve<mesos::agent::Response>(response);
 }
 
 

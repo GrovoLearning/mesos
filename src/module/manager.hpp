@@ -125,7 +125,7 @@ public:
   //   std::vector<std::string> modules = ModuleManager::find<Hook>();
   //
   // Will return all of the module names for modules that implement
-  // the Isolator interface.
+  // the `Hook` interface.
   template <typename T>
   static std::vector<std::string> find()
   {
@@ -143,7 +143,7 @@ public:
   }
 
   // Exposed just for testing so that we can unload a given
-  // module  and remove it from the list of ModuleBases.
+  // module and remove it from the list of `ModuleBase`.
   static Try<Nothing> unload(const std::string& moduleName);
 
 private:
@@ -167,18 +167,24 @@ private:
 
   static hashmap<std::string, std::string> kindToVersion;
 
-  // Mapping from "module name" to the actual ModuleBase. If two
+  // Mapping from module name to the actual `ModuleBase`. If two
   // modules from different libraries have the same name then the last
-  // one specified in the protobuf Modules will be picked.
+  // one specified in the protobuf `Modules` will be picked.
   static hashmap<std::string, ModuleBase*> moduleBases;
 
   // Module-specific command-line parameters.
   static hashmap<std::string, Parameters> moduleParameters;
 
   // A list of dynamic libraries to keep the object from getting
-  // destructed. Destroying the DynamicLibrary object could result in
-  // unloading the library from the process memory.
-  static hashmap<std::string, process::Owned<DynamicLibrary>> dynamicLibraries;
+  // destructed.
+  // NOTE: We do leak loaded dynamic libraries. This is to allow
+  // modules to make use of e.g., libprocess which otherwise could
+  // lead to situations where libprocess (which we depend on ourself)
+  // is unloaded before the destructor of below `static` is called.
+  // Unloading the dynamic library could then lead to the linker
+  // attempting to unload the libprocess loaded from the module which
+  // is not there anymore.
+  static hashmap<std::string, DynamicLibrary*> dynamicLibraries;
 
   // Module to library name mapping.
   static hashmap<std::string, std::string> moduleLibraries;

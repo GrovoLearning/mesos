@@ -17,7 +17,7 @@ jobs.
 Oversubscription was introduced in Mesos 0.23.0 and adds two new agent
 components: a Resource Estimator and a Quality of Service (QoS) Controller,
 alongside extending the existing resource allocator, resource monitor, and
-mesos agent. The new components and their interactions are illustrated below.
+Mesos agent. The new components and their interactions are illustrated below.
 
 ![Oversubscription overview](images/oversubscription-overview.jpg)
 
@@ -192,7 +192,7 @@ public:
 ~~~
 
 > NOTE The QoS Controller must not block `corrections()`. Back the QoS
-> Controller with it's own libprocess actor instead.
+> Controller with its own libprocess actor instead.
 
 The QoS Controller informs the agent that particular corrective actions need to
 be made. Each corrective action contains information about executor or task and

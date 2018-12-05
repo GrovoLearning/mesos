@@ -23,6 +23,7 @@
 
 #include <process/owned.hpp>
 
+#include <stout/adaptor.hpp>
 #include <stout/elf.hpp>
 #include <stout/error.hpp>
 #include <stout/foreach.hpp>
@@ -38,6 +39,7 @@
 #include <stout/os/rmdir.hpp>
 #include <stout/os/shell.hpp>
 
+#include "linux/fs.hpp"
 #include "linux/ldcache.hpp"
 
 #include "slave/containerizer/mesos/isolators/gpu/nvml.hpp"
@@ -191,6 +193,10 @@ const string& NvidiaVolume::CONTAINER_PATH() const
 
 Try<NvidiaVolume> NvidiaVolume::create()
 {
+  if (geteuid() != 0) {
+    return Error("NvidiaVolume::create() requires root privileges");
+  }
+
   // Append the Nvidia driver version to the name of the volume.
   Try<Nothing> initialized = nvml::initialize();
   if (initialized.isError()) {
@@ -208,6 +214,45 @@ Try<NvidiaVolume> NvidiaVolume::create()
     Try<Nothing> mkdir = os::mkdir(hostPath);
     if (mkdir.isError()) {
       return Error("Failed to os::mkdir '" + hostPath + "': " + mkdir.error());
+    }
+  }
+
+  // If the filesystem where we are creating this volume has the
+  // `noexec` bit set, we will not be able to execute any of the
+  // nvidia binaries we place in the volume (e.g. `nvidia-smi`). To
+  // fix this, we mount a `tmpfs` over the volume `hostPath` without
+  // the `noexec` bit set. See MESOS-5923 for more information.
+  Try<fs::MountInfoTable> table = fs::MountInfoTable::read();
+  if (table.isError()) {
+    return Error("Failed to get mount table: " + table.error());
+  }
+
+  Result<string> realpath = os::realpath(hostPath);
+  if (!realpath.isSome()) {
+    return Error("Failed to os::realpath '" + hostPath + "':"
+                 " " + (realpath.isError()
+                        ? realpath.error()
+                        : "No such file or directory"));
+  }
+
+  // Do a reverse search through the list of mounted filesystems to
+  // find the filesystem that is mounted with the longest overlapping
+  // path to our `hostPath` (which may include the `hostPath` itself).
+  // Only mount a new `tmpfs` over the `hostPath` if the filesysem we
+  // find is marked as `noexec`.
+  foreach (const fs::MountInfoTable::Entry& entry,
+           adaptor::reverse(table->entries)) {
+    if (strings::startsWith(realpath.get(), entry.target)) {
+      if (strings::contains(entry.vfsOptions, "noexec")) {
+        Try<Nothing> mnt = fs::mount(
+            "tmpfs", hostPath, "tmpfs", MS_NOSUID | MS_NODEV, "mode=755");
+
+        if (mnt.isError()) {
+          return Error("Failed to mount '" + hostPath + "': " + mnt.error());
+        }
+      }
+
+      break;
     }
   }
 
@@ -231,24 +276,23 @@ Try<NvidiaVolume> NvidiaVolume::create()
     if (!os::exists(path)) {
       string command = "which " + binary;
       Try<string> which = os::shell(command);
-      if (which.isError()) {
-        return Error("Failed to os::shell '" + command + "': " + which.error());
-      }
 
-      which = strings::trim(which.get());
+      if (which.isSome()) {
+        which = strings::trim(which.get());
 
-      Result<string> realpath = os::realpath(which.get());
-      if (!realpath.isSome()) {
-        return Error("Failed to os::realpath '" + which.get() + "':"
-                     " " + (realpath.isError()
-                            ? realpath.error()
-                            : "No such file or directory"));
-      }
+        Result<string> realpath = os::realpath(which.get());
+        if (!realpath.isSome()) {
+          return Error("Failed to os::realpath '" + which.get() + "':"
+                       " " + (realpath.isError()
+                              ? realpath.error()
+                              : "No such file or directory"));
+        }
 
-      command = "cp " + realpath.get() + " " + path;
-      Try<string> cp = os::shell(command);
-      if (cp.isError()) {
-        return Error("Failed to os::shell '" + command + "': " + cp.error());
+        command = "cp " + realpath.get() + " " + path;
+        Try<string> cp = os::shell(command);
+        if (cp.isError()) {
+          return Error("Failed to os::shell '" + command + "': " + cp.error());
+        }
       }
     }
   }
@@ -334,7 +378,7 @@ Try<NvidiaVolume> NvidiaVolume::create()
 
         if (!os::exists(symlinkPath)) {
           Try<Nothing> symlink =
-            fs::symlink(Path(realpath.get()).basename(), symlinkPath);
+            ::fs::symlink(Path(realpath.get()).basename(), symlinkPath);
           if (symlink.isError()) {
             return Error("Failed to fs::symlink"
                          " '" + symlinkPath + "'"
@@ -359,7 +403,7 @@ Try<NvidiaVolume> NvidiaVolume::create()
 
           if (!os::exists(symlinkPath)) {
             Try<Nothing> symlink =
-              fs::symlink(Path(realpath.get()).basename(), symlinkPath);
+              ::fs::symlink(Path(realpath.get()).basename(), symlinkPath);
             if (symlink.isError()) {
               return Error("Failed to fs::symlink"
                            " '" + symlinkPath + "'"
@@ -378,20 +422,18 @@ Try<NvidiaVolume> NvidiaVolume::create()
 }
 
 
-// We use the the `com.nvidia.volumes.needed` label from
-// nvidia-docker to decide if we should inject the volume or not:
+// We use the `com.nvidia.volumes.needed` label from nvidia-docker
+// to decide if we should inject the volume or not:
 //
 // https://github.com/NVIDIA/nvidia-docker/wiki/Image-inspection
 bool NvidiaVolume::shouldInject(const ImageManifest& manifest) const
 {
-  foreach (const docker::spec::v1::Label& label, manifest.config().labels()) {
-    if (label.key() == "com.nvidia.volumes.needed") {
-      // The label value is used as the name of the volume that
-      // nvidia-docker-plugin registers with Docker. We therefore
-      // don't need to use it as we simply pass the host path
-      // of the volume directly.
-      return true;
-    }
+  if (manifest.config().labels().count("com.nvidia.volumes.needed")) {
+    // The label value is used as the name of the volume that
+    // nvidia-docker-plugin registers with Docker. We therefore
+    // don't need to use it as we simply pass the host path
+    // of the volume directly.
+    return true;
   }
 
   return false;

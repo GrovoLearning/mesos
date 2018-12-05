@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -34,8 +35,12 @@
 #include <stout/net.hpp>
 #include <stout/stopwatch.hpp>
 
-#include <stout/os/stat.hpp>
+#include <stout/os/constants.hpp>
 #include <stout/os/exists.hpp>
+#include <stout/os/int_fd.hpp>
+#include <stout/os/stat.hpp>
+
+#include "common/values.hpp"
 
 #include "linux/fs.hpp"
 #include "linux/ns.hpp"
@@ -79,10 +84,13 @@ using namespace routing::queueing;
 
 using mesos::internal::master::Master;
 
+using mesos::internal::values::rangesToIntervalSet;
+
 using mesos::master::detector::MasterDetector;
 
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
+using mesos::slave::ContainerTermination;
 using mesos::slave::Isolator;
 
 using std::list;
@@ -155,7 +163,7 @@ static void cleanup(const string& eth0, const string& lo)
   }
 
   // Clean up all 'veth' devices if exist.
-  Try<set<string> > links = net::links();
+  Try<set<string>> links = net::links();
   ASSERT_SOME(links);
 
   foreach (const string& name, links.get()) {
@@ -165,7 +173,7 @@ static void cleanup(const string& eth0, const string& lo)
   }
 
   if (os::exists(slave::PORT_MAPPING_BIND_MOUNT_ROOT())) {
-    Try<list<string> > entries = os::ls(slave::PORT_MAPPING_BIND_MOUNT_ROOT());
+    Try<list<string>> entries = os::ls(slave::PORT_MAPPING_BIND_MOUNT_ROOT());
     ASSERT_SOME(entries);
 
     foreach (const string& file, entries.get()) {
@@ -241,19 +249,19 @@ protected:
     cleanup(eth0, lo);
 
     // Get host IP address.
-    Result<net::IPNetwork> hostIPNetwork =
-        net::IPNetwork::fromLinkDevice(eth0, AF_INET);
+    Result<net::IP::Network> hostIPNetwork =
+        net::IP::Network::fromLinkDevice(eth0, AF_INET);
 
-    CHECK_SOME(hostIPNetwork)
+    ASSERT_SOME(hostIPNetwork)
       << "Failed to retrieve the host public IP network from " << eth0 << ": "
       << hostIPNetwork.error();
 
-    hostIP = hostIPNetwork.get().address();
+    hostIP = hostIPNetwork->address();
 
     // Get all the external name servers for tests that need to talk
     // to an external host, e.g., ping, DNS.
     Try<string> read = os::read("/etc/resolv.conf");
-    CHECK_SOME(read);
+    ASSERT_SOME(read);
 
     foreach (const string& line, strings::split(read.get(), "\n")) {
       if (!strings::startsWith(line, "nameserver")) {
@@ -306,7 +314,7 @@ protected:
       int pipes[2],
       const ContainerID& containerId,
       const string& command,
-      const Option<ContainerLaunchInfo>& launchInfo)
+      const Option<ContainerLaunchInfo>& isolatorLaunchInfo)
   {
     CommandInfo commandInfo;
     commandInfo.set_value(command);
@@ -314,24 +322,27 @@ protected:
     // The flags to pass to the helper process.
     MesosContainerizerLaunch::Flags launchFlags;
 
-    launchFlags.command = JSON::protobuf(commandInfo);
-    launchFlags.working_directory = os::getcwd();
-
-    CHECK_SOME(os::user());
-    launchFlags.user = os::user().get();
-
     launchFlags.pipe_read = pipes[0];
     launchFlags.pipe_write = pipes[1];
 
-    if (launchInfo->pre_exec_commands().size() != 1) {
-      return Error("No valid commands inside ContainerLaunchInfo.");
+    ContainerLaunchInfo launchInfo;
+    launchInfo.mutable_command()->CopyFrom(commandInfo);
+    launchInfo.set_working_directory(os::getcwd());
+
+    Result<string> user = os::user();
+    if (user.isError()) {
+      return Error(user.error());
+    } else if (user.isNone()) {
+      return Error("Could not get current user");
+    }
+    launchInfo.set_user(user.get());
+
+    if (isolatorLaunchInfo.isSome()) {
+      launchInfo.mutable_pre_exec_commands()->MergeFrom(
+          isolatorLaunchInfo->pre_exec_commands());
     }
 
-    JSON::Array preExecCommands;
-    preExecCommands.values.push_back(JSON::protobuf(
-        launchInfo->pre_exec_commands(0)));
-
-    launchFlags.pre_exec_commands = preExecCommands;
+    launchFlags.launch_info = JSON::protobuf(launchInfo);
 
     vector<string> argv(2);
     argv[0] = MESOS_CONTAINERIZER;
@@ -341,12 +352,12 @@ protected:
         containerId,
         path::join(flags.launcher_dir, MESOS_CONTAINERIZER),
         argv,
-        Subprocess::FD(STDIN_FILENO),
-        Subprocess::FD(STDOUT_FILENO),
-        Subprocess::FD(STDERR_FILENO),
-        launchFlags,
+        mesos::slave::ContainerIO(),
+        &launchFlags,
         None(),
-        CLONE_NEWNET | CLONE_NEWNS);
+        None(),
+        CLONE_NEWNET | CLONE_NEWNS,
+        {pipes[0], pipes[1]});
 
     return pid;
   }
@@ -374,23 +385,27 @@ protected:
     Try<Subprocess> s = subprocess(
         path::join(flags.launcher_dir, "mesos-network-helper"),
         argv,
-        Subprocess::PATH("/dev/null"),
+        Subprocess::PATH(os::DEV_NULL),
         Subprocess::PIPE(),
         Subprocess::FD(STDERR_FILENO),
-        NO_SETSID,
-        statistics.flags);
+        &statistics.flags);
 
-    CHECK_SOME(s);
+    if (s.isError()) {
+      return Error(s.error());
+    }
 
-    Future<Option<int> > status = s.get().status();
+    Future<Option<int>> status = s->status();
     AWAIT_EXPECT_READY(status);
     EXPECT_SOME_EQ(0, status.get());
 
-    Future<string> out = io::read(s.get().out().get());
+    Future<string> out = io::read(s->out().get());
     AWAIT_EXPECT_READY(out);
 
     Try<JSON::Object> object = JSON::parse<JSON::Object>(out.get());
-    CHECK_SOME(object);
+
+    if (object.isError()) {
+      return Error(object.error());
+    }
 
     return ::protobuf::parse<ResourceStatistics>(object.get());
   }
@@ -445,10 +460,10 @@ static bool waitForFileCreation(
 TEST_F(PortMappingIsolatorTest, ROOT_NC_ContainerToContainerTCP)
 {
   Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
-  CHECK_SOME(isolator);
+  ASSERT_SOME(isolator);
 
   Try<Launcher*> launcher = LinuxLauncher::create(flags);
-  CHECK_SOME(launcher);
+  ASSERT_SOME(launcher);
 
   // Set the executor's resources.
   ExecutorInfo executorInfo;
@@ -456,7 +471,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_ContainerToContainerTCP)
       Resources::parse(container1Ports).get());
 
   ContainerID containerId1;
-  containerId1.set_value(UUID::random().toString());
+  containerId1.set_value(id::UUID::random().toString());
 
   // Use a relative temporary directory so it gets cleaned up
   // automatically with the test.
@@ -505,7 +520,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_ContainerToContainerTCP)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > status1 = process::reap(pid.get());
+  Future<Option<int>> status1 = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -522,7 +537,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_ContainerToContainerTCP)
   ASSERT_TRUE(waitForFileCreation(container1Ready));
 
   ContainerID containerId2;
-  containerId2.set_value(UUID::random().toString());
+  containerId2.set_value(id::UUID::random().toString());
 
   executorInfo.mutable_resources()->CopyFrom(
       Resources::parse(container2Ports).get());
@@ -569,7 +584,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_ContainerToContainerTCP)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > status2 = process::reap(pid.get());
+  Future<Option<int>> status2 = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -608,10 +623,10 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_ContainerToContainerTCP)
 TEST_F(PortMappingIsolatorTest, ROOT_NC_ContainerToContainerUDP)
 {
   Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
-  CHECK_SOME(isolator);
+  ASSERT_SOME(isolator);
 
   Try<Launcher*> launcher = LinuxLauncher::create(flags);
-  CHECK_SOME(launcher);
+  ASSERT_SOME(launcher);
 
   // Set the executor's resources.
   ExecutorInfo executorInfo;
@@ -619,7 +634,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_ContainerToContainerUDP)
       Resources::parse(container1Ports).get());
 
   ContainerID containerId1;
-  containerId1.set_value(UUID::random().toString());
+  containerId1.set_value(id::UUID::random().toString());
 
   // Use a relative temporary directory so it gets cleaned up
   // automatically with the test.
@@ -668,7 +683,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_ContainerToContainerUDP)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > status1 = process::reap(pid.get());
+  Future<Option<int>> status1 = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -685,7 +700,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_ContainerToContainerUDP)
   ASSERT_TRUE(waitForFileCreation(container1Ready));
 
   ContainerID containerId2;
-  containerId2.set_value(UUID::random().toString());
+  containerId2.set_value(id::UUID::random().toString());
 
   executorInfo.mutable_resources()->CopyFrom(
       Resources::parse(container2Ports).get());
@@ -734,7 +749,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_ContainerToContainerUDP)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > status2 = process::reap(pid.get());
+  Future<Option<int>> status2 = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -773,10 +788,10 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_ContainerToContainerUDP)
 TEST_F(PortMappingIsolatorTest, ROOT_NC_HostToContainerUDP)
 {
   Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
-  CHECK_SOME(isolator);
+  ASSERT_SOME(isolator);
 
   Try<Launcher*> launcher = LinuxLauncher::create(flags);
-  CHECK_SOME(launcher);
+  ASSERT_SOME(launcher);
 
   // Set the executor's resources.
   ExecutorInfo executorInfo;
@@ -784,7 +799,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_HostToContainerUDP)
       Resources::parse(container1Ports).get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   // Use a relative temporary directory so it gets cleaned up
   // automatically with the test.
@@ -834,7 +849,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_HostToContainerUDP)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > status = process::reap(pid.get());
+  Future<Option<int>> status = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -891,10 +906,10 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_HostToContainerUDP)
 TEST_F(PortMappingIsolatorTest, ROOT_NC_HostToContainerTCP)
 {
   Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
-  CHECK_SOME(isolator);
+  ASSERT_SOME(isolator);
 
   Try<Launcher*> launcher = LinuxLauncher::create(flags);
-  CHECK_SOME(launcher);
+  ASSERT_SOME(launcher);
 
   // Set the executor's resources.
   ExecutorInfo executorInfo;
@@ -902,7 +917,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_HostToContainerTCP)
       Resources::parse(container1Ports).get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   // Use a relative temporary directory so it gets cleaned up
   // automatically with the test.
@@ -952,7 +967,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_HostToContainerTCP)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > status = process::reap(pid.get());
+  Future<Option<int>> status = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -1017,10 +1032,10 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerICMPExternal)
     << "-------------------------------------------------------------";
 
   Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
-  CHECK_SOME(isolator);
+  ASSERT_SOME(isolator);
 
   Try<Launcher*> launcher = LinuxLauncher::create(flags);
-  CHECK_SOME(launcher);
+  ASSERT_SOME(launcher);
 
   // Set the executor's resources.
   ExecutorInfo executorInfo;
@@ -1028,7 +1043,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerICMPExternal)
       Resources::parse(container1Ports).get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   // Use a relative temporary directory so it gets cleaned up
   // automatically with the test.
@@ -1049,7 +1064,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerICMPExternal)
   ASSERT_EQ(1, launchInfo.get()->pre_exec_commands().size());
 
   ostringstream command;
-  for (unsigned int i = 0; i < nameServers.size(); i++) {
+  for (size_t i = 0; i < nameServers.size(); i++) {
     const string& IP = nameServers[i];
     command << "ping -c1 " << IP;
     if (i + 1 < nameServers.size()) {
@@ -1071,7 +1086,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerICMPExternal)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > status = process::reap(pid.get());
+  Future<Option<int>> status = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -1104,10 +1119,10 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerICMPExternal)
 TEST_F(PortMappingIsolatorTest, ROOT_ContainerICMPInternal)
 {
   Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
-  CHECK_SOME(isolator);
+  ASSERT_SOME(isolator);
 
   Try<Launcher*> launcher = LinuxLauncher::create(flags);
-  CHECK_SOME(launcher);
+  ASSERT_SOME(launcher);
 
   // Set the executor's resources.
   ExecutorInfo executorInfo;
@@ -1115,7 +1130,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerICMPInternal)
       Resources::parse(container1Ports).get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   // Use a relative temporary directory so it gets cleaned up
   // automatically with the test.
@@ -1152,7 +1167,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerICMPInternal)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > status = process::reap(pid.get());
+  Future<Option<int>> status = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -1194,10 +1209,10 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerARPExternal)
     << "-------------------------------------------------------------";
 
   Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
-  CHECK_SOME(isolator);
+  ASSERT_SOME(isolator);
 
   Try<Launcher*> launcher = LinuxLauncher::create(flags);
-  CHECK_SOME(launcher);
+  ASSERT_SOME(launcher);
 
   // Set the executor's resources.
   ExecutorInfo executorInfo;
@@ -1205,7 +1220,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerARPExternal)
       Resources::parse(container1Ports).get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   // Use a relative temporary directory so it gets cleaned up
   // automatically with the test.
@@ -1226,7 +1241,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerARPExternal)
   ASSERT_EQ(1, launchInfo.get()->pre_exec_commands().size());
 
   ostringstream command;
-  for (unsigned int i = 0; i < nameServers.size(); i++) {
+  for (size_t i = 0; i < nameServers.size(); i++) {
     const string& IP = nameServers[i];
     // Time out after 1s and terminate upon receiving the first reply.
     command << "arping -f -w1 " << IP << " -I " << eth0;
@@ -1249,7 +1264,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerARPExternal)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > status = process::reap(pid.get());
+  Future<Option<int>> status = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -1290,10 +1305,10 @@ TEST_F(PortMappingIsolatorTest, ROOT_DNS)
     << "-------------------------------------------------------------";
 
   Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
-  CHECK_SOME(isolator);
+  ASSERT_SOME(isolator);
 
   Try<Launcher*> launcher = LinuxLauncher::create(flags);
-  CHECK_SOME(launcher);
+  ASSERT_SOME(launcher);
 
   // Set the executor's resources.
   ExecutorInfo executorInfo;
@@ -1301,7 +1316,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_DNS)
       Resources::parse(container1Ports).get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   // Use a relative temporary directory so it gets cleaned up
   // automatically with the test.
@@ -1322,7 +1337,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_DNS)
   ASSERT_EQ(1, launchInfo.get()->pre_exec_commands().size());
 
   ostringstream command;
-  for (unsigned int i = 0; i < nameServers.size(); i++) {
+  for (size_t i = 0; i < nameServers.size(); i++) {
     const string& IP = nameServers[i];
     command << "host " << IP;
     if (i + 1 < nameServers.size()) {
@@ -1344,7 +1359,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_DNS)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > status = process::reap(pid.get());
+  Future<Option<int>> status = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -1382,10 +1397,10 @@ TEST_F(PortMappingIsolatorTest, ROOT_TooManyContainers)
   flags.ephemeral_ports_per_container = 512;
 
   Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
-  CHECK_SOME(isolator);
+  ASSERT_SOME(isolator);
 
   Try<Launcher*> launcher = LinuxLauncher::create(flags);
-  CHECK_SOME(launcher);
+  ASSERT_SOME(launcher);
 
   // Set the executor's resources.
   ExecutorInfo executorInfo;
@@ -1393,7 +1408,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_TooManyContainers)
       Resources::parse(container1Ports).get());
 
   ContainerID containerId1;
-  containerId1.set_value(UUID::random().toString());
+  containerId1.set_value(id::UUID::random().toString());
 
   // Use a relative temporary directory so it gets cleaned up
   // automatically with the test.
@@ -1429,7 +1444,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_TooManyContainers)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > status1 = process::reap(pid.get());
+  Future<Option<int>> status1 = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -1443,7 +1458,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_TooManyContainers)
   ::close(pipes[1]);
 
   ContainerID containerId2;
-  containerId2.set_value(UUID::random().toString());
+  containerId2.set_value(id::UUID::random().toString());
 
   executorInfo.mutable_resources()->CopyFrom(
       Resources::parse(container2Ports).get());
@@ -1493,18 +1508,18 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_SmallEgressLimit)
   flags.egress_rate_limit_per_container = rate;
 
   Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
-  CHECK_SOME(isolator);
+  ASSERT_SOME(isolator);
 
   Try<Launcher*> launcher = LinuxLauncher::create(flags);
-  CHECK_SOME(launcher);
+  ASSERT_SOME(launcher);
 
   // Open an nc server on the host side. Note that 'invalidPort' is in
   // neither 'ports' nor 'ephemeral_ports', which makes it a good port
   // to use on the host.
   ostringstream command1;
-  command1 << "nc -l localhost " << invalidPort << " > /devnull";
+  command1 << "nc -l localhost " << invalidPort << " > " << os::DEV_NULL;
   Try<Subprocess> s = subprocess(command1.str().c_str());
-  CHECK_SOME(s);
+  ASSERT_SOME(s);
 
   // Set the executor's resources.
   ExecutorInfo executorInfo;
@@ -1512,7 +1527,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_SmallEgressLimit)
       Resources::parse(container1Ports).get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   // Use a relative temporary directory so it gets cleaned up
   // automatically with the test.
@@ -1542,7 +1557,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_SmallEgressLimit)
            << " bytes of data under egress rate limit " << rate.bytes()
            << "Bytes/s...';";
 
-  command2 << "{ time -p echo " << data  << " | nc localhost "
+  command2 << "{ time -p echo " << data << " | nc localhost "
            << invalidPort << " ; } 2> " << transmissionTime << " && ";
 
   // Touch the guard file.
@@ -1561,7 +1576,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_SmallEgressLimit)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > reap = process::reap(pid.get());
+  Future<Option<int>> reap = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -1578,7 +1593,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_SmallEgressLimit)
   ASSERT_TRUE(waitForFileCreation(container1Ready));
 
   Try<string> read = os::read(transmissionTime);
-  CHECK_SOME(read);
+  ASSERT_SOME(read);
 
   // Get the real elapsed time from `time` output. Sample output:
   // real 12.37
@@ -1595,7 +1610,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_SmallEgressLimit)
   ASSERT_GT(time.get(), (size.bytes() / rate.bytes()));
 
   // Make sure the nc server exits normally.
-  Future<Option<int> > status = s.get().status();
+  Future<Option<int>> status = s->status();
   AWAIT_READY(status);
   EXPECT_SOME_EQ(0, status.get());
 
@@ -1655,10 +1670,10 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_PortMappingStatistics)
   flags.network_enable_snmp_statistics = true;
 
   Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
-  CHECK_SOME(isolator);
+  ASSERT_SOME(isolator);
 
   Try<Launcher*> launcher = LinuxLauncher::create(flags);
-  CHECK_SOME(launcher);
+  ASSERT_SOME(launcher);
 
   // Open an nc server on the host side. Note that 'invalidPort' is
   // in neither 'ports' nor 'ephemeral_ports', which makes it a good
@@ -1666,9 +1681,9 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_PortMappingStatistics)
   // connections to the localhost IP are filtered out when retrieving
   // the RTT information inside containers.
   ostringstream command1;
-  command1 << "nc -l " << hostIP << " " << invalidPort << " > /devnull";
+  command1 << "nc -l " << hostIP << " " << invalidPort << " > " << os::DEV_NULL;
   Try<Subprocess> s = subprocess(command1.str().c_str());
-  CHECK_SOME(s);
+  ASSERT_SOME(s);
 
   // Set the executor's resources.
   ExecutorInfo executorInfo;
@@ -1676,7 +1691,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_PortMappingStatistics)
       Resources::parse(container1Ports).get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   // Use a relative temporary directory so it gets cleaned up
   // automatically with the test.
@@ -1706,7 +1721,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_PortMappingStatistics)
            << " bytes of data under egress rate limit " << rate.bytes()
            << "Bytes/s...';";
 
-  command2 << "{ time -p echo " << data  << " | nc " << hostIP << " "
+  command2 << "{ time -p echo " << data << " | nc " << hostIP << " "
            << invalidPort << " ; } 2> " << transmissionTime << " && ";
 
   // Touch the guard file.
@@ -1725,7 +1740,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_PortMappingStatistics)
   ASSERT_SOME(pid);
 
   // Reap the forked child.
-  Future<Option<int> > reap = process::reap(pid.get());
+  Future<Option<int>> reap = process::reap(pid.get());
 
   // Continue in the parent.
   ::close(pipes[0]);
@@ -1752,9 +1767,9 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_PortMappingStatistics)
     Future<ResourceStatistics> usage = isolator.get()->usage(containerId);
     AWAIT_READY(usage);
 
-    if (usage.get().has_net_tcp_rtt_microsecs_p50() &&
-        usage.get().has_net_tcp_active_connections()) {
-      EXPECT_GT(usage.get().net_tcp_active_connections(), 0);
+    if (usage->has_net_tcp_rtt_microsecs_p50() &&
+        usage->has_net_tcp_active_connections()) {
+      EXPECT_GT(usage->net_tcp_active_connections(), 0);
       break;
     }
   } while (waited < Seconds(5));
@@ -1791,7 +1806,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_PortMappingStatistics)
   ASSERT_TRUE(waitForFileCreation(container1Ready));
 
   // Make sure the nc server exits normally.
-  Future<Option<int> > status = s.get().status();
+  Future<Option<int>> status = s->status();
   AWAIT_READY(status);
   EXPECT_SOME_EQ(0, status.get());
 
@@ -1803,6 +1818,80 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_PortMappingStatistics)
 
   delete isolator.get();
   delete launcher.get();
+}
+
+
+static uint16_t roundUpToPow2(uint16_t x)
+{
+  uint16_t r = 1 << static_cast<uint16_t>(std::log2(x));
+  return x == r ? x : (r << 1);
+}
+
+
+// This test verifies that the isolator properly cleans up the
+// container that was not isolated, and doesn't leak ephemeral ports.
+TEST_F(PortMappingIsolatorTest, ROOT_CleanupNotIsolated)
+{
+  Try<Resources> resources = Resources::parse(flags.resources.get());
+  ASSERT_SOME(resources);
+  Try<IntervalSet<uint16_t>> ephemeralPorts =
+    rangesToIntervalSet<uint16_t>(resources->ephemeral_ports().get());
+  ASSERT_SOME(ephemeralPorts);
+
+  // Increase the number of ephemeral ports per container so that we
+  // won't be able to launch a second container unless ports used by
+  // the first one are deallocated.
+  flags.ephemeral_ports_per_container =
+    roundUpToPow2(ephemeralPorts->size() / 2 + 1);
+
+  Try<Isolator*> _isolator = PortMappingIsolatorProcess::create(flags);
+  ASSERT_SOME(_isolator);
+  Owned<Isolator> isolator(_isolator.get());
+
+  ExecutorInfo executorInfo;
+  executorInfo.mutable_resources()->CopyFrom(
+      Resources::parse(container1Ports).get());
+
+  ContainerID containerId1;
+  containerId1.set_value(id::UUID::random().toString());
+
+  Try<string> dir1 = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir1);
+
+  ContainerConfig containerConfig1;
+  containerConfig1.mutable_executor_info()->CopyFrom(executorInfo);
+  containerConfig1.set_directory(dir1.get());
+
+  Future<Option<ContainerLaunchInfo>> launchInfo1 =
+    isolator->prepare(containerId1, containerConfig1);
+  AWAIT_READY(launchInfo1);
+  ASSERT_SOME(launchInfo1.get());
+  ASSERT_EQ(1, launchInfo1.get()->pre_exec_commands().size());
+
+  // Simulate container destruction during preparation and clean up
+  // not isolated container.
+  AWAIT_READY(isolator->cleanup(containerId1));
+
+  executorInfo.mutable_resources()->CopyFrom(
+      Resources::parse(container2Ports).get());
+
+  ContainerID containerId2;
+  containerId2.set_value(id::UUID::random().toString());
+
+  Try<string> dir2 = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir2);
+
+  ContainerConfig containerConfig2;
+  containerConfig2.mutable_executor_info()->CopyFrom(executorInfo);
+  containerConfig2.set_directory(dir2.get());
+
+  Future<Option<ContainerLaunchInfo>> launchInfo2 =
+    isolator->prepare(containerId2, containerConfig2);
+  AWAIT_READY(launchInfo2);
+  ASSERT_SOME(launchInfo2.get());
+  ASSERT_EQ(1, launchInfo2.get()->pre_exec_commands().size());
+
+  AWAIT_READY(isolator->cleanup(containerId2));
 }
 
 
@@ -1839,8 +1928,6 @@ public:
     ContainerizerTest<MesosContainerizer>::TearDown();
   }
 
-  Fetcher fetcher;
-
   // Name of the host eth0 and lo.
   string eth0;
   string lo;
@@ -1865,16 +1952,22 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedContainers)
   // we create in this test. Also, this will bypass MESOS-2554.
   slaveFlags.isolation = "cgroups/cpu,cgroups/mem";
 
+  Fetcher fetcher(slaveFlags);
+
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(slaveFlags, true, &fetcher);
 
   ASSERT_SOME(_containerizer);
+
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 
-  Try<Owned<cluster::Slave>> slave =
-    StartSlave(detector.get(), containerizer.get(), slaveFlags);
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      containerizer.get(),
+      slaveFlags);
+
   ASSERT_SOME(slave);
 
   MockScheduler sched;
@@ -1893,7 +1986,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedContainers)
 
   // NOTE: We set filter explicitly here so that the resources will
   // not be filtered for 5 seconds (the default).
-  Future<vector<Offer> > offers1;
+  Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers1))
     .WillRepeatedly(DeclineOffers(filters));      // Ignore subsequent offers.
@@ -1901,7 +1994,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedContainers)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
   Offer offer1 = offers1.get()[0];
 
@@ -1928,7 +2021,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedContainers)
   Future<SlaveReregisteredMessage> slaveReregisteredMessage1 =
     FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
 
-  Future<vector<Offer> > offers2;
+  Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
     .WillRepeatedly(DeclineOffers(filters));      // Ignore subsequent offers.
@@ -1948,7 +2041,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedContainers)
   AWAIT_READY(_recover1);
 
   Clock::settle(); // Wait for slave to schedule reregister timeout.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+  Clock::advance(slaveFlags.executor_reregistration_timeout);
 
   AWAIT_READY(slaveReregisteredMessage1);
 
@@ -1958,7 +2051,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedContainers)
   Clock::resume();
 
   AWAIT_READY(offers2);
-  EXPECT_NE(0u, offers2.get().size());
+  ASSERT_FALSE(offers2->empty());
 
   Offer offer2 = offers2.get()[0];
 
@@ -1997,7 +2090,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedContainers)
   AWAIT_READY(_recover2);
 
   Clock::settle(); // Wait for slave to schedule reregister timeout.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+  Clock::advance(slaveFlags.executor_reregistration_timeout);
 
   AWAIT_READY(slaveReregisteredMessage2);
 
@@ -2007,7 +2100,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedContainers)
   // were recovered.
   Future<hashset<ContainerID>> containers = containerizer.get()->containers();
   AWAIT_READY(containers);
-  EXPECT_EQ(2u, containers.get().size());
+  EXPECT_EQ(2u, containers->size());
 
   foreach (const ContainerID& containerId, containers.get()) {
     // Do some basic checks to make sure the network isolator can
@@ -2035,8 +2128,18 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_CleanUpOrphan)
   // NOTE: We add 'cgroups/cpu,cgroups/mem' to bypass MESOS-2554.
   flags.isolation = "cgroups/cpu,cgroups/mem,network/port_mapping";
 
+  Fetcher fetcher(flags);
+
+  Try<MesosContainerizer*> _containerizer =
+    MesosContainerizer::create(flags, true, &fetcher);
+
+  ASSERT_SOME(_containerizer);
+  Owned<MesosContainerizer> containerizer(_containerizer.get());
+
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), containerizer.get(), flags);
+
   ASSERT_SOME(slave);
 
   MockScheduler sched;
@@ -2052,7 +2155,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_CleanUpOrphan)
   EXPECT_CALL(sched, registered(_, _, _))
     .WillOnce(FutureArg<1>(&frameworkId));
 
-  Future<vector<Offer> > offers;
+  Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
     .WillRepeatedly(DeclineOffers());      // Ignore subsequent offers.
@@ -2060,20 +2163,32 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_CleanUpOrphan)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   // Start a long running task using network islator.
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement =
+  Future<Nothing> _statusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _statusUpdateAcknowledgement2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
-  // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement);
+  // Wait for the ACKs to be checkpointed.
+  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_statusUpdateAcknowledgement2);
+
+  Future<hashset<ContainerID>> containers = containerizer->containers();
+
+  AWAIT_READY(containers);
+  ASSERT_EQ(1u, containers->size());
+
+  ContainerID containerId = *containers->begin();
 
   slave.get()->terminate();
 
@@ -2084,16 +2199,22 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_CleanUpOrphan)
   Future<SlaveRegisteredMessage> slaveRegisteredMessage =
     FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
 
-  Future<Nothing> orphansDestroyed =
-    FUTURE_DISPATCH(_, &MesosContainerizerProcess::___recover);
+  _containerizer = MesosContainerizer::create(flags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+
+  containerizer.reset(_containerizer.get());
 
   // Restart the slave.
-  slave = StartSlave(detector.get(), flags);
+  slave = StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
 
-  AWAIT_READY(slaveRegisteredMessage);
+  // Wait until slave recovery is complete.
+  Future<Nothing> _recover = FUTURE_DISPATCH(_, &Slave::_recover);
+  AWAIT_READY_FOR(_recover, Seconds(60));
 
-  AWAIT_READY(orphansDestroyed);
+  // Wait until the orphan containers are cleaned up.
+  AWAIT_READY_FOR(containerizer.get()->wait(containerId), Seconds(60));
+  AWAIT_READY(slaveRegisteredMessage);
 
   // Expect that qdiscs still exist on eth0 and lo but with no filters.
   Try<bool> hostEth0ExistsQdisc = ingress::exists(eth0);
@@ -2102,27 +2223,27 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_CleanUpOrphan)
   Try<bool> hostLoExistsQdisc = ingress::exists(lo);
   EXPECT_SOME_TRUE(hostLoExistsQdisc);
 
-  Result<vector<ip::Classifier> > classifiers =
+  Result<vector<ip::Classifier>> classifiers =
     ip::classifiers(eth0, ingress::HANDLE);
 
   EXPECT_SOME(classifiers);
-  EXPECT_EQ(0u, classifiers.get().size());
+  EXPECT_TRUE(classifiers->empty());
 
   classifiers = ip::classifiers(lo, ingress::HANDLE);
   EXPECT_SOME(classifiers);
-  EXPECT_EQ(0u, classifiers.get().size());
+  EXPECT_TRUE(classifiers->empty());
 
   // Expect no 'veth' devices.
-  Try<set<string> > links = net::links();
+  Try<set<string>> links = net::links();
   ASSERT_SOME(links);
   foreach (const string& name, links.get()) {
     EXPECT_FALSE(strings::startsWith(name, slave::PORT_MAPPING_VETH_PREFIX()));
   }
 
   // Expect no files in bind mount directory.
-  Try<list<string> > files = os::ls(slave::PORT_MAPPING_BIND_MOUNT_ROOT());
+  Try<list<string>> files = os::ls(slave::PORT_MAPPING_BIND_MOUNT_ROOT());
   ASSERT_SOME(files);
-  EXPECT_EQ(0u, files.get().size());
+  EXPECT_TRUE(files->empty());
 
   driver.stop();
   driver.join();
@@ -2138,6 +2259,8 @@ TEST_F(PortMappingMesosTest, ROOT_NetworkNamespaceHandleSymlink)
 
   slave::Flags flags = CreateSlaveFlags();
   flags.isolation = "network/port_mapping";
+
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(flags, true, &fetcher);
@@ -2158,7 +2281,7 @@ TEST_F(PortMappingMesosTest, ROOT_NetworkNamespaceHandleSymlink)
 
   EXPECT_CALL(sched, registered(_, _, _));
 
-  Future<vector<Offer> > offers;
+  Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
     .WillRepeatedly(DeclineOffers());      // Ignore subsequent offers.
@@ -2166,29 +2289,35 @@ TEST_F(PortMappingMesosTest, ROOT_NetworkNamespaceHandleSymlink)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   // Start a long running task using network islator.
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
+  Future<TaskStatus> status0;
   Future<TaskStatus> status1;
   Future<TaskStatus> status2;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status0))
     .WillOnce(FutureArg<1>(&status1))
     .WillOnce(FutureArg<1>(&status2))
     .WillRepeatedly(Return());       // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
+  AWAIT_READY(status0);
+  EXPECT_EQ(task.task_id(), status0->task_id());
+  EXPECT_EQ(TASK_STARTING, status0->state());
+
   AWAIT_READY(status1);
-  EXPECT_EQ(task.task_id(), status1.get().task_id());
-  EXPECT_EQ(TASK_RUNNING, status1.get().state());
+  EXPECT_EQ(task.task_id(), status1->task_id());
+  EXPECT_EQ(TASK_RUNNING, status1->state());
 
   Future<hashset<ContainerID>> containers = containerizer->containers();
   AWAIT_READY(containers);
-  ASSERT_EQ(1u, containers.get().size());
+  ASSERT_EQ(1u, containers->size());
 
-  ContainerID containerId = *(containers.get().begin());
+  ContainerID containerId = *(containers->begin());
 
   const string symlink = path::join(
       slave::PORT_MAPPING_BIND_MOUNT_SYMLINK_ROOT(),
@@ -2197,16 +2326,18 @@ TEST_F(PortMappingMesosTest, ROOT_NetworkNamespaceHandleSymlink)
   EXPECT_TRUE(os::exists(symlink));
   EXPECT_TRUE(os::stat::islink(symlink));
 
-  Future<containerizer::Termination> termination =
+  Future<Option<ContainerTermination>> termination =
     containerizer->wait(containerId);
 
   driver.killTask(task.task_id());
 
   AWAIT_READY(status2);
-  EXPECT_EQ(task.task_id(), status2.get().task_id());
-  EXPECT_EQ(TASK_KILLED, status2.get().state());
+  EXPECT_EQ(task.task_id(), status2->task_id());
+  EXPECT_EQ(TASK_KILLED, status2->state());
 
   AWAIT_READY(termination);
+  EXPECT_SOME(termination.get());
+
   EXPECT_FALSE(os::exists(symlink));
 
   driver.stop();
@@ -2224,6 +2355,8 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedKnownAndUnKnownOrphans)
 
   slave::Flags flags = CreateSlaveFlags();
   flags.isolation = "network/port_mapping";
+
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(flags, true, &fetcher);
@@ -2247,7 +2380,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedKnownAndUnKnownOrphans)
 
   EXPECT_CALL(sched, registered(_, _, _));
 
-  Future<vector<Offer> > offers;
+  Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
     .WillRepeatedly(DeclineOffers());      // Ignore subsequent offers.
@@ -2255,7 +2388,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedKnownAndUnKnownOrphans)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   Offer offer = offers.get()[0];
 
@@ -2271,23 +2404,33 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedKnownAndUnKnownOrphans)
 
   Future<TaskStatus> status1;
   Future<TaskStatus> status2;
+  Future<TaskStatus> status3;
+  Future<TaskStatus> status4;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
     .WillOnce(FutureArg<1>(&status1))
     .WillOnce(FutureArg<1>(&status2))
+    .WillOnce(FutureArg<1>(&status3))
+    .WillOnce(FutureArg<1>(&status4))
     .WillRepeatedly(Return());       // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task1, task2});
 
+  // Only check the first and the last status, as the other two might
+  // be interleaved between TASK_STARTING and TASK_RUNNING.
   AWAIT_READY(status1);
-  ASSERT_EQ(TASK_RUNNING, status1.get().state());
+  ASSERT_EQ(TASK_STARTING, status1->state());
 
-  AWAIT_READY(status2);
-  ASSERT_EQ(TASK_RUNNING, status2.get().state());
+  AWAIT_READY(status4);
+  ASSERT_EQ(TASK_RUNNING, status2->state());
 
   // Obtain the container IDs.
   Future<hashset<ContainerID>> containers = containerizer->containers();
   AWAIT_READY(containers);
-  ASSERT_EQ(2u, containers.get().size());
+  ASSERT_EQ(2u, containers->size());
+
+  auto iterator = containers->begin();
+  const ContainerID containerId1 = *iterator;
+  const ContainerID containerId2 = *(++iterator);
 
   slave.get()->terminate();
 
@@ -2297,10 +2440,9 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedKnownAndUnKnownOrphans)
 
   // Remove the network namespace symlink for one container so that it
   // becomes an unknown orphan.
-  const ContainerID containerId = *(containers.get().begin());
   const string symlink = path::join(
       slave::PORT_MAPPING_BIND_MOUNT_SYMLINK_ROOT(),
-      stringify(containerId));
+      stringify(containerId1));
 
   ASSERT_TRUE(os::exists(symlink));
   ASSERT_TRUE(os::stat::islink(symlink));
@@ -2309,15 +2451,22 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedKnownAndUnKnownOrphans)
   Future<SlaveRegisteredMessage> slaveRegisteredMessage =
     FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
 
-  Future<Nothing> knownOrphansDestroyed =
-    FUTURE_DISPATCH(_, &MesosContainerizerProcess::___recover);
+  _containerizer = MesosContainerizer::create(flags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+
+  containerizer.reset(_containerizer.get());
 
   // Restart the slave.
-  slave = StartSlave(detector.get(), flags);
+  slave = StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
 
+  // Wait until slave recovery is complete.
+  Future<Nothing> _recover = FUTURE_DISPATCH(_, &Slave::_recover);
+  AWAIT_READY_FOR(_recover, Seconds(60));
+
+  // Wait until the orphan containers are cleaned up.
+  AWAIT_READY_FOR(containerizer.get()->wait(containerId2), Seconds(60));
   AWAIT_READY(slaveRegisteredMessage);
-  AWAIT_READY(knownOrphansDestroyed);
 
   // We settle the clock here to ensure that the processing of
   // 'MesosContainerizerProcess::___destroy()' is complete and the

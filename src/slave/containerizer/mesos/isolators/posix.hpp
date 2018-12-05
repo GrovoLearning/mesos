@@ -18,6 +18,7 @@
 #define __POSIX_ISOLATOR_HPP__
 
 #include <process/future.hpp>
+#include <process/id.hpp>
 
 #include <stout/hashmap.hpp>
 #include <stout/os.hpp>
@@ -40,18 +41,18 @@ namespace slave {
 class PosixIsolatorProcess : public MesosIsolatorProcess
 {
 public:
-  virtual process::Future<Nothing> recover(
-      const std::list<mesos::slave::ContainerState>& state,
-      const hashset<ContainerID>& orphans)
+  process::Future<Nothing> recover(
+      const std::vector<mesos::slave::ContainerState>& state,
+      const hashset<ContainerID>& orphans) override
   {
     foreach (const mesos::slave::ContainerState& run, state) {
       // This should (almost) never occur: see comment in
-      // PosixLauncher::recover().
+      // SubprocessLauncher::recover().
       if (pids.contains(run.container_id())) {
         return process::Failure("Container already recovered");
       }
 
-      pids.put(run.container_id(), run.pid());
+      pids.put(run.container_id(), static_cast<pid_t>(run.pid()));
 
       process::Owned<process::Promise<mesos::slave::ContainerLimitation>>
         promise(new process::Promise<mesos::slave::ContainerLimitation>());
@@ -61,9 +62,9 @@ public:
     return Nothing();
   }
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig)
+      const mesos::slave::ContainerConfig& containerConfig) override
   {
     if (promises.contains(containerId)) {
       return process::Failure("Container " + stringify(containerId) +
@@ -77,9 +78,9 @@ public:
     return None();
   }
 
-  virtual process::Future<Nothing> isolate(
+  process::Future<Nothing> isolate(
       const ContainerID& containerId,
-      pid_t pid)
+      pid_t pid) override
   {
     if (!promises.contains(containerId)) {
       return process::Failure("Unknown container: " + stringify(containerId));
@@ -90,8 +91,8 @@ public:
     return Nothing();
   }
 
-  virtual process::Future<mesos::slave::ContainerLimitation> watch(
-      const ContainerID& containerId)
+  process::Future<mesos::slave::ContainerLimitation> watch(
+      const ContainerID& containerId) override
   {
     if (!promises.contains(containerId)) {
       return process::Failure("Unknown container: " + stringify(containerId));
@@ -100,9 +101,9 @@ public:
     return promises[containerId]->future();
   }
 
-  virtual process::Future<Nothing> update(
+  process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources)
+      const Resources& resources) override
   {
     if (!promises.contains(containerId)) {
       return process::Failure("Unknown container: " + stringify(containerId));
@@ -112,10 +113,13 @@ public:
     return Nothing();
   }
 
-  virtual process::Future<Nothing> cleanup(const ContainerID& containerId)
+  process::Future<Nothing> cleanup(const ContainerID& containerId) override
   {
     if (!promises.contains(containerId)) {
-      return process::Failure("Unknown container: " + stringify(containerId));
+      VLOG(1) << "Ignoring cleanup request for unknown container "
+              << containerId;
+
+      return Nothing();
     }
 
     // TODO(idownes): We should discard the container's promise here to signal
@@ -146,8 +150,8 @@ public:
     return new MesosIsolator(process);
   }
 
-  virtual process::Future<ResourceStatistics> usage(
-      const ContainerID& containerId)
+  process::Future<ResourceStatistics> usage(
+      const ContainerID& containerId) override
   {
     if (!pids.contains(containerId)) {
       LOG(WARNING) << "No resource usage for unknown container '"
@@ -165,7 +169,8 @@ public:
   }
 
 protected:
-  PosixCpuIsolatorProcess() {}
+  PosixCpuIsolatorProcess()
+    : ProcessBase(process::ID::generate("posix-cpu-isolator")) {}
 };
 
 class PosixMemIsolatorProcess : public PosixIsolatorProcess
@@ -179,8 +184,8 @@ public:
     return new MesosIsolator(process);
   }
 
-  virtual process::Future<ResourceStatistics> usage(
-      const ContainerID& containerId)
+  process::Future<ResourceStatistics> usage(
+      const ContainerID& containerId) override
   {
     if (!pids.contains(containerId)) {
       LOG(WARNING) << "No resource usage for unknown container '"
@@ -198,7 +203,8 @@ public:
   }
 
 protected:
-  PosixMemIsolatorProcess() {}
+  PosixMemIsolatorProcess()
+    : ProcessBase(process::ID::generate("posix-mem-isolator")) {}
 };
 
 } // namespace slave {

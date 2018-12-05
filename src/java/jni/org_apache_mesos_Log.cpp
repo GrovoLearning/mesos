@@ -151,7 +151,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Reader_read
 
   jlong jseconds = env->CallLongMethod(junit, toSeconds, jtimeout);
 
-  Future<std::list<Log::Entry> > entries = reader->read(from, to);
+  Future<std::list<Log::Entry>> entries = reader->read(from, to);
 
   if (!entries.await(Seconds(jseconds))) {
     // Timed out while trying to read the log.
@@ -234,6 +234,47 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Reader_ending
 
 /*
  * Class:     org_apache_mesos_Log_Reader
+ * Method:    catchup
+ * Signature: (JLjava/util/concurrent/TimeUnit;)Lorg/apache/mesos/Log/Position;
+ */
+JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Reader_catchup
+  (JNIEnv* env, jobject thiz, jlong jtimeout, jobject junit)
+{
+  // Read out __reader.
+  jclass clazz = env->GetObjectClass(thiz);
+  jfieldID __reader = env->GetFieldID(clazz, "__reader", "J");
+  Log::Reader* reader = (Log::Reader*)env->GetLongField(thiz, __reader);
+
+  // long seconds = unit.toSeconds(time);
+  clazz = env->GetObjectClass(junit);
+  jmethodID toSeconds = env->GetMethodID(clazz, "toSeconds", "(J)J");
+  jlong jseconds = env->CallLongMethod(junit, toSeconds, jtimeout);
+
+  Future<Log::Position> position = reader->catchup();
+
+  if (!position.await(Seconds(jseconds))) {
+    // Timed out while trying to catchup the log.
+    position.discard();
+    clazz = env->FindClass("java/util/concurrent/TimeoutException");
+    env->ThrowNew(clazz, "Timed out while attempting to catchup");
+    return nullptr;
+  } else if (!position.isReady()) {
+    // Failed to catchup the log.
+    clazz = env->FindClass("org/apache/mesos/Log$OperationFailedException");
+    env->ThrowNew(
+        clazz,
+        (position.isFailed()
+          ? position.failure().c_str() : "Discarded future"));
+    return nullptr;
+  }
+
+  jobject jposition = convert<Log::Position>(env, position.get());
+  return jposition;
+}
+
+
+/*
+ * Class:     org_apache_mesos_Log_Reader
  * Method:    initialize
  * Signature: (Lorg/apache/mesos/Log;)V
  */
@@ -306,7 +347,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Writer_append
 
   jlong jseconds = env->CallLongMethod(junit, toSeconds, jtimeout);
 
-  Future<Option<Log::Position> > position = writer->append(data);
+  Future<Option<Log::Position>> position = writer->append(data);
 
   if (!position.await(Seconds(jseconds))) {
     // Timed out while trying to append the log.
@@ -325,7 +366,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Writer_append
          ? position.failure().c_str()
          : "Discarded future"));
     return nullptr;
-  } else if (position.get().isNone()) {
+  } else if (position->isNone()) {
     // Lost exclusive write promise.
     env->ReleaseByteArrayElements(jdata, temp, 0);
     clazz = env->FindClass("org/apache/mesos/Log$WriterFailedException");
@@ -337,7 +378,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Writer_append
 
   env->ReleaseByteArrayElements(jdata, temp, 0);
 
-  jobject jposition = convert<Log::Position>(env, position.get().get());
+  jobject jposition = convert<Log::Position>(env, position->get());
 
   return jposition;
 }
@@ -372,7 +413,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Writer_truncate
 
   jlong jseconds = env->CallLongMethod(junit, toSeconds, jtimeout);
 
-  Future<Option<Log::Position> > position = writer->truncate(to);
+  Future<Option<Log::Position>> position = writer->truncate(to);
 
   if (!position.await(Seconds(jseconds))) {
     // Timed out while trying to truncate the log.
@@ -389,7 +430,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Writer_truncate
          ? position.failure().c_str()
          : "Discarded future"));
     return nullptr;
-  } else if (position.get().isNone()) {
+  } else if (position->isNone()) {
     // Lost exclusive write promise.
     clazz = env->FindClass("org/apache/mesos/Log$WriterFailedException");
     env->ThrowNew(
@@ -398,7 +439,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_Log_00024Writer_truncate
     return nullptr;
   }
 
-  jobject jposition = convert<Log::Position>(env, position.get().get());
+  jobject jposition = convert<Log::Position>(env, position->get());
 
   return jposition;
 }
@@ -450,13 +491,13 @@ JNIEXPORT void JNICALL Java_org_apache_mesos_Log_00024Writer_initialize
 
   // Try to start the writer.
   while (retries-- > 0) {
-    Future<Option<Log::Position> > position = writer->start();
+    Future<Option<Log::Position>> position = writer->start();
 
     if (!position.await(seconds)) {
       // Cancel the pending start. It is likely that we'll retry right
       // away but that is safe.
       position.discard();
-    } else if (position.isReady() && position.get().isSome()) {
+    } else if (position.isReady() && position->isSome()) {
       // Started!
       break;
     }

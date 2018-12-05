@@ -43,7 +43,7 @@ namespace state {
 // replicated guarantees.
 //
 // Note that the semantics of 'fetch' and 'store' provide
-// atomicity. That is, you can not store a variable that has changed
+// atomicity. That is, you cannot store a variable that has changed
 // since you did the last fetch. That is, if a store succeeds then no
 // other writes have been performed on the variable since your fetch.
 //
@@ -143,7 +143,7 @@ inline process::Future<Variable> State::_fetch(
   // UUID and no value to start).
   internal::state::Entry entry;
   entry.set_name(name);
-  entry.set_uuid(UUID::random().toBytes());
+  entry.set_uuid(id::UUID::random().toBytes());
 
   return Variable(entry);
 }
@@ -152,13 +152,13 @@ inline process::Future<Variable> State::_fetch(
 inline process::Future<Option<Variable>> State::store(const Variable& variable)
 {
   // Note that we try and swap an entry even if the value didn't change!
-  UUID uuid = UUID::fromBytes(variable.entry.uuid()).get();
+  id::UUID uuid = id::UUID::fromBytes(variable.entry.uuid()).get();
 
   // Create a new entry to replace the existing entry provided the
   // UUID matches.
   internal::state::Entry entry;
   entry.set_name(variable.entry.name());
-  entry.set_uuid(UUID::random().toBytes());
+  entry.set_uuid(id::UUID::random().toBytes());
   entry.set_value(variable.entry.value());
 
   return storage->set(entry, uuid)

@@ -41,28 +41,28 @@ using strings::format;
 class PathsTest : public ::testing::Test
 {
 public:
-  virtual void SetUp()
+  void SetUp() override
   {
     slaveId.set_value("agent1");
     frameworkId.set_value("framework1");
     executorId.set_value("executor1");
     taskId.set_value("task1");
-    containerId.set_value(UUID::random().toString());
+    containerId.set_value(id::UUID::random().toString());
     role = "role1";
     persistenceId = "persistenceId1";
 
     Try<string> path = os::mkdtemp();
-    CHECK_SOME(path) << "Failed to mkdtemp";
+    ASSERT_SOME(path) << "Failed to mkdtemp";
     rootDir = path.get();
 
     path = os::mkdtemp();
-    CHECK_SOME(path) << "Failed to mkdtemp";
+    ASSERT_SOME(path) << "Failed to mkdtemp";
     diskSourceDir = path.get();
 
     imageType = Image::APPC;
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
      os::rmdir(rootDir);
      os::rmdir(diskSourceDir);
@@ -84,7 +84,7 @@ protected:
 
 TEST_F(PathsTest, CreateExecutorDirectory)
 {
-  const string& result = paths::createExecutorDirectory(
+  Try<string> result = paths::createExecutorDirectory(
       rootDir, slaveId, frameworkId, executorId, containerId);
 
   // Expected directory layout.
@@ -99,7 +99,7 @@ TEST_F(PathsTest, CreateExecutorDirectory)
       "runs",
       containerId.value());
 
-  ASSERT_EQ(dir, result);
+  ASSERT_SOME_EQ(dir, result);
 }
 
 
@@ -164,12 +164,6 @@ TEST_F(PathsTest, ProvisionerDir)
 {
   EXPECT_EQ(path::join(rootDir, "provisioner"),
             paths::getProvisionerDir(rootDir));
-}
-
-
-TEST_F(PathsTest, Archive)
-{
-  EXPECT_EQ(path::join(rootDir, "archive"), paths::getArchiveDir(rootDir));
 }
 
 

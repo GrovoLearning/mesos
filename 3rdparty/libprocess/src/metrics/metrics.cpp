@@ -12,14 +12,14 @@
 
 #include <glog/logging.h>
 
-#include <list>
+#include <map>
 #include <string>
 #include <vector>
 
+#include <process/after.hpp>
 #include <process/collect.hpp>
 #include <process/dispatch.hpp>
 #include <process/help.hpp>
-#include <process/once.hpp>
 #include <process/owned.hpp>
 #include <process/process.hpp>
 
@@ -28,113 +28,76 @@
 #include <stout/duration.hpp>
 #include <stout/error.hpp>
 #include <stout/foreach.hpp>
-#include <stout/hashmap.hpp>
 #include <stout/numify.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
 
-using std::list;
+using std::map;
 using std::string;
 using std::vector;
 
 namespace process {
 namespace metrics {
+namespace internal {
 
-
-static internal::MetricsProcess* metrics_process = nullptr;
-
-
-void initialize(const Option<string>& authenticationRealm)
+MetricsProcess* MetricsProcess::create(
+    const Option<string>& authenticationRealm)
 {
-  // To prevent a deadlock, we must ensure libprocess is
-  // initialized. Otherwise, libprocess will be implicitly
-  // initialized inside the 'once' block below, which in
-  // turns initializes metrics, and we arrive back here
-  // and deadlock by calling 'once()' without allowing
-  // 'done()' to ever be called.
-  process::initialize();
+  Option<string> limit =
+    os::getenv("LIBPROCESS_METRICS_SNAPSHOT_ENDPOINT_RATE_LIMIT");
 
-  static Once* initialized = new Once();
-  if (!initialized->once()) {
-    Option<string> limit =
-      os::getenv("LIBPROCESS_METRICS_SNAPSHOT_ENDPOINT_RATE_LIMIT");
+  Option<Owned<RateLimiter>> limiter;
 
-    Option<Owned<RateLimiter>> limiter;
+  // By default, we apply a rate limit of 2 requests
+  // per second to the metrics snapshot endpoint in
+  // order to maintain backwards compatibility (before
+  // this was made configurable, we hard-coded a limit
+  // of 2 requests per second).
+  if (limit.isNone()) {
+    limiter = Owned<RateLimiter>(new RateLimiter(2, Seconds(1)));
+  } else if (limit->empty()) {
+    limiter = None();
+  } else {
+    // TODO(vinod): Move this parsing logic to flags
+    // once we have a 'Rate' abstraction in stout.
+    Option<Error> reason;
+    vector<string> tokens = strings::tokenize(limit.get(), "/");
 
-    // By default, we apply a rate limit of 2 requests
-    // per second to the metrics snapshot endpoint in
-    // order to maintain backwards compatibility (before
-    // this was made configurable, we hard-coded a limit
-    // of 2 requests per second).
-    if (limit.isNone()) {
-      limiter = Owned<RateLimiter>(new RateLimiter(2, Seconds(1)));
-    } else if (limit->empty()) {
-      limiter = None();
-    } else {
-      // TODO(vinod): Move this parsing logic to flags
-      // once we have a 'Rate' abstraction in stout.
-      Option<Error> reason;
-      vector<string> tokens = strings::tokenize(limit.get(), "/");
+    if (tokens.size() == 2) {
+      Try<int> requests = numify<int>(tokens[0]);
+      Try<Duration> interval = Duration::parse(tokens[1]);
 
-      if (tokens.size() == 2) {
-        Try<int> requests = numify<int>(tokens[0]);
-        Try<Duration> interval = Duration::parse(tokens[1]);
-
-        if (requests.isError()) {
-          reason = Error(
-              "Failed to parse the number of requests: " + requests.error());
-        } else if (interval.isError()) {
-          reason = Error(
-              "Failed to parse the interval: " + interval.error());
-        } else {
-          limiter = Owned<RateLimiter>(
-              new RateLimiter(requests.get(), interval.get()));
-        }
+      if (requests.isError()) {
+        reason = Error(
+            "Failed to parse the number of requests: " + requests.error());
+      } else if (interval.isError()) {
+        reason = Error(
+            "Failed to parse the interval: " + interval.error());
+      } else {
+        limiter = Owned<RateLimiter>(
+            new RateLimiter(requests.get(), interval.get()));
       }
+    }
 
-      if (limiter.isNone()) {
+    if (limiter.isNone()) {
         EXIT(EXIT_FAILURE)
           << "Failed to parse LIBPROCESS_METRICS_SNAPSHOT_ENDPOINT_RATE_LIMIT "
           << "'" << limit.get() << "'"
           << " (format is <number of requests>/<interval duration>)"
-          << (reason.isSome() ? ": " + reason.get().message : "");
-      }
+          << (reason.isSome() ? ": " + reason->message : "");
     }
-
-    metrics_process =
-      new internal::MetricsProcess(limiter, authenticationRealm);
-    spawn(metrics_process);
-
-    initialized->done();
   }
-}
 
-
-namespace internal {
-
-
-MetricsProcess* MetricsProcess::instance()
-{
-  metrics::initialize();
-
-  return metrics_process;
+  return new MetricsProcess(limiter, authenticationRealm);
 }
 
 
 void MetricsProcess::initialize()
 {
-  if (authenticationRealm.isSome()) {
-    route("/snapshot",
-          authenticationRealm.get(),
-          help(),
-          &MetricsProcess::_snapshot);
-  } else {
-    route("/snapshot",
-          help(),
-          [this](const http::Request& request) {
-            return _snapshot(request, None());
-          });
-  }
+  route("/snapshot",
+        authenticationRealm,
+        help(),
+        &MetricsProcess::_snapshot);
 }
 
 
@@ -157,54 +120,77 @@ string MetricsProcess::help()
 
 Future<Nothing> MetricsProcess::add(Owned<Metric> metric)
 {
-  if (metrics.contains(metric->name())) {
+  bool inserted = metrics.emplace(metric->name(), metric).second;
+
+  if (!inserted) {
     return Failure("Metric '" + metric->name() + "' was already added");
   }
 
-  metrics[metric->name()] = metric;
   return Nothing();
 }
 
 
 Future<Nothing> MetricsProcess::remove(const string& name)
 {
-  if (!metrics.contains(name)) {
+  size_t erased = metrics.erase(name);
+
+  if (erased == 0) {
     return Failure("Metric '" + name + "' not found");
   }
-
-  metrics.erase(name);
 
   return Nothing();
 }
 
 
-Future<hashmap<string, double>> MetricsProcess::snapshot(
+Future<map<string, double>> MetricsProcess::snapshot(
     const Option<Duration>& timeout)
 {
-  hashmap<string, Future<double>> futures;
-  hashmap<string, Option<Statistics<double>>> statistics;
+  // To avoid creating a new vector when calling `await()` below, we use three
+  // ordered vectors, where the Nth key in `keys` is associated with the Nth
+  // items in each of `futures` and `statistics`.
+  vector<string> keys;
+  vector<Future<double>> futures;
+  vector<Option<Statistics<double>>> statistics;
 
-  foreachkey (const string& metric, metrics) {
-    CHECK_NOTNULL(metrics[metric].get());
-    futures[metric] = metrics[metric]->value();
-    // TODO(dhamon): It would be nice to compute these asynchronously.
-    statistics[metric] = metrics[metric]->statistics();
+  keys.reserve(metrics.size());
+  futures.reserve(metrics.size());
+  statistics.reserve(metrics.size());
+
+  for (auto iter = metrics.begin(); iter != metrics.end(); ++iter) {
+    keys.emplace_back(iter->first);
+    futures.emplace_back(iter->second->value());
+    statistics.emplace_back(iter->second->statistics());
   }
 
-  if (timeout.isSome()) {
-    return await(futures.values())
-      .after(timeout.get(), lambda::bind(_snapshotTimeout, futures.values()))
-      .then(lambda::bind(__snapshot, timeout, futures, statistics));
-  } else {
-    return await(futures.values())
-      .then(lambda::bind(__snapshot, timeout, futures, statistics));
-  }
+  Future<Nothing> timedout =
+    after(timeout.getOrElse(Duration::max()));
+
+  // Return the response once it finishes or we time out.
+  //
+  // NOTE: We assign the result of `select()` to a local variable to ensure that
+  // the `await()` call in this expression is evaluated before the call to
+  // `std::move(futures)` in the subsequent expression. Otherwise, it's possible
+  // that the `move()` could be evaluated first, causing an empty vector to be
+  // passed into `await()`.
+  Future<Future<Nothing>> waited =
+    select<Nothing>({
+      timedout,
+      await(futures).then([]{ return Nothing(); }) });
+
+  return waited
+    .onAny([=]() mutable { timedout.discard(); }) // Don't accumulate timers.
+    .then(defer(self(),
+                &Self::__snapshot,
+                timeout,
+                std::move(keys),
+                std::move(futures),
+                std::move(statistics)));
 }
 
 
 Future<http::Response> MetricsProcess::_snapshot(
     const http::Request& request,
-    const Option<string>& /* principal */)
+    const Option<http::authentication::Principal>&)
 {
   // Parse the 'timeout' parameter.
   Option<Duration> timeout;
@@ -229,56 +215,57 @@ Future<http::Response> MetricsProcess::_snapshot(
   }
 
   return acquire.then(defer(self(), &Self::snapshot, timeout))
-      .then([request](const hashmap<string, double>& metrics)
+      .then([request](const map<string, double>& metrics)
             -> http::Response {
         return http::OK(jsonify(metrics), request.url.query.get("jsonp"));
       });
 }
 
 
-list<Future<double>> MetricsProcess::_snapshotTimeout(
-    const list<Future<double>>& futures)
-{
-  // Stop waiting for all futures to transition and return a 'ready'
-  // list to proceed handling the request.
-  return futures;
-}
-
-
-Future<hashmap<string, double>> MetricsProcess::__snapshot(
+Future<map<string, double>> MetricsProcess::__snapshot(
     const Option<Duration>& timeout,
-    const hashmap<string, Future<double>>& metrics,
-    const hashmap<string, Option<Statistics<double>>>& statistics)
+    vector<string>&& keys,
+    vector<Future<double>>&& metrics,
+    vector<Option<Statistics<double>>>&& statistics)
 {
-  hashmap<string, double> snapshot;
+  map<string, double> snapshot;
 
-  foreachpair (const string& key, const Future<double>& value, metrics) {
+  for (size_t i = 0; i < metrics.size(); ++i) {
     // TODO(dhamon): Maybe add the failure message for this metric to the
     // response if value.isFailed().
+    const string& key = keys[i];
+    const Future<double>& value = metrics[i];
+
     if (value.isPending()) {
       CHECK_SOME(timeout);
       VLOG(1) << "Exceeded timeout of " << timeout.get()
               << " when attempting to get metric '" << key << "'";
     } else if (value.isReady()) {
-      snapshot[key] = value.get();
+      snapshot.emplace_hint(snapshot.end(), key, value.get());
     }
 
-    Option<Statistics<double>> statistics_ = statistics.get(key).get();
-
-    if (statistics_.isSome()) {
-      snapshot[key + "/count"] = statistics_.get().count;
-      snapshot[key + "/min"] = statistics_.get().min;
-      snapshot[key + "/max"] = statistics_.get().max;
-      snapshot[key + "/p50"] = statistics_.get().p50;
-      snapshot[key + "/p90"] = statistics_.get().p90;
-      snapshot[key + "/p95"] = statistics_.get().p95;
-      snapshot[key + "/p99"] = statistics_.get().p99;
-      snapshot[key + "/p999"] = statistics_.get().p999;
-      snapshot[key + "/p9999"] = statistics_.get().p9999;
+    if (statistics[i].isSome()) {
+      Statistics<double>& statistics_ = statistics[i].get();
+      snapshot.emplace_hint(
+          snapshot.end(),
+          key + "/count",
+          static_cast<double>(statistics_.count));
+      // TODO(alexr): Consider exposing p25 and p75 percentiles.
+      snapshot.emplace_hint(snapshot.end(), key + "/max", statistics_.max);
+      snapshot.emplace_hint(snapshot.end(), key + "/min", statistics_.min);
+      snapshot.emplace_hint(snapshot.end(), key + "/p50", statistics_.p50);
+      snapshot.emplace_hint(snapshot.end(), key + "/p90", statistics_.p90);
+      snapshot.emplace_hint(snapshot.end(), key + "/p95", statistics_.p95);
+      snapshot.emplace_hint(snapshot.end(), key + "/p99", statistics_.p99);
+      snapshot.emplace_hint(snapshot.end(), key + "/p999", statistics_.p999);
+      snapshot.emplace_hint(snapshot.end(), key + "/p9999", statistics_.p9999);
     }
   }
 
-  return snapshot;
+  // NOTE: Newer compilers (clang-3.9 and gcc-5.1) can perform
+  // this move automatically when optimization is on. Once these
+  // are the minimum versions, remove this `std::move`.
+  return std::move(snapshot);
 }
 
 }  // namespace internal {

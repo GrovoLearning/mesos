@@ -11,7 +11,7 @@ The above figure shows the main components of Mesos.  Mesos consists of a *maste
 
 The master enables fine-grained sharing of resources (CPU, RAM, ...) across
 frameworks by making them *resource offers*. Each resource offer contains a list
-of &lt;agent ID, resource1: amount1, resource2: amount2, ...&gt; (NOTE: as
+of `<agent ID, resource1: amount1, resource2: amount2, ...>` (NOTE: as
 keyword 'slave' is deprecated in favor of 'agent', driver-based frameworks will
 still receive offers with slave ID, whereas frameworks using the v1 HTTP API receive offers with agent ID). The master decides *how many* resources to offer to each framework according to a given organizational policy, such as fair sharing or strict priority. To support a diverse set of policies, the master employs a modular architecture that makes it easy to add new allocation modules via a plugin mechanism.
 
@@ -34,4 +34,4 @@ In addition, this resource offer process repeats when tasks finish and new resou
 
 While the thin interface provided by Mesos allows it to scale and allows the frameworks to evolve independently, one question remains: how can the constraints of a framework be satisfied without Mesos knowing about these constraints? For example, how can a framework achieve data locality without Mesos knowing which nodes store the data required by the framework? Mesos answers these questions by simply giving frameworks the ability to **reject** offers. A framework will reject the offers that do not satisfy its constraints and accept the ones that do.  In particular, we have found that a simple policy called delay scheduling, in which frameworks wait for a limited time to acquire nodes storing the input data, yields nearly optimal data locality.
 
-You can also read much more about the Mesos architecture in this [technical paper](http://mesos.berkeley.edu/mesos_tech_report.pdf).
+You can also read much more about the Mesos architecture in this [technical paper](https://www.usenix.org/conference/nsdi11/mesos-platform-fine-grained-resource-sharing-data-center).

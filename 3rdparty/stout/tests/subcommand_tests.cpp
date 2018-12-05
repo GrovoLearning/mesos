@@ -29,18 +29,18 @@ using std::vector;
 class TestSubcommand : public Subcommand
 {
 public:
-  struct Flags : public flags::FlagsBase
+  struct Flags : public virtual flags::FlagsBase
   {
     Flags()
     {
-      add(&b, "b", "bool");
-      add(&i, "i", "int");
-      add(&s, "s", "string");
-      add(&s2, "s2", "string with single quote");
-      add(&s3, "s3", "string with double quote");
-      add(&d, "d", "Duration");
-      add(&y, "y", "Bytes");
-      add(&j, "j", "JSON::Object");
+      add(&Flags::b, "b", "bool");
+      add(&Flags::i, "i", "int");
+      add(&Flags::s, "s", "string");
+      add(&Flags::s2, "s2", "string with single quote");
+      add(&Flags::s3, "s3", "string with double quote");
+      add(&Flags::d, "d", "Duration");
+      add(&Flags::y, "y", "Bytes");
+      add(&Flags::j, "j", "JSON::Object");
     }
 
     void populate()
@@ -87,8 +87,8 @@ public:
   Flags flags;
 
 protected:
-  virtual int execute() { return 0; }
-  virtual flags::FlagsBase* getFlags() { return &flags; }
+  int execute() override { return 0; }
+  flags::FlagsBase* getFlags() override { return &flags; }
 };
 
 
@@ -113,7 +113,7 @@ TEST(SubcommandTest, Flags)
 
   // Construct the command line arguments.
   vector<string> _argv = getArgv(flags);
-  int argc = _argv.size() + 2;
+  int argc = static_cast<int>(_argv.size()) + 2;
   char** argv = new char*[argc];
   argv[0] = (char*) "command";
   argv[1] = (char*) "subcommand";

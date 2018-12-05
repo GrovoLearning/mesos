@@ -26,37 +26,22 @@ class Profiler : public Process<Profiler>
 public:
   Profiler(const Option<std::string>& _authenticationRealm)
     : ProcessBase("profiler"),
-      started(false),
       authenticationRealm(_authenticationRealm) {}
 
-  virtual ~Profiler() {}
+  ~Profiler() override {}
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
-    if (authenticationRealm.isSome()) {
-      route("/start",
-            authenticationRealm.get(),
-            START_HELP(),
-            &Profiler::start);
+    route("/start",
+          authenticationRealm,
+          START_HELP(),
+          &Profiler::start);
 
-      route("/stop",
-            authenticationRealm.get(),
-            STOP_HELP(),
-            &Profiler::stop);
-    } else {
-      route("/start",
-            START_HELP(),
-            [this](const http::Request& request) {
-              return Profiler::start(request, None());
-            });
-
-      route("/stop",
-            STOP_HELP(),
-            [this](const http::Request& request) {
-              return Profiler::stop(request, None());
-            });
-    }
+    route("/stop",
+          authenticationRealm,
+          STOP_HELP(),
+          &Profiler::stop);
   }
 
 private:
@@ -68,16 +53,14 @@ private:
   // Starts the profiler. There are no request parameters.
   Future<http::Response> start(
       const http::Request& request,
-      const Option<std::string>& /* principal */);
+      const Option<http::authentication::Principal>&);
 
   // Stops the profiler. There are no request parameters.
   // This returns the profile output, it will also remain present
   // in the working directory.
   Future<http::Response> stop(
       const http::Request& request,
-      const Option<std::string>& /* principal */);
-
-  bool started;
+      const Option<http::authentication::Principal>&);
 
   // The authentication realm that the profiler's HTTP endpoints will be
   // installed into.

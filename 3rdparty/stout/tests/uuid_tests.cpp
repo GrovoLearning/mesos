@@ -20,6 +20,8 @@
 #include <stout/gtest.hpp>
 #include <stout/uuid.hpp>
 
+using id::UUID;
+
 using std::string;
 
 
@@ -49,9 +51,19 @@ TEST(UUIDTest, Test)
   EXPECT_EQ(string2, string3);
   EXPECT_EQ(string1, string3);
 
-  EXPECT_EQ(uuid1, UUID::fromString(string1));
-  EXPECT_EQ(uuid2, UUID::fromString(string2));
-  EXPECT_EQ(uuid3, UUID::fromString(string3));
+  EXPECT_SOME_EQ(uuid1, UUID::fromString(string1));
+  EXPECT_SOME_EQ(uuid2, UUID::fromString(string2));
+  EXPECT_SOME_EQ(uuid3, UUID::fromString(string3));
+}
+
+
+TEST(UUIDTest, Metadata)
+{
+  UUID uuid = UUID::random();
+
+  EXPECT_EQ(16u, uuid.size());
+  EXPECT_EQ(UUID::variant_rfc_4122, uuid.variant());
+  EXPECT_EQ(UUID::version_random_number_based, uuid.version());
 }
 
 
@@ -60,4 +72,6 @@ TEST(UUIDTest, MalformedUUID)
   EXPECT_SOME(UUID::fromBytes(UUID::random().toBytes()));
   EXPECT_ERROR(UUID::fromBytes("malformed-uuid"));
   EXPECT_ERROR(UUID::fromBytes("invalidstringmsg"));
+  EXPECT_SOME(UUID::fromString(UUID::random().toString()));
+  EXPECT_ERROR(UUID::fromString("malformed-uuid"));
 }

@@ -17,11 +17,19 @@
 #ifndef __DOCKER_CONTAINERIZER_HPP__
 #define __DOCKER_CONTAINERIZER_HPP__
 
+#include <map>
+#include <set>
+#include <string>
+
 #include <mesos/slave/container_logger.hpp>
 
 #include <process/owned.hpp>
 #include <process/shared.hpp>
 
+#include <process/metrics/metrics.hpp>
+#include <process/metrics/timer.hpp>
+
+#include <stout/duration.hpp>
 #include <stout/flags.hpp>
 #include <stout/hashset.hpp>
 
@@ -30,7 +38,7 @@
 
 #include "slave/containerizer/containerizer.hpp"
 
-#include "slave/containerizer/mesos/isolators/gpu/nvidia.hpp"
+#include "slave/containerizer/mesos/isolators/gpu/components.hpp"
 
 namespace mesos {
 namespace internal {
@@ -40,8 +48,9 @@ namespace slave {
 // created by Mesos from those created manually.
 extern const std::string DOCKER_NAME_PREFIX;
 
-// Separator used to compose docker container name, which is made up
-// of slave ID and container ID.
+// Separator used to compose docker container name, which consists
+// of the name prefix, ContainerID, and possibly the SlaveID depending
+// on the version of Mesos used to create the container.
 extern const std::string DOCKER_NAME_SEPERATOR;
 
 // Directory that stores all the symlinked sandboxes that is mapped
@@ -68,49 +77,44 @@ public:
       const Flags& flags,
       Fetcher* fetcher,
       const process::Owned<mesos::slave::ContainerLogger>& logger,
-      process::Shared<Docker> docker);
+      process::Shared<Docker> docker,
+      const Option<NvidiaComponents>& nvidia = None());
 
   // This is only public for tests.
   DockerContainerizer(
       const process::Owned<DockerContainerizerProcess>& _process);
 
-  virtual ~DockerContainerizer();
+  ~DockerContainerizer() override;
 
-  virtual process::Future<Nothing> recover(
-      const Option<state::SlaveState>& state);
+  process::Future<Nothing> recover(
+      const Option<state::SlaveState>& state) override;
 
-  virtual process::Future<bool> launch(
+  process::Future<Containerizer::LaunchResult> launch(
       const ContainerID& containerId,
-      const ExecutorInfo& executorInfo,
-      const std::string& directory,
-      const Option<std::string>& user,
-      const SlaveID& slaveId,
-      const process::PID<Slave>& slavePid,
-      bool checkpoint);
+      const mesos::slave::ContainerConfig& containerConfig,
+      const std::map<std::string, std::string>& environment,
+      const Option<std::string>& pidCheckpointPath) override;
 
-  virtual process::Future<bool> launch(
+  process::Future<Nothing> update(
       const ContainerID& containerId,
-      const TaskInfo& taskInfo,
-      const ExecutorInfo& executorInfo,
-      const std::string& directory,
-      const Option<std::string>& user,
-      const SlaveID& slaveId,
-      const process::PID<Slave>& slavePid,
-      bool checkpoint);
+      const Resources& resources) override;
 
-  virtual process::Future<Nothing> update(
-      const ContainerID& containerId,
-      const Resources& resources);
+  process::Future<ResourceStatistics> usage(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<ResourceStatistics> usage(
-      const ContainerID& containerId);
+  process::Future<ContainerStatus> status(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<containerizer::Termination> wait(
-      const ContainerID& containerId);
+  process::Future<Option<mesos::slave::ContainerTermination>> wait(
+      const ContainerID& containerId) override;
 
-  virtual void destroy(const ContainerID& containerId);
+  process::Future<Option<mesos::slave::ContainerTermination>> destroy(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<hashset<ContainerID>> containers();
+  process::Future<hashset<ContainerID>> containers() override;
+
+  process::Future<Nothing> pruneImages(
+      const std::vector<Image>& excludedImages) override;
 
 private:
   process::Owned<DockerContainerizerProcess> process;
@@ -126,24 +130,22 @@ public:
       const Flags& _flags,
       Fetcher* _fetcher,
       const process::Owned<mesos::slave::ContainerLogger>& _logger,
-      process::Shared<Docker> _docker)
+      process::Shared<Docker> _docker,
+      const Option<NvidiaComponents>& _nvidia)
     : flags(_flags),
       fetcher(_fetcher),
       logger(_logger),
-      docker(_docker) {}
+      docker(_docker),
+      nvidia(_nvidia) {}
 
   virtual process::Future<Nothing> recover(
       const Option<state::SlaveState>& state);
 
-  virtual process::Future<bool> launch(
+  virtual process::Future<Containerizer::LaunchResult> launch(
       const ContainerID& containerId,
-      const Option<TaskInfo>& taskInfo,
-      const ExecutorInfo& executorInfo,
-      const std::string& directory,
-      const Option<std::string>& user,
-      const SlaveID& slaveId,
-      const process::PID<Slave>& slavePid,
-      bool checkpoint);
+      const mesos::slave::ContainerConfig& containerConfig,
+      const std::map<std::string, std::string>& environment,
+      const Option<std::string>& pidCheckpointPath);
 
   // force = true causes the containerizer to update the resources
   // for the container, even if they match what it has cached.
@@ -155,22 +157,38 @@ public:
   virtual process::Future<ResourceStatistics> usage(
       const ContainerID& containerId);
 
-  virtual process::Future<containerizer::Termination> wait(
+  virtual process::Future<ContainerStatus> status(
       const ContainerID& containerId);
 
-  virtual void destroy(
+  virtual process::Future<Option<mesos::slave::ContainerTermination>> wait(
+      const ContainerID& containerId);
+
+  virtual process::Future<Option<mesos::slave::ContainerTermination>> destroy(
       const ContainerID& containerId,
       bool killed = true); // process is either killed or reaped.
 
-  virtual process::Future<Nothing> fetch(
-      const ContainerID& containerId,
-      const SlaveID& slaveId);
+  virtual process::Future<Nothing> fetch(const ContainerID& containerId);
 
   virtual process::Future<Nothing> pull(const ContainerID& containerId);
 
   virtual process::Future<hashset<ContainerID>> containers();
 
 private:
+  struct Metrics
+  {
+    Metrics() : image_pull("containerizer/docker/image_pull", Hours(1))
+    {
+      process::metrics::add(image_pull);
+    }
+
+    ~Metrics()
+    {
+      process::metrics::remove(image_pull);
+    }
+
+    process::metrics::Timer<Milliseconds> image_pull;
+  };
+
   // Continuations and helpers.
   process::Future<Nothing> _fetch(
       const ContainerID& containerId,
@@ -180,19 +198,16 @@ private:
       const ContainerID& containerId,
       pid_t pid);
 
-  process::Future<bool> _launch(
+  process::Future<Containerizer::LaunchResult> _launch(
       const ContainerID& containerId,
-      const Option<TaskInfo>& taskInfo,
-      const ExecutorInfo& executorInfo,
-      const std::string& directory,
-      const SlaveID& slaveId);
+      const mesos::slave::ContainerConfig& containerConfig);
 
   process::Future<Nothing> _recover(
       const Option<state::SlaveState>& state,
-      const std::list<Docker::Container>& containers);
+      const std::vector<Docker::Container>& containers);
 
   process::Future<Nothing> __recover(
-      const std::list<Docker::Container>& containers);
+      const std::vector<Docker::Container>& containers);
 
   // Starts the executor in a Docker container.
   process::Future<Docker::Container> launchExecutorContainer(
@@ -208,7 +223,7 @@ private:
       const Docker::Container& dockerContainer);
 
   // Reaps on the executor pid.
-  process::Future<bool> reapExecutor(
+  process::Future<Nothing> reapExecutor(
       const ContainerID& containerId,
       pid_t pid);
 
@@ -222,6 +237,11 @@ private:
       const process::Future<Nothing>& future);
 
   void ___destroy(
+      const ContainerID& containerId,
+      bool killed,
+      const process::Future<Option<int>>& status);
+
+  void ____destroy(
       const ContainerID& containerId,
       bool killed,
       const process::Future<Option<int>>& status);
@@ -252,6 +272,25 @@ private:
     const Resources& current,
     const Resources& updated);
 
+#ifdef __linux__
+  // Allocate GPU resources for a specified container.
+  process::Future<Nothing> allocateNvidiaGpus(
+      const ContainerID& containerId,
+      const size_t count);
+
+  process::Future<Nothing> _allocateNvidiaGpus(
+      const ContainerID& containerId,
+      const std::set<Gpu>& allocated);
+
+  // Deallocate GPU resources for a specified container.
+  process::Future<Nothing> deallocateNvidiaGpus(
+      const ContainerID& containerId);
+
+  process::Future<Nothing> _deallocateNvidiaGpus(
+      const ContainerID& containerId,
+      const std::set<Gpu>& deallocated);
+#endif // __linux__
+
   Try<ResourceStatistics> cgroupsStatistics(pid_t pid) const;
 
   // Call back for when the executor exits. This will trigger
@@ -271,53 +310,45 @@ private:
 
   process::Shared<Docker> docker;
 
+  Option<NvidiaComponents> nvidia;
+
+  Metrics metrics;
+
   struct Container
   {
     static Try<Container*> create(
         const ContainerID& id,
-        const Option<TaskInfo>& taskInfo,
-        const ExecutorInfo& executorInfo,
-        const std::string& directory,
-        const Option<std::string>& user,
-        const SlaveID& slaveId,
-        const process::PID<Slave>& slavePid,
-        bool checkpoint,
+        const mesos::slave::ContainerConfig& containerConfig,
+        const std::map<std::string, std::string>& environment,
+        const Option<std::string>& pidCheckpointPath,
         const Flags& flags);
 
-    static std::string name(const SlaveID& slaveId, const std::string& id)
+    static std::string name(const ContainerID& id)
     {
-      return DOCKER_NAME_PREFIX + slaveId.value() + DOCKER_NAME_SEPERATOR +
-        stringify(id);
+      return DOCKER_NAME_PREFIX + stringify(id);
     }
 
     Container(const ContainerID& id)
       : state(FETCHING), id(id) {}
 
-    Container(const ContainerID& id,
-              const Option<TaskInfo>& taskInfo,
-              const ExecutorInfo& executorInfo,
-              const std::string& directory,
-              const Option<std::string>& user,
-              const SlaveID& slaveId,
-              const process::PID<Slave>& slavePid,
-              bool checkpoint,
-              bool symlinked,
-              const Flags& flags,
-              const Option<CommandInfo>& _command,
-              const Option<ContainerInfo>& _container,
-              const Option<std::map<std::string, std::string>>& _environment,
-              bool launchesExecutorContainer)
+    Container(
+        const ContainerID& _id,
+        const mesos::slave::ContainerConfig& _containerConfig,
+        const std::map<std::string, std::string>& _environment,
+        const Option<std::string>& _pidCheckpointPath,
+        bool symlinked,
+        const std::string& containerWorkDir,
+        const Option<CommandInfo>& _command,
+        const Option<ContainerInfo>& _container,
+        bool launchesExecutorContainer)
       : state(FETCHING),
-        id(id),
-        task(taskInfo),
-        executor(executorInfo),
-        directory(directory),
-        user(user),
-        slaveId(slaveId),
-        slavePid(slavePid),
-        checkpoint(checkpoint),
+        id(_id),
+        containerConfig(_containerConfig),
+        pidCheckpointPath(_pidCheckpointPath),
+        environment(_environment),
         symlinked(symlinked),
-        flags(flags),
+        containerWorkDir(containerWorkDir),
+        containerName(name(id)),
         launchesExecutorContainer(launchesExecutorContainer)
     {
       // NOTE: The task's resources are included in the executor's
@@ -330,38 +361,24 @@ private:
       // perfect check because an executor might always have a subset
       // of it's resources that match a task, nevertheless, it's
       // better than nothing).
-      resources = executor.resources();
+      resources = containerConfig.resources();
 
-      if (task.isSome()) {
-        CHECK(resources.contains(task.get().resources()));
+      if (containerConfig.has_task_info()) {
+        CHECK(resources.contains(containerConfig.task_info().resources()));
       }
 
       if (_command.isSome()) {
         command = _command.get();
-      } else if (task.isSome()) {
-        command = task.get().command();
       } else {
-        command = executor.command();
+        command = containerConfig.command_info();
       }
 
       if (_container.isSome()) {
         container = _container.get();
-      } else if (task.isSome()) {
-        container = task.get().container();
       } else {
-        container = executor.container();
-      }
-
-      if (_environment.isSome()) {
-        environment = _environment.get();
-      } else {
-        environment = executorEnvironment(
-            executor,
-            directory,
-            slaveId,
-            slavePid,
-            checkpoint,
-            flags);
+        // NOTE: The existence of this field is checked in
+        // DockerContainerizerProcess::launch.
+        container = containerConfig.container_info();
       }
     }
 
@@ -370,19 +387,14 @@ private:
       if (symlinked) {
         // The sandbox directory is a symlink, remove it at container
         // destroy.
-        os::rm(directory);
+        os::rm(containerWorkDir);
       }
-    }
-
-    std::string name()
-    {
-      return name(slaveId, stringify(id));
     }
 
     Option<std::string> executorName()
     {
       if (launchesExecutorContainer) {
-        return name() + DOCKER_NAME_SEPERATOR + "executor";
+        return containerName + DOCKER_NAME_SEPERATOR + "executor";
       } else {
         return None();
       }
@@ -390,20 +402,22 @@ private:
 
     std::string image() const
     {
-      if (task.isSome()) {
-        return task.get().container().docker().image();
+      if (containerConfig.has_task_info()) {
+        return containerConfig.task_info().container().docker().image();
       }
 
-      return executor.container().docker().image();
+      return containerConfig.executor_info().container().docker().image();
     }
 
     bool forcePullImage() const
     {
-      if (task.isSome()) {
-        return task.get().container().docker().force_pull_image();
+      if (containerConfig.has_task_info()) {
+        return containerConfig.task_info()
+          .container().docker().force_pull_image();
       }
 
-      return executor.container().docker().force_pull_image();
+      return containerConfig.executor_info()
+        .container().docker().force_pull_image();
     }
 
     // The DockerContainerizer needs to be able to properly clean up
@@ -438,30 +452,41 @@ private:
       DESTROYING = 5
     } state;
 
+    // Copies of the parameters sent to `Container::create`.
     const ContainerID id;
-    const Option<TaskInfo> task;
-    const ExecutorInfo executor;
+    const mesos::slave::ContainerConfig containerConfig;
+    const Option<std::string> pidCheckpointPath;
+
+    // A copy of the parameter sent to `Container::create`.
+    // NOTE: This may be modified further by hooks.
+    std::map<std::string, std::string> environment;
+
+    // The sandbox directory for the container. This holds the
+    // symlinked path if symlinked boolean is true.
+    // TODO(josephw): The symlink path does not persist across failovers,
+    // so we will not delete the symlink if the agent restarts. This results
+    // in gradually leaking hanging symlinks.
+    bool symlinked;
+    std::string containerWorkDir;
+
+    // Copies of the fields in `containerConfig`, except when the
+    // container is a command task and the agent is launched with
+    // the --docker_mesos_image flag.
     ContainerInfo container;
     CommandInfo command;
-    std::map<std::string, std::string> environment;
 
     // Environment variables that the command executor should pass
     // onto a docker-ized task. This is set by a hook.
     Option<std::map<std::string, std::string>> taskEnvironment;
 
-    // The sandbox directory for the container. This holds the
-    // symlinked path if symlinked boolean is true.
-    std::string directory;
-
-    const Option<std::string> user;
-    SlaveID slaveId;
-    const process::PID<Slave> slavePid;
-    bool checkpoint;
-    bool symlinked;
-    const Flags flags;
+    // The string used to refer to this container via the Docker CLI.
+    // This name is either computed by concatenating the DOCKER_NAME_PREFIX
+    // and the ContainerID; or during recovery, by taking the recovered
+    // container's name.
+    std::string containerName;
 
     // Promise for future returned from wait().
-    process::Promise<containerizer::Termination> termination;
+    process::Promise<mesos::slave::ContainerTermination> termination;
 
     // Exit status of executor or container (depending on whether or
     // not we used the command executor). Represented as a promise so
@@ -470,7 +495,7 @@ private:
 
     // Future that tells us the return value of last launch stage (fetch, pull,
     // run, etc).
-    process::Future<bool> launch;
+    process::Future<Containerizer::LaunchResult> launch;
 
     // We keep track of the resources for each container so we can set
     // the ResourceStatistics limits in usage(). Note that this is
@@ -490,6 +515,11 @@ private:
     // container. This is stored so we can clean up the executor
     // on destroy.
     Option<pid_t> executorPid;
+
+#ifdef __linux__
+    // GPU resources allocated to the container.
+    std::set<Gpu> gpus;
+#endif // __linux__
 
     // Marks if this container launches an executor in a docker
     // container.

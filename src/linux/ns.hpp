@@ -23,30 +23,21 @@
 #endif
 
 #include <sched.h>
-#include <unistd.h>
 
 #include <sys/syscall.h>
 
+#include <queue>
 #include <set>
 #include <string>
-#include <vector>
+#include <thread>
 
-#include <stout/error.hpp>
-#include <stout/hashmap.hpp>
-#include <stout/nothing.hpp>
-#include <stout/os.hpp>
-#include <stout/path.hpp>
-#include <stout/proc.hpp>
-#include <stout/stringify.hpp>
-#include <stout/strings.hpp>
-#include <stout/try.hpp>
-
-#include <stout/os/exists.hpp>
-#include <stout/os/ls.hpp>
-
-#include <process/collect.hpp>
 #include <process/future.hpp>
-#include <process/reap.hpp>
+
+#include <stout/lambda.hpp>
+#include <stout/nothing.hpp>
+#include <stout/option.hpp>
+#include <stout/result.hpp>
+#include <stout/try.hpp>
 
 #ifndef CLONE_NEWNS
 #define CLONE_NEWNS 0x00020000
@@ -76,42 +67,44 @@
 #define CLONE_NEWCGROUP 0x02000000
 #endif
 
+// Define a 'setns' for compilation environments that don't already
+// have one.
+inline int setns(int fd, int nstype)
+{
+#ifdef SYS_setns
+  return ::syscall(SYS_setns, fd, nstype);
+#elif defined(__x86_64__)
+  // A workaround for those hosts that have an old glibc (older than
+  // 2.14) but have a new kernel. The magic number '308' here is the
+  // syscall number for 'setns' on x86_64 architecture.
+  return ::syscall(308, fd, nstype);
+#else
+#error "setns is not available"
+#endif
+}
+
 namespace ns {
 
-// Returns all the supported namespaces by the kernel.
-inline std::set<std::string> namespaces()
-{
-  std::set<std::string> result;
-  Try<std::list<std::string> > entries = os::ls("/proc/self/ns");
-  if (entries.isSome()) {
-    foreach (const std::string& entry, entries.get()) {
-      result.insert(entry);
-    }
-  }
-  return result;
-}
-
-
 // Returns the nstype (e.g., CLONE_NEWNET, CLONE_NEWNS, etc.) for the
-// given namespace which will be used when calling ::setns.
-inline Try<int> nstype(const std::string& ns)
-{
-  hashmap<std::string, int> nstypes;
+// given namespace which can be used when calling ::setns.
+Try<int> nstype(const std::string& ns);
 
-  nstypes["mnt"] = CLONE_NEWNS;
-  nstypes["uts"] = CLONE_NEWUTS;
-  nstypes["ipc"] = CLONE_NEWIPC;
-  nstypes["net"] = CLONE_NEWNET;
-  nstypes["user"] = CLONE_NEWUSER;
-  nstypes["pid"] = CLONE_NEWPID;
-  nstypes["cgroup"] = CLONE_NEWCGROUP;
 
-  if (!nstypes.contains(ns)) {
-    return Error("Unknown namespace '" + ns + "'");
-  }
+// Given a single CLONE_NEW* constant, return the corresponding namespace
+// name. This is the inverse of ns::nstype().
+Try<std::string> nsname(int nsType);
 
-  return nstypes[ns];
-}
+
+// Returns all the configured kernel namespaces.
+std::set<int> nstypes();
+
+
+// Returns true if all the given CLONE_NEW* constants are supported
+// in the running kernel. If CLONE_NEWUSER is specified, the kernel
+// version must be at least 3.12.0 since prior to that version, major
+// kernel subsystems (e.g. XFS) did not implement user namespace
+// support. See also user_namespaces(7).
+Try<bool> supported(int nsTypes);
 
 
 // Re-associate the calling process with the specified namespace. The
@@ -120,214 +113,213 @@ inline Try<int> nstype(const std::string& ns)
 // allow a process with multiple threads to call this function because
 // it will lead to some weird situations where different threads of a
 // process are in different namespaces.
-inline Try<Nothing> setns(const std::string& path, const std::string& ns)
-{
-  // Return error if there're multiple threads in the calling process.
-  Try<std::set<pid_t> > threads = proc::threads(::getpid());
-  if (threads.isError()) {
-    return Error(
-        "Failed to get the threads of the current process: " +
-        threads.error());
-  } else if (threads.get().size() > 1) {
-    return Error("Multiple threads exist in the current process");
-  }
-
-  if (ns::namespaces().count(ns) == 0) {
-    return Error("Namespace '" + ns + "' is not supported");
-  }
-
-  // Currently, we don't support pid namespace as its semantics is
-  // different from other namespaces (instead of re-associating the
-  // calling thread, it re-associates the *children* of the calling
-  // thread with the specified namespace).
-  if (ns == "pid") {
-    return Error("Pid namespace is not supported");
-  }
-
-  Try<int> fd = os::open(path, O_RDONLY | O_CLOEXEC);
-
-  if (fd.isError()) {
-    return Error("Failed to open '" + path + "': " + fd.error());
-  }
-
-#ifndef O_CLOEXEC
-  Try<Nothing> cloexec = os::cloexec(fd.get());
-  if (cloexec.isError()) {
-    os::close(fd.get());
-    return Error("Failed to cloexec: " + cloexec.error());
-  }
-#endif
-
-  Try<int> nstype = ns::nstype(ns);
-  if (nstype.isError()) {
-    return Error(nstype.error());
-  }
-
-#ifdef SYS_setns
-  int ret = ::syscall(SYS_setns, fd.get(), nstype.get());
-#elif __x86_64__
-  // A workaround for those hosts that have an old glibc (older than
-  // 2.14) but have a new kernel. The magic number '308' here is the
-  // syscall number for 'setns' on x86_64 architecture.
-  int ret = ::syscall(308, fd.get(), nstype.get());
-#else
-#error "setns is not available"
-#endif
-
-  if (ret == -1) {
-    // Save the errno as it might be overwritten by 'os::close' below.
-    ErrnoError error;
-    os::close(fd.get());
-    return error;
-  }
-
-  os::close(fd.get());
-  return Nothing();
-}
+Try<Nothing> setns(
+    const std::string& path,
+    const std::string& ns,
+    bool checkMultithreaded = true);
 
 
 // Re-associate the calling process with the specified namespace. The
 // pid specifies the process whose namespace we will associate.
-inline Try<Nothing> setns(pid_t pid, const std::string& ns)
-{
-  if (!os::exists(pid)) {
-    return Error("Pid " + stringify(pid) + " does not exist");
-  }
-
-  std::string path = path::join("/proc", stringify(pid), "ns", ns);
-  if (!os::exists(path)) {
-    return Error("Namespace '" + ns + "' is not supported");
-  }
-
-  return ns::setns(path, ns);
-}
+Try<Nothing> setns(
+    pid_t pid,
+    const std::string& ns,
+    bool checkMultithreaded = true);
 
 
 // Get the inode number of the specified namespace for the specified
 // pid. The inode number identifies the namespace and can be used for
 // comparisons, i.e., two processes with the same inode for a given
 // namespace type are in the same namespace.
-inline Try<ino_t> getns(pid_t pid, const std::string& ns)
-{
-  if (!os::exists(pid)) {
-    return Error("Pid " + stringify(pid) + " does not exist");
-  }
-
-  if (ns::namespaces().count(ns) < 1) {
-    return Error("Namespace '" + ns + "' is not supported");
-  }
-
-  std::string path = path::join("/proc", stringify(pid), "ns", ns);
-  struct stat s;
-  if (::stat(path.c_str(), &s) < 0) {
-    return ErrnoError("Failed to stat " + ns + " namespace handle"
-                      " for pid " + stringify(pid));
-  }
-
-  return s.st_ino;
-}
+Result<ino_t> getns(pid_t pid, const std::string& ns);
 
 
-namespace pid {
-
-namespace internal {
-
-inline Nothing _nothing() { return Nothing(); }
-
-} // namespace internal {
-
-inline process::Future<Nothing> destroy(ino_t inode)
-{
-  // Check we're not trying to kill the root namespace.
-  Try<ino_t> ns = ns::getns(1, "pid");
-  if (ns.isError()) {
-    return process::Failure(ns.error());
-  }
-
-  if (ns.get() == inode) {
-    return process::Failure("Cannot destroy root pid namespace");
-  }
-
-  // Or ourselves.
-  ns = ns::getns(::getpid(), "pid");
-  if (ns.isError()) {
-    return process::Failure(ns.error());
-  }
-
-  if (ns.get() == inode) {
-    return process::Failure("Cannot destroy own pid namespace");
-  }
-
-  // Signal all pids in the namespace, including the init pid if it's
-  // still running. Once the init pid has been signalled the kernel
-  // will prevent any new children forking in the namespace and will
-  // also signal all other pids in the namespace.
-  Try<std::set<pid_t>> pids = os::pids();
-  if (pids.isError()) {
-    return process::Failure("Failed to list of processes");
-  }
-
-  foreach (pid_t pid, pids.get()) {
-    // Ignore any errors, probably because the process no longer
-    // exists, and ignorable otherwise.
-    Try<ino_t> ns = ns::getns(pid, "pid");
-    if (ns.isSome() && ns.get() == inode) {
-      kill(pid, SIGKILL);
-    }
-  }
-
-  // Get a new snapshot and do a second pass of the pids to capture
-  // any pids that are dying so we can reap them.
-  pids = os::pids();
-  if (pids.isError()) {
-    return process::Failure("Failed to list of processes");
-  }
-
-  std::list<process::Future<Option<int>>> futures;
-
-  foreach (pid_t pid, pids.get()) {
-    Try<ino_t> ns = ns::getns(pid, "pid");
-    if (ns.isSome() && ns.get() == inode) {
-      futures.push_back(process::reap(pid));
-    }
-
-    // Ignore any errors, probably because the process no longer
-    // exists, and ignorable otherwise.
-  }
-
-  // Wait for all the signalled processes to terminate. The pid
-  // namespace will then be empty and will be released by the kernel
-  // (unless there are additional references).
-  return process::collect(futures)
-    .then(lambda::bind(&internal::_nothing));
-}
-
-} // namespace pid {
+/**
+ * Performs an `os::clone` after entering a set of namespaces for the
+ * specified `target` process.
+ *
+ * This function provides two steps of functionality:
+ *   (1) Enter a set of namespaces via two `fork` calls.
+ *   (1) Perform a `clone` within that set of namespaces.
+ *
+ * Step (1) of functionality is similar to the `nsenter` command line
+ * utility. Step (2) allows us to perform a clone that itself might
+ * create a nested set of namespaces, which enables us to have nested
+ * containers.
+ *
+ * Double Fork:
+ *
+ * In order to enter a PID namespace we need to do a double fork
+ * because doing a `setns` for a PID namespace only effects future
+ * children.
+ *
+ * Moreover, attempting to `setns` before we do any forks and then
+ * have the parent `setns` back to the original namespaces does not
+ * work because entering a depriviledged user namespace will not let
+ * us reassociate back with the original namespace, even if we keep
+ * the file descriptor of the original namespace open.
+ *
+ * Because we have to double fork we need to send back the actual PID
+ * of the final process that's executing the provided function `f`.
+ * We use domain sockets for this because in the event we've entered a
+ * PID namespace we need the kernel to translate the PID to the PID in
+ * our PID namespace.
+ *
+ * @param target Target process whose namespaces we should enter.
+ * @param nstypes Namespaces we should enter.
+ * @param f Function to invoke after entering the namespaces and cloning.
+ * @param flags Flags to pass to `clone`.
+ *
+ * @return `pid_t` of the child process.
+ */
+Try<pid_t> clone(
+    pid_t target,
+    int nstypes,
+    const lambda::function<int()>& f,
+    int flags);
 
 
 // Returns the namespace flags in the string form of bitwise-ORing the
 // flags, e.g., CLONE_NEWNS | CLONE_NEWNET.
-inline std::string stringify(int flags)
-{
-  hashmap<unsigned int, std::string> names = {
-    {CLONE_NEWNS,   "CLONE_NEWNS"},
-    {CLONE_NEWUTS,  "CLONE_NEWUTS"},
-    {CLONE_NEWIPC,  "CLONE_NEWIPC"},
-    {CLONE_NEWPID,  "CLONE_NEWPID"},
-    {CLONE_NEWNET,  "CLONE_NEWNET"},
-    {CLONE_NEWUSER, "CLONE_NEWUSER"},
-    {CLONE_NEWCGROUP, "CLONE_NEWCGROUP"}
-  };
+std::string stringify(int flags);
 
-  std::vector<std::string> namespaces;
-  foreachpair (unsigned int flag, const std::string& name, names) {
-    if (flags & flag) {
-      namespaces.push_back(name);
+
+// The NamespaceRunner runs any function in a specified namespace.
+// To do that it manages a separate thread which would be re-associated
+// with that namespace.
+class NamespaceRunner
+{
+public:
+  NamespaceRunner()
+  {
+    // Start the looper thread.
+    thread.reset(new std::thread(&NamespaceRunner::loop, this));
+  }
+
+  ~NamespaceRunner()
+  {
+    // Shutdown the queue.
+    queue.shutdown();
+    // Wait for the thread to complete.
+    thread->join();
+    thread.reset();
+  }
+
+  // Run any function in a specified namespace.
+  template <typename T>
+  process::Future<T> run(
+      const std::string& path,
+      const std::string& ns,
+      const lambda::function<Try<T>()>& func)
+  {
+    std::shared_ptr<process::Promise<T>> promise(
+        new process::Promise<T>);
+    process::Future<T> future = promise->future();
+
+    // Put a function to the queue, the function will be called
+    // in the thread. The thread will be re-associated with the
+    // specified namespace.
+    queue.put([=]{
+      Try<Nothing> setns = ::ns::setns(path, ns, false);
+      if (setns.isError()) {
+        promise->fail(setns.error());
+      } else {
+        promise->set(func());
+      }
+    });
+
+    return future;
+  }
+
+private:
+  typedef lambda::function<void()> Func;
+
+  // The thread loop.
+  void loop()
+  {
+    for (;;) {
+      // Get a function from the queue.
+      Option<Func> func = queue.get();
+
+      // Stop the thread if the queue is shutdowned.
+      if (func.isNone()) {
+        break;
+      }
+
+      // Call the function, it re-associates the thread with the
+      // specified namespace and calls the initial user function.
+      func.get()();
     }
   }
 
-  return strings::join(" | ", namespaces);
-}
+  // It's not safe to use process::Queue when not all of its callers are
+  // managed by libprocess. Calling Future::await() in looper thread
+  // might cause the looper thread to be donated to a libprocess Process.
+  // If that Process is very busy (e.g., master or agent Process), it's
+  // possible that the looper thread will never re-gain control.
+  //
+  // ProcessingQueue uses mutex and condition variable to solve this
+  // problem. ProcessingQueue::get() can block the thread. The main
+  // use cases for the class are thread workers and thread pools.
+  template <typename T>
+  class ProcessingQueue
+  {
+  public:
+    ProcessingQueue() : finished(false) {}
+
+    ~ProcessingQueue() = default;
+
+    // Add an element to the queue and notify one client.
+    void put(T&& t)
+    {
+      synchronized (mutex) {
+        queue.push(std::forward<T>(t));
+        cond.notify_one();
+      }
+    }
+
+    // NOTE: This function blocks the thread. It returns the oldest
+    // element from the queue and returns None() if the queue is
+    // shutdowned.
+    Option<T> get()
+    {
+      synchronized (mutex) {
+        // Wait for either a new queue element or queue shutdown.
+        while (queue.empty() && !finished) {
+          synchronized_wait(&cond, &mutex);
+        }
+
+        if (finished) {
+          // The queue is shutdowned.
+          return None();
+        }
+
+        // Return the oldest element from the queue.
+        T t = std::move(queue.front());
+        queue.pop();
+        return Some(std::move(t));
+      }
+    }
+
+    // Shutdown the queue and notify all clients.
+    void shutdown() {
+      synchronized (mutex) {
+        finished = true;
+        std::queue<T>().swap(queue);
+        cond.notify_all();
+      }
+    }
+
+  private:
+    std::mutex mutex;
+    std::condition_variable cond;
+    std::queue<T> queue;
+    bool finished;
+  };
+
+  ProcessingQueue<Func> queue;
+  std::unique_ptr<std::thread> thread;
+};
 
 } // namespace ns {
 

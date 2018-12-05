@@ -14,18 +14,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <stout/error.hpp>
-#include <stout/nothing.hpp>
-#include <stout/try.hpp>
+#include <utility>
 
+#include <stout/error.hpp>
+#include <stout/hashmap.hpp>
+
+#include "slave/containerizer/mesos/isolators/cgroups/constants.hpp"
 #include "slave/containerizer/mesos/isolators/cgroups/subsystem.hpp"
+
+#include "slave/containerizer/mesos/isolators/cgroups/subsystems/blkio.hpp"
+#include "slave/containerizer/mesos/isolators/cgroups/subsystems/cpu.hpp"
+#include "slave/containerizer/mesos/isolators/cgroups/subsystems/cpuacct.hpp"
+#include "slave/containerizer/mesos/isolators/cgroups/subsystems/cpuset.hpp"
+#include "slave/containerizer/mesos/isolators/cgroups/subsystems/devices.hpp"
+#include "slave/containerizer/mesos/isolators/cgroups/subsystems/hugetlb.hpp"
+#include "slave/containerizer/mesos/isolators/cgroups/subsystems/memory.hpp"
+#include "slave/containerizer/mesos/isolators/cgroups/subsystems/net_cls.hpp"
+#include "slave/containerizer/mesos/isolators/cgroups/subsystems/net_prio.hpp"
+#include "slave/containerizer/mesos/isolators/cgroups/subsystems/perf_event.hpp"
+#include "slave/containerizer/mesos/isolators/cgroups/subsystems/pids.hpp"
 
 using mesos::slave::ContainerLimitation;
 
-using process::Failure;
 using process::Future;
 using process::Owned;
-using process::PID;
 
 using std::string;
 
@@ -33,68 +45,233 @@ namespace mesos {
 namespace internal {
 namespace slave {
 
-Try<Owned<Subsystem>> Subsystem::create(
-    const Flags& _flags,
-    const string& _name,
-    const string& _hierarchy)
+Subsystem::Subsystem(Owned<SubsystemProcess> _process)
+  : process(std::move(_process))
 {
-  return Error("Not implemented.");
+  process::spawn(process.get());
 }
 
 
-Subsystem::Subsystem(
+Subsystem::~Subsystem()
+{
+  process::terminate(process.get());
+  process::wait(process.get());
+}
+
+
+string Subsystem::name() const
+{
+  return process->name();
+}
+
+
+Try<Owned<Subsystem>> Subsystem::create(
+    const Flags& flags,
+    const string& name,
+    const string& hierarchy)
+{
+  hashmap<string, Try<Owned<SubsystemProcess>>(*)(const Flags&, const string&)>
+    creators = {
+    {CGROUP_SUBSYSTEM_BLKIO_NAME, &BlkioSubsystemProcess::create},
+    {CGROUP_SUBSYSTEM_CPU_NAME, &CpuSubsystemProcess::create},
+    {CGROUP_SUBSYSTEM_CPUACCT_NAME, &CpuacctSubsystemProcess::create},
+    {CGROUP_SUBSYSTEM_CPUSET_NAME, &CpusetSubsystemProcess::create},
+    {CGROUP_SUBSYSTEM_DEVICES_NAME, &DevicesSubsystemProcess::create},
+    {CGROUP_SUBSYSTEM_HUGETLB_NAME, &HugetlbSubsystemProcess::create},
+    {CGROUP_SUBSYSTEM_MEMORY_NAME, &MemorySubsystemProcess::create},
+    {CGROUP_SUBSYSTEM_NET_CLS_NAME, &NetClsSubsystemProcess::create},
+    {CGROUP_SUBSYSTEM_NET_PRIO_NAME, &NetPrioSubsystemProcess::create},
+    {CGROUP_SUBSYSTEM_PERF_EVENT_NAME, &PerfEventSubsystemProcess::create},
+    {CGROUP_SUBSYSTEM_PIDS_NAME, &PidsSubsystemProcess::create},
+  };
+
+  if (!creators.contains(name)) {
+    return Error("Unknown subsystem '" + name + "'");
+  }
+
+  Try<Owned<SubsystemProcess>> subsystemProcess =
+    creators[name](flags, hierarchy);
+
+  if (subsystemProcess.isError()) {
+    return Error(
+        "Failed to create subsystem '" + name + "': " +
+        subsystemProcess.error());
+  }
+
+  return Owned<Subsystem>(new Subsystem(subsystemProcess.get()));
+}
+
+
+Future<Nothing> Subsystem::recover(
+    const ContainerID& containerId,
+    const string& cgroup)
+{
+  return process::dispatch(
+      process.get(),
+      &SubsystemProcess::recover,
+      containerId,
+      cgroup);
+}
+
+
+Future<Nothing> Subsystem::prepare(
+    const ContainerID& containerId,
+    const string& cgroup)
+{
+  return process::dispatch(
+      process.get(),
+      &SubsystemProcess::prepare,
+      containerId,
+      cgroup);
+}
+
+
+Future<Nothing> Subsystem::isolate(
+    const ContainerID& containerId,
+    const string& cgroup,
+    pid_t pid)
+{
+  return process::dispatch(
+      process.get(),
+      &SubsystemProcess::isolate,
+      containerId,
+      cgroup,
+      pid);
+}
+
+
+Future<mesos::slave::ContainerLimitation> Subsystem::watch(
+    const ContainerID& containerId,
+    const string& cgroup)
+{
+  return process::dispatch(
+      process.get(),
+      &SubsystemProcess::watch,
+      containerId,
+      cgroup);
+}
+
+
+Future<Nothing> Subsystem::update(
+    const ContainerID& containerId,
+    const string& cgroup,
+    const Resources& resources)
+{
+  return process::dispatch(
+      process.get(),
+      &SubsystemProcess::update,
+      containerId,
+      cgroup,
+      resources);
+}
+
+
+Future<ResourceStatistics> Subsystem::usage(
+    const ContainerID& containerId,
+    const string& cgroup)
+{
+  return process::dispatch(
+      process.get(),
+      &SubsystemProcess::usage,
+      containerId,
+      cgroup);
+}
+
+
+Future<ContainerStatus> Subsystem::status(
+    const ContainerID& containerId,
+    const string& cgroup)
+{
+  return process::dispatch(
+      process.get(),
+      &SubsystemProcess::status,
+      containerId,
+      cgroup);
+}
+
+
+Future<Nothing> Subsystem::cleanup(
+    const ContainerID& containerId,
+    const string& cgroup)
+{
+  return process::dispatch(
+      process.get(),
+      &SubsystemProcess::cleanup,
+      containerId,
+      cgroup);
+}
+
+
+SubsystemProcess::SubsystemProcess(
     const Flags& _flags,
     const string& _hierarchy)
   : flags(_flags),
     hierarchy(_hierarchy) {}
 
 
-Subsystem::~Subsystem()
-{
-}
-
-
-Future<Nothing> Subsystem::recover(const ContainerID& containerId)
-{
-  return Failure("Not implemented.");
-}
-
-
-Future<Nothing> Subsystem::prepare(const ContainerID& containerId)
-{
-  return Failure("Not implemented.");
-}
-
-
-Future<Nothing> Subsystem::isolate(const ContainerID& containerId, pid_t pid)
-{
-  return Failure("Not implemented.");
-}
-
-
-Future<Nothing> Subsystem::update(
+Future<Nothing> SubsystemProcess::recover(
     const ContainerID& containerId,
+    const string& cgroup)
+{
+  return Nothing();
+}
+
+
+Future<Nothing> SubsystemProcess::prepare(
+    const ContainerID& containerId,
+    const string& cgroup)
+{
+  return Nothing();
+}
+
+
+Future<Nothing> SubsystemProcess::isolate(
+    const ContainerID& containerId,
+    const string& cgroup,
+    pid_t pid)
+{
+  return Nothing();
+}
+
+
+Future<ContainerLimitation> SubsystemProcess::watch(
+    const ContainerID& containerId,
+    const string& cgroup)
+{
+  return Future<ContainerLimitation>();
+}
+
+
+Future<Nothing> SubsystemProcess::update(
+    const ContainerID& containerId,
+    const string& cgroup,
     const Resources& resources)
 {
-  return Failure("Not implemented.");
+  return Nothing();
 }
 
 
-Future<ResourceStatistics> Subsystem::usage(const ContainerID& containerId)
+Future<ResourceStatistics> SubsystemProcess::usage(
+    const ContainerID& containerId,
+    const string& cgroup)
 {
-  return Failure("Not implemented.");
+  return ResourceStatistics();
 }
 
 
-Future<ContainerStatus> Subsystem::status(const ContainerID& containerId)
+Future<ContainerStatus> SubsystemProcess::status(
+    const ContainerID& containerId,
+    const string& cgroup)
 {
-  return Failure("Not implemented.");
+  return ContainerStatus();
 }
 
 
-Future<Nothing> Subsystem::cleanup(const ContainerID& containerId)
+Future<Nothing> SubsystemProcess::cleanup(
+    const ContainerID& containerId,
+    const string& cgroup)
 {
-  return Failure("Not implemented.");
+  return Nothing();
 }
 
 } // namespace slave {

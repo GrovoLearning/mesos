@@ -21,6 +21,7 @@
 #include <mesos/module/hook.hpp>
 
 #include <process/future.hpp>
+#include <process/id.hpp>
 #include <process/process.hpp>
 #include <process/protobuf.hpp>
 
@@ -48,7 +49,9 @@ const char* testErrorLabelKey = "MESOS_Test_Error_Label";
 class HookProcess : public ProtobufProcess<HookProcess>
 {
 public:
-  void initialize()
+  HookProcess() : ProcessBase(process::ID::generate("example-hook")) {}
+
+  void initialize() override
   {
     install<internal::HookExecuted>(
         &HookProcess::handler,
@@ -84,10 +87,10 @@ private:
 class TestHook : public Hook
 {
 public:
-  virtual Result<Labels> masterLaunchTaskLabelDecorator(
+  Result<Labels> masterLaunchTaskLabelDecorator(
       const TaskInfo& taskInfo,
       const FrameworkInfo& frameworkInfo,
-      const SlaveInfo& slaveInfo)
+      const SlaveInfo& slaveInfo) override
   {
     LOG(INFO) << "Executing 'masterLaunchTaskLabelDecorator' hook";
 
@@ -108,7 +111,7 @@ public:
     return labels;
   }
 
-  virtual Try<Nothing> masterSlaveLostHook(const SlaveInfo& slaveInfo)
+  Try<Nothing> masterSlaveLostHook(const SlaveInfo& slaveInfo) override
   {
     LOG(INFO) << "Executing 'masterSlaveLostHook' in agent '"
               << slaveInfo.id() << "'";
@@ -137,11 +140,11 @@ public:
 
   // TODO(nnielsen): Split hook tests into multiple modules to avoid
   // interference.
-  virtual Result<Labels> slaveRunTaskLabelDecorator(
+  Result<Labels> slaveRunTaskLabelDecorator(
       const TaskInfo& taskInfo,
       const ExecutorInfo& executorInfo,
       const FrameworkInfo& frameworkInfo,
-      const SlaveInfo& slaveInfo)
+      const SlaveInfo& slaveInfo) override
   {
     LOG(INFO) << "Executing 'slaveRunTaskLabelDecorator' hook";
 
@@ -165,8 +168,8 @@ public:
 
   // In this hook, we create a new environment variable "FOO" and set
   // it's value to "bar".
-  virtual Result<Environment> slaveExecutorEnvironmentDecorator(
-      const ExecutorInfo& executorInfo)
+  Result<Environment> slaveExecutorEnvironmentDecorator(
+      const ExecutorInfo& executorInfo) override
   {
     LOG(INFO) << "Executing 'slaveExecutorEnvironmentDecorator' hook";
 
@@ -184,18 +187,21 @@ public:
   }
 
 
-  // In this hook, look for the existence of a specific label.
-  // If found, return a `Failure`.
-  // Otherwise, add an environment variable to the task.
-  virtual Future<Option<Environment>> slavePreLaunchDockerEnvironmentDecorator(
-      const Option<TaskInfo>& taskInfo,
-      const ExecutorInfo& executorInfo,
-      const string& name,
-      const string& sandboxDirectory,
-      const string& mappedDirectory,
-      const Option<map<string, string>>& env)
+  // In this hook, we check for the presence of a label, and if set
+  // we return a failure, effectively failing the container creation.
+  // Otherwise we add an environment variable to the executor and task.
+  // Additionally, this hook creates a file named "foo" in the container
+  // work directory (sandbox).
+  Future<Option<DockerTaskExecutorPrepareInfo>>
+    slavePreLaunchDockerTaskExecutorDecorator(
+        const Option<TaskInfo>& taskInfo,
+        const ExecutorInfo& executorInfo,
+        const string& containerName,
+        const string& containerWorkDirectory,
+        const string& mappedSandboxDirectory,
+        const Option<map<string, string>>& env) override
   {
-    LOG(INFO) << "Executing 'slavePreLaunchDockerEnvironmentDecorator' hook";
+    LOG(INFO) << "Executing 'slavePreLaunchDockerTaskExecutorDecorator' hook";
 
     if (taskInfo.isSome()) {
       foreach (const Label& label, taskInfo->labels().labels()) {
@@ -205,34 +211,29 @@ public:
       }
     }
 
-    Environment environment;
-    Environment::Variable* variable = environment.add_variables();
-    variable->set_name("FOO_DOCKER");
-    variable->set_value("docker_bar");
+    DockerTaskExecutorPrepareInfo prepareInfo;
 
-    return environment;
+    Environment* taskEnvironment =
+      prepareInfo.mutable_taskenvironment();
+    Environment::Variable* variable = taskEnvironment->add_variables();
+    variable->set_name("HOOKTEST_TASK");
+    variable->set_value("foo");
+
+    Environment* executorEnvironment =
+      prepareInfo.mutable_executorenvironment();
+    variable = executorEnvironment->add_variables();
+    variable->set_name("HOOKTEST_EXECUTOR");
+    variable->set_value("bar");
+
+    os::touch(path::join(containerWorkDirectory, "foo"));
+
+    return prepareInfo;
   }
 
 
-  virtual Try<Nothing> slavePreLaunchDockerHook(
-      const ContainerInfo& containerInfo,
-      const CommandInfo& commandInfo,
-      const Option<TaskInfo>& taskInfo,
-      const ExecutorInfo& executorInfo,
-      const string& name,
-      const string& sandboxDirectory,
-      const string& mappedDirectory,
-      const Option<Resources>& resources,
-      const Option<map<string, string>>& env)
-  {
-    LOG(INFO) << "Executing 'slavePreLaunchDockerHook'";
-    return os::touch(path::join(sandboxDirectory, "foo"));
-  }
-
-
-  virtual Try<Nothing> slavePostFetchHook(
+  Try<Nothing> slavePostFetchHook(
       const ContainerID& containerId,
-      const string& directory)
+      const string& directory) override
   {
     LOG(INFO) << "Executing 'slavePostFetchHook'";
 
@@ -248,9 +249,9 @@ public:
 
   // This hook locates the file created by environment decorator hook
   // and deletes it.
-  virtual Try<Nothing> slaveRemoveExecutorHook(
+  Try<Nothing> slaveRemoveExecutorHook(
       const FrameworkInfo& frameworkInfo,
-      const ExecutorInfo& executorInfo)
+      const ExecutorInfo& executorInfo) override
   {
     LOG(INFO) << "Executing 'slaveRemoveExecutorHook'";
 
@@ -276,9 +277,9 @@ public:
   }
 
 
-  virtual Result<TaskStatus> slaveTaskStatusDecorator(
+  Result<TaskStatus> slaveTaskStatusDecorator(
       const FrameworkID& frameworkId,
-      const TaskStatus& status)
+      const TaskStatus& status) override
   {
     LOG(INFO) << "Executing 'slaveTaskStatusDecorator' hook";
 
@@ -317,8 +318,8 @@ public:
   }
 
 
-  virtual Result<Resources> slaveResourcesDecorator(
-      const SlaveInfo& slaveInfo)
+  Result<Resources> slaveResourcesDecorator(
+      const SlaveInfo& slaveInfo) override
   {
     LOG(INFO) << "Executing 'slaveResourcesDecorator' hook";
 
@@ -339,8 +340,8 @@ public:
   }
 
 
-  virtual Result<Attributes> slaveAttributesDecorator(
-      const SlaveInfo& slaveInfo)
+  Result<Attributes> slaveAttributesDecorator(
+      const SlaveInfo& slaveInfo) override
   {
     LOG(INFO) << "Executing 'slaveAttributesDecorator' hook";
 

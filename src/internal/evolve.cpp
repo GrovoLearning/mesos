@@ -34,6 +34,8 @@
 
 using std::string;
 
+using google::protobuf::RepeatedPtrField;
+
 using process::UPID;
 
 namespace mesos {
@@ -56,7 +58,7 @@ static T evolve(const google::protobuf::Message& message)
     << " while evolving to " << t.GetTypeName();
 
   // NOTE: We need to use 'ParsePartialFromString' instead of
-  // 'ParsePartialFromString' because some required fields might not
+  // 'ParseFromString' because some required fields might not
   // be set and we don't want an exception to get thrown.
   CHECK(t.ParsePartialFromString(data))
     << "Failed to parse " << t.GetTypeName()
@@ -84,21 +86,9 @@ v1::AgentInfo evolve(const SlaveInfo& slaveInfo)
 }
 
 
-v1::FrameworkID evolve(const FrameworkID& frameworkId)
+v1::DomainInfo evolve(const DomainInfo& domainInfo)
 {
-  return evolve<v1::FrameworkID>(frameworkId);
-}
-
-
-v1::FrameworkInfo evolve(const FrameworkInfo& frameworkInfo)
-{
-  return evolve<v1::FrameworkInfo>(frameworkInfo);
-}
-
-
-v1::KillPolicy evolve(const KillPolicy& killPolicy)
-{
-  return evolve<v1::KillPolicy>(killPolicy);
+  return evolve<v1::DomainInfo>(domainInfo);
 }
 
 
@@ -114,9 +104,21 @@ v1::ExecutorInfo evolve(const ExecutorInfo& executorInfo)
 }
 
 
-v1::Offer evolve(const Offer& offer)
+v1::FileInfo evolve(const FileInfo& fileInfo)
 {
-  return evolve<v1::Offer>(offer);
+  return evolve<v1::FileInfo>(fileInfo);
+}
+
+
+v1::FrameworkID evolve(const FrameworkID& frameworkId)
+{
+  return evolve<v1::FrameworkID>(frameworkId);
+}
+
+
+v1::FrameworkInfo evolve(const FrameworkInfo& frameworkInfo)
+{
+  return evolve<v1::FrameworkInfo>(frameworkInfo);
 }
 
 
@@ -126,9 +128,68 @@ v1::InverseOffer evolve(const InverseOffer& inverseOffer)
 }
 
 
+v1::KillPolicy evolve(const KillPolicy& killPolicy)
+{
+  return evolve<v1::KillPolicy>(killPolicy);
+}
+
+
+v1::MachineID evolve(const MachineID& machineId)
+{
+  return evolve<v1::MachineID>(machineId);
+}
+
+
+v1::MasterInfo evolve(const MasterInfo& masterInfo)
+{
+  return evolve<v1::MasterInfo>(masterInfo);
+}
+
+
+v1::Offer evolve(const Offer& offer)
+{
+  return evolve<v1::Offer>(offer);
+}
+
+
 v1::OfferID evolve(const OfferID& offerId)
 {
   return evolve<v1::OfferID>(offerId);
+}
+
+
+v1::OperationStatus evolve(const OperationStatus& status)
+{
+  return evolve<v1::OperationStatus>(status);
+}
+
+
+v1::Resource evolve(const Resource& resource)
+{
+  return evolve<v1::Resource>(resource);
+}
+
+
+v1::ResourceProviderID evolve(
+    const ResourceProviderID& resourceProviderId)
+{
+  // NOTE: We do not use the common 'devolve' call for performance.
+  v1::ResourceProviderID id;
+  id.set_value(resourceProviderId.value());
+  return id;
+}
+
+
+v1::Resources evolve(const Resources& resources)
+{
+  return evolve<v1::Resource>(
+      static_cast<const RepeatedPtrField<Resource>&>(resources));
+}
+
+
+v1::Task evolve(const Task& task)
+{
+  return evolve<v1::Task>(task);
 }
 
 
@@ -150,33 +211,39 @@ v1::TaskStatus evolve(const TaskStatus& status)
 }
 
 
-v1::Task evolve(const Task& task)
+v1::UUID evolve(const UUID& uuid)
 {
-  return evolve<v1::Task>(task);
+  return evolve<v1::UUID>(uuid);
 }
 
 
-v1::MasterInfo evolve(const MasterInfo& masterInfo)
+v1::agent::Call evolve(const agent::Call& call)
 {
-  return evolve<v1::MasterInfo>(masterInfo);
+  return evolve<v1::agent::Call>(call);
 }
 
 
-v1::FileInfo evolve(const FileInfo& fileInfo)
+v1::agent::ProcessIO evolve(const agent::ProcessIO& processIO)
 {
-  return evolve<v1::FileInfo>(fileInfo);
+  return evolve<v1::agent::ProcessIO>(processIO);
 }
 
 
-v1::Resource evolve(const Resource& resource)
-{
-  return evolve<v1::Resource>(resource);
-}
-
-
-v1::agent::Response evolve(const mesos::agent::Response& response)
+v1::agent::Response evolve(const agent::Response& response)
 {
   return evolve<v1::agent::Response>(response);
+}
+
+
+v1::maintenance::ClusterStatus evolve(const maintenance::ClusterStatus& status)
+{
+  return evolve<v1::maintenance::ClusterStatus>(status);
+}
+
+
+v1::maintenance::Schedule evolve(const maintenance::Schedule& schedule)
+{
+  return evolve<v1::maintenance::Schedule>(schedule);
 }
 
 
@@ -186,9 +253,34 @@ v1::master::Response evolve(const mesos::master::Response& response)
 }
 
 
+v1::resource_provider::Call evolve(const resource_provider::Call& call)
+{
+  return evolve<v1::resource_provider::Call>(call);
+}
+
+
+v1::resource_provider::Event evolve(const resource_provider::Event& event)
+{
+  return evolve<v1::resource_provider::Event>(event);
+}
+
+
+// TODO(xujyan): Do we need this conversion when Mesos never sends out
+// `scheduler::Call` thus never needs to evovle internal call to a v1 call?
+// Perhaps we should remove the method so there's no need to maintain it.
 v1::scheduler::Call evolve(const scheduler::Call& call)
 {
-  return evolve<v1::scheduler::Call>(call);
+  v1::scheduler::Call _call = evolve<v1::scheduler::Call>(call);
+
+  // Certain conversions require special handling.
+  if (_call.type() == v1::scheduler::Call::SUBSCRIBE) {
+    // v1 Subscribe.suppressed_roles cannot be automatically converted
+    // because its tag is used by another field in the internal Subscribe.
+    *(_call.mutable_subscribe()->mutable_suppressed_roles()) =
+      call.subscribe().suppressed_roles();
+  }
+
+  return _call;
 }
 
 
@@ -198,18 +290,60 @@ v1::scheduler::Event evolve(const scheduler::Event& event)
 }
 
 
+v1::scheduler::Event evolve(const ExitedExecutorMessage& message)
+{
+  v1::scheduler::Event event;
+  event.set_type(v1::scheduler::Event::FAILURE);
+
+  v1::scheduler::Event::Failure* failure = event.mutable_failure();
+  *failure->mutable_agent_id() = evolve(message.slave_id());
+  *failure->mutable_executor_id() = evolve(message.executor_id());
+  failure->set_status(message.status());
+
+  return event;
+}
+
+
+v1::scheduler::Event evolve(const ExecutorToFrameworkMessage& message)
+{
+  v1::scheduler::Event event;
+  event.set_type(v1::scheduler::Event::MESSAGE);
+
+  v1::scheduler::Event::Message* message_ = event.mutable_message();
+  *message_->mutable_agent_id() = evolve(message.slave_id());
+  *message_->mutable_executor_id() = evolve(message.executor_id());
+  message_->set_data(message.data());
+
+  return event;
+}
+
+
+v1::scheduler::Event evolve(const FrameworkErrorMessage& message)
+{
+  v1::scheduler::Event event;
+  event.set_type(v1::scheduler::Event::ERROR);
+
+  v1::scheduler::Event::Error* error = event.mutable_error();
+  error->set_message(message.message());
+
+  return event;
+}
+
+
 v1::scheduler::Event evolve(const FrameworkRegisteredMessage& message)
 {
   v1::scheduler::Event event;
   event.set_type(v1::scheduler::Event::SUBSCRIBED);
 
   v1::scheduler::Event::Subscribed* subscribed = event.mutable_subscribed();
-  subscribed->mutable_framework_id()->CopyFrom(evolve(message.framework_id()));
+  *subscribed->mutable_framework_id() = evolve(message.framework_id());
 
   // TODO(anand): The master should pass the heartbeat interval as an argument
   // to `evolve()`.
   subscribed->set_heartbeat_interval_seconds(
       master::DEFAULT_HEARTBEAT_INTERVAL.secs());
+
+  *subscribed->mutable_master_info() = evolve(message.master_info());
 
   return event;
 }
@@ -221,24 +355,14 @@ v1::scheduler::Event evolve(const FrameworkReregisteredMessage& message)
   event.set_type(v1::scheduler::Event::SUBSCRIBED);
 
   v1::scheduler::Event::Subscribed* subscribed = event.mutable_subscribed();
-  subscribed->mutable_framework_id()->CopyFrom(evolve(message.framework_id()));
+  *subscribed->mutable_framework_id() = evolve(message.framework_id());
 
   // TODO(anand): The master should pass the heartbeat interval as an argument
   // to `evolve()`.
   subscribed->set_heartbeat_interval_seconds(
       master::DEFAULT_HEARTBEAT_INTERVAL.secs());
 
-  return event;
-}
-
-
-v1::scheduler::Event evolve(const ResourceOffersMessage& message)
-{
-  v1::scheduler::Event event;
-  event.set_type(v1::scheduler::Event::OFFERS);
-
-  v1::scheduler::Event::Offers* offers = event.mutable_offers();
-  offers->mutable_offers()->CopyFrom(evolve<v1::Offer>(message.offers()));
+  *subscribed->mutable_master_info() = evolve(message.master_info());
 
   return event;
 }
@@ -252,21 +376,32 @@ v1::scheduler::Event evolve(const InverseOffersMessage& message)
   v1::scheduler::Event::InverseOffers* inverse_offers =
     event.mutable_inverse_offers();
 
-  inverse_offers->mutable_inverse_offers()->CopyFrom(evolve<v1::InverseOffer>(
-      message.inverse_offers()));
+  *inverse_offers->mutable_inverse_offers() =
+    evolve<v1::InverseOffer>(message.inverse_offers());
 
   return event;
 }
 
 
-v1::scheduler::Event evolve(const RescindResourceOfferMessage& message)
+v1::scheduler::Event evolve(const LostSlaveMessage& message)
 {
   v1::scheduler::Event event;
-  event.set_type(v1::scheduler::Event::RESCIND);
+  event.set_type(v1::scheduler::Event::FAILURE);
 
-  v1::scheduler::Event::Rescind* rescind = event.mutable_rescind();
+  v1::scheduler::Event::Failure* failure = event.mutable_failure();
+  *failure->mutable_agent_id() = evolve(message.slave_id());
 
-  rescind->mutable_offer_id()->CopyFrom(evolve(message.offer_id()));
+  return event;
+}
+
+
+v1::scheduler::Event evolve(const ResourceOffersMessage& message)
+{
+  v1::scheduler::Event event;
+  event.set_type(v1::scheduler::Event::OFFERS);
+
+  v1::scheduler::Event::Offers* offers = event.mutable_offers();
+  *offers->mutable_offers() = evolve<v1::Offer>(message.offers());
 
   return event;
 }
@@ -280,8 +415,21 @@ v1::scheduler::Event evolve(const RescindInverseOfferMessage& message)
   v1::scheduler::Event::RescindInverseOffer* rescindInverseOffer =
     event.mutable_rescind_inverse_offer();
 
-  rescindInverseOffer->mutable_inverse_offer_id()->CopyFrom(evolve(
-      message.inverse_offer_id()));
+  *rescindInverseOffer->mutable_inverse_offer_id() =
+      evolve(message.inverse_offer_id());
+
+  return event;
+}
+
+
+v1::scheduler::Event evolve(const RescindResourceOfferMessage& message)
+{
+  v1::scheduler::Event event;
+  event.set_type(v1::scheduler::Event::RESCIND);
+
+  v1::scheduler::Event::Rescind* rescind = event.mutable_rescind();
+
+  *rescind->mutable_offer_id() = evolve(message.offer_id());
 
   return event;
 }
@@ -294,16 +442,16 @@ v1::scheduler::Event evolve(const StatusUpdateMessage& message)
 
   v1::scheduler::Event::Update* update = event.mutable_update();
 
-  update->mutable_status()->CopyFrom(evolve(message.update().status()));
+  *update->mutable_status() = evolve(message.update().status());
 
   if (message.update().has_slave_id()) {
-    update->mutable_status()->mutable_agent_id()->CopyFrom(
-        evolve(message.update().slave_id()));
+    *update->mutable_status()->mutable_agent_id() =
+      evolve(message.update().slave_id());
   }
 
   if (message.update().has_executor_id()) {
-    update->mutable_status()->mutable_executor_id()->CopyFrom(
-        evolve(message.update().executor_id()));
+    *update->mutable_status()->mutable_executor_id() =
+      evolve(message.update().executor_id());
   }
 
   update->mutable_status()->set_timestamp(message.update().timestamp());
@@ -328,105 +476,45 @@ v1::scheduler::Event evolve(const StatusUpdateMessage& message)
 }
 
 
-v1::scheduler::Event evolve(const LostSlaveMessage& message)
+v1::scheduler::Event evolve(const UpdateOperationStatusMessage& message)
 {
   v1::scheduler::Event event;
-  event.set_type(v1::scheduler::Event::FAILURE);
-
-  v1::scheduler::Event::Failure* failure = event.mutable_failure();
-  failure->mutable_agent_id()->CopyFrom(evolve(message.slave_id()));
+  event.set_type(v1::scheduler::Event::UPDATE_OPERATION_STATUS);
+  *event.mutable_update_operation_status()->mutable_status() =
+    evolve(message.status());
 
   return event;
 }
 
 
-v1::scheduler::Event evolve(const ExitedExecutorMessage& message)
+v1::executor::Call evolve(const executor::Call& call)
 {
-  v1::scheduler::Event event;
-  event.set_type(v1::scheduler::Event::FAILURE);
-
-  v1::scheduler::Event::Failure* failure = event.mutable_failure();
-  failure->mutable_agent_id()->CopyFrom(evolve(message.slave_id()));
-  failure->mutable_executor_id()->CopyFrom(evolve(message.executor_id()));
-  failure->set_status(message.status());
-
-  return event;
+  return evolve<v1::executor::Call>(call);
 }
 
 
-v1::scheduler::Event evolve(const ExecutorToFrameworkMessage& message)
-{
-  v1::scheduler::Event event;
-  event.set_type(v1::scheduler::Event::MESSAGE);
-
-  v1::scheduler::Event::Message* message_ = event.mutable_message();
-  message_->mutable_agent_id()->CopyFrom(evolve(message.slave_id()));
-  message_->mutable_executor_id()->CopyFrom(evolve(message.executor_id()));
-  message_->set_data(message.data());
-
-  return event;
-}
-
-
-v1::scheduler::Event evolve(const FrameworkErrorMessage& message)
-{
-  v1::scheduler::Event event;
-  event.set_type(v1::scheduler::Event::ERROR);
-
-  v1::scheduler::Event::Error* error = event.mutable_error();
-  error->set_message(message.message());
-
-  return event;
-}
-
-
-v1::executor::Event evolve(const mesos::executor::Event& event)
+v1::executor::Event evolve(const executor::Event& event)
 {
   return evolve<v1::executor::Event>(event);
 }
 
 
-v1::executor::Event evolve(const KillTaskMessage& message)
+v1::scheduler::Response evolve(const scheduler::Response& response)
 {
-  v1::executor::Event event;
-  event.set_type(v1::executor::Event::KILL);
-
-  v1::executor::Event::Kill* kill = event.mutable_kill();
-
-  kill->mutable_task_id()->CopyFrom(evolve(message.task_id()));
-
-  if (message.has_kill_policy()) {
-    kill->mutable_kill_policy()->CopyFrom(evolve(message.kill_policy()));
-  }
-
-  return event;
+  return evolve<v1::scheduler::Response>(response);
 }
 
 
-v1::executor::Event evolve(const RunTaskMessage& message)
+v1::executor::Event evolve(const ExecutorRegisteredMessage& message)
 {
   v1::executor::Event event;
-  event.set_type(v1::executor::Event::LAUNCH);
+  event.set_type(v1::executor::Event::SUBSCRIBED);
 
-  v1::executor::Event::Launch* launch = event.mutable_launch();
+  v1::executor::Event::Subscribed* subscribed = event.mutable_subscribed();
 
-  launch->mutable_task()->CopyFrom(evolve(message.task()));
-
-  return event;
-}
-
-
-v1::executor::Event evolve(
-    const StatusUpdateAcknowledgementMessage& message)
-{
-  v1::executor::Event event;
-  event.set_type(v1::executor::Event::ACKNOWLEDGED);
-
-  v1::executor::Event::Acknowledged* acknowledged =
-    event.mutable_acknowledged();
-
-  acknowledged->mutable_task_id()->CopyFrom(evolve(message.task_id()));
-  acknowledged->set_uuid(message.uuid());
+  *subscribed->mutable_executor_info() = evolve(message.executor_info());
+  *subscribed->mutable_framework_info() = evolve(message.framework_info());
+  *subscribed->mutable_agent_info() = evolve(message.slave_info());
 
   return event;
 }
@@ -445,21 +533,31 @@ v1::executor::Event evolve(const FrameworkToExecutorMessage& message)
 }
 
 
-v1::executor::Event evolve(const ExecutorRegisteredMessage& message)
+v1::executor::Event evolve(const KillTaskMessage& message)
 {
   v1::executor::Event event;
-  event.set_type(v1::executor::Event::SUBSCRIBED);
+  event.set_type(v1::executor::Event::KILL);
 
-  v1::executor::Event::Subscribed* subscribed = event.mutable_subscribed();
+  v1::executor::Event::Kill* kill = event.mutable_kill();
 
-  subscribed->mutable_executor_info()->
-    CopyFrom(evolve(message.executor_info()));
+  *kill->mutable_task_id() = evolve(message.task_id());
 
-  subscribed->mutable_framework_info()->
-    CopyFrom(evolve(message.framework_info()));
+  if (message.has_kill_policy()) {
+    *kill->mutable_kill_policy() = evolve(message.kill_policy());
+  }
 
-  subscribed->mutable_agent_info()->
-    CopyFrom(evolve(message.slave_info()));
+  return event;
+}
+
+
+v1::executor::Event evolve(const RunTaskMessage& message)
+{
+  v1::executor::Event event;
+  event.set_type(v1::executor::Event::LAUNCH);
+
+  v1::executor::Event::Launch* launch = event.mutable_launch();
+
+  *launch->mutable_task() = evolve(message.task());
 
   return event;
 }
@@ -474,31 +572,19 @@ v1::executor::Event evolve(const ShutdownExecutorMessage&)
 }
 
 
-v1::master::Response evolve(const maintenance::ClusterStatus& status)
+v1::executor::Event evolve(
+    const StatusUpdateAcknowledgementMessage& message)
 {
-  v1::master::Response response;
-  response.set_type(v1::master::Response::GET_MAINTENANCE_STATUS);
+  v1::executor::Event event;
+  event.set_type(v1::executor::Event::ACKNOWLEDGED);
 
-  v1::master::Response::GetMaintenanceStatus* maintenanceStatus =
-      response.mutable_get_maintenance_status();
-  maintenanceStatus->mutable_status()->CopyFrom(
-      evolve<v1::maintenance::ClusterStatus>(status));
+  v1::executor::Event::Acknowledged* acknowledged =
+    event.mutable_acknowledged();
 
-  return response;
-}
+  *acknowledged->mutable_task_id() = evolve(message.task_id());
+  acknowledged->set_uuid(message.uuid());
 
-
-v1::master::Response evolve(const maintenance::Schedule& schedule)
-{
-  v1::master::Response response;
-  response.set_type(v1::master::Response::GET_MAINTENANCE_SCHEDULE);
-
-  v1::master::Response::GetMaintenanceSchedule* maintenanceSchedule =
-      response.mutable_get_maintenance_schedule();
-  maintenanceSchedule->mutable_schedule()->CopyFrom(
-      evolve<v1::maintenance::Schedule>(schedule));
-
-  return response;
+  return event;
 }
 
 
@@ -522,7 +608,7 @@ v1::master::Response evolve<v1::master::Response::GET_FLAGS>(
 
   foreachpair (const string& key,
                const JSON::Value& value,
-               flags.get().values) {
+               flags->values) {
     v1::Flag* flag = getFlags->add_flags();
     flag->set_name(key);
 
@@ -551,7 +637,7 @@ v1::agent::Response evolve<v1::agent::Response::GET_FLAGS>(
 
   foreachpair (const string& key,
                const JSON::Value& value,
-               flags.get().values) {
+               flags->values) {
     v1::Flag* flag = getFlags->add_flags();
     flag->set_name(key);
 
@@ -572,11 +658,8 @@ v1::master::Response evolve<v1::master::Response::GET_VERSION>(
   v1::master::Response response;
   response.set_type(v1::master::Response::GET_VERSION);
 
-  Try<v1::VersionInfo> version = protobuf::parse<v1::VersionInfo>(object);
-  CHECK_SOME(version);
-
-  response.mutable_get_version()->mutable_version_info()->CopyFrom(
-      version.get());
+  *response.mutable_get_version()->mutable_version_info() =
+    CHECK_NOTERROR(::protobuf::parse<v1::VersionInfo>(object));
 
   return response;
 }
@@ -590,11 +673,8 @@ v1::agent::Response evolve<v1::agent::Response::GET_VERSION>(
   v1::agent::Response response;
   response.set_type(v1::agent::Response::GET_VERSION);
 
-  Try<v1::VersionInfo> version = protobuf::parse<v1::VersionInfo>(object);
-  CHECK_SOME(version);
-
-  response.mutable_get_version()->mutable_version_info()->CopyFrom(
-      version.get());
+  *response.mutable_get_version()->mutable_version_info() =
+    CHECK_NOTERROR(::protobuf::parse<v1::VersionInfo>(object));
 
   return response;
 }
@@ -615,41 +695,45 @@ v1::agent::Response evolve<v1::agent::Response::GET_CONTAINERS>(
 
     Result<JSON::String> container_id =
       object.find<JSON::String>("container_id");
+
     CHECK_SOME(container_id);
-    container->mutable_container_id()->set_value(container_id.get().value);
+    container->mutable_container_id()->set_value(container_id->value);
 
     Result<JSON::String> framework_id =
       object.find<JSON::String>("framework_id");
-    CHECK_SOME(framework_id);
-    container->mutable_framework_id()->set_value(framework_id.get().value);
 
-    Result<JSON::String> executor_id =
-      object.find<JSON::String>("executor_id");
-    CHECK_SOME(executor_id);
-    container->mutable_executor_id()->set_value(executor_id.get().value);
+    CHECK(!framework_id.isError());
+    if (framework_id.isSome()) {
+      container->mutable_framework_id()->set_value(framework_id->value);
+    }
+
+    Result<JSON::String> executor_id = object.find<JSON::String>("executor_id");
+
+    CHECK(!executor_id.isError());
+    if (executor_id.isSome()) {
+      container->mutable_executor_id()->set_value(executor_id->value);
+    }
 
     Result<JSON::String> executor_name =
       object.find<JSON::String>("executor_name");
-    CHECK_SOME(executor_name);
-    container->set_executor_name(executor_name.get().value);
 
-    Result<JSON::Object> container_status =
-      object.find<JSON::Object>("status");
+    CHECK(!executor_name.isError());
+    if (executor_name.isSome()) {
+      container->set_executor_name(executor_name->value);
+    }
+
+    Result<JSON::Object> container_status = object.find<JSON::Object>("status");
     if (container_status.isSome()) {
-      Try<mesos::v1::ContainerStatus> status =
-        protobuf::parse<mesos::v1::ContainerStatus>(container_status.get());
-      CHECK_SOME(status);
-      container->mutable_container_status()->CopyFrom(status.get());
+      *container->mutable_container_status() = CHECK_NOTERROR(
+          ::protobuf::parse<v1::ContainerStatus>(container_status.get()));
     }
 
     Result<JSON::Object> resource_statistics =
       object.find<JSON::Object>("statistics");
+
     if (resource_statistics.isSome()) {
-      Try<mesos::v1::ResourceStatistics> statistics =
-        protobuf::parse<mesos::v1::ResourceStatistics>(
-            resource_statistics.get());
-      CHECK_SOME(statistics);
-      container->mutable_resource_statistics()->CopyFrom(statistics.get());
+      *container->mutable_resource_statistics() = CHECK_NOTERROR(
+          ::protobuf::parse<v1::ResourceStatistics>(resource_statistics.get()));
     }
   }
 

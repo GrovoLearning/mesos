@@ -41,14 +41,15 @@
 namespace io = process::io;
 
 using process::Clock;
-using process::subprocess;
-using process::Subprocess;
+using process::Future;
 using process::MAX_REAP_INTERVAL;
+using process::Subprocess;
+using process::subprocess;
 
 using std::map;
+using std::shared_ptr;
 using std::string;
 using std::vector;
-using std::shared_ptr;
 
 
 class SubprocessTest: public TemporaryDirectoryTest {};
@@ -69,12 +70,7 @@ void run_subprocess(const lambda::function<Try<Subprocess>()>& createSubprocess)
   Clock::resume();
 
   // Check process exited cleanly.
-  AWAIT_ASSERT_READY(s->status());
-  ASSERT_SOME(s->status().get());
-
-  int status = s->status().get().get();
-  ASSERT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 }
 
 
@@ -82,33 +78,30 @@ void run_subprocess(const lambda::function<Try<Subprocess>()>& createSubprocess)
 // a file descriptor for a file, rather than a socket).
 TEST_F(SubprocessTest, PipeOutputToFileDescriptor)
 {
-  Try<string> testdir = os::mkdtemp();
-  ASSERT_SOME(testdir);
-
   // Create temporary files to pipe `stdin` to, and open it. We will pipe
   // output into this file.
   const string outfile_name = "out.txt";
-  const string outfile = path::join(testdir.get(), outfile_name);
+  const string outfile = path::join(sandbox.get(), outfile_name);
   ASSERT_SOME(os::touch(outfile));
 
-  Try<int> outfile_fd = os::open(outfile, O_RDWR);
+  Try<int_fd> outfile_fd = os::open(outfile, O_RDWR);
   ASSERT_SOME(outfile_fd);
 
   // Create temporary files to pipe `stderr` to, and open it. We will pipe
   // error into this file.
   const string errorfile_name = "error.txt";
-  const string errorfile = path::join(testdir.get(), errorfile_name);
+  const string errorfile = path::join(sandbox.get(), errorfile_name);
   ASSERT_SOME(os::touch(errorfile));
 
-  Try<int> errorfile_fd = os::open(errorfile, O_RDWR);
+  Try<int_fd> errorfile_fd = os::open(errorfile, O_RDWR);
   ASSERT_SOME(errorfile_fd);
 
   // RAII handle for the file descriptor increases chance that we clean up
   // after ourselves.
-  const auto close_fd = [](int* fd) { os::close(*fd); };
+  const auto close_fd = [](int_fd* fd) { os::close(*fd); };
 
-  shared_ptr<int> safe_out_fd(&outfile_fd.get(), close_fd);
-  shared_ptr<int> safe_err_fd(&errorfile_fd.get(), close_fd);
+  shared_ptr<int_fd> safe_out_fd(&outfile_fd.get(), close_fd);
+  shared_ptr<int_fd> safe_err_fd(&errorfile_fd.get(), close_fd);
 
   // Pipe simple string to output file.
   run_subprocess(
@@ -147,15 +140,12 @@ TEST_F(SubprocessTest, PipeOutputToFileDescriptor)
 
 TEST_F(SubprocessTest, PipeOutputToPath)
 {
-  Try<string> testdir = os::mkdtemp();
-  ASSERT_SOME(testdir);
-
   // Name the files to pipe output and error to.
   const string outfile_name = "out.txt";
-  const string outfile = path::join(testdir.get(), outfile_name);
+  const string outfile = path::join(sandbox.get(), outfile_name);
 
   const string errorfile_name = "error.txt";
-  const string errorfile = path::join(testdir.get(), errorfile_name);
+  const string errorfile = path::join(sandbox.get(), errorfile_name);
 
   // Pipe simple string to output file.
   run_subprocess(
@@ -194,12 +184,9 @@ TEST_F(SubprocessTest, PipeOutputToPath)
 
 TEST_F(SubprocessTest, EnvironmentEcho)
 {
-  Try<string> testdir = os::mkdtemp();
-  ASSERT_SOME(testdir);
-
   // Name the file to pipe output to.
   const string outfile_name = "out.txt";
-  const string outfile = path::join(testdir.get(), outfile_name);
+  const string outfile = path::join(sandbox.get(), outfile_name);
 
   // Pipe simple string to output file.
   run_subprocess(
@@ -222,7 +209,6 @@ TEST_F(SubprocessTest, EnvironmentEcho)
             Subprocess::FD(STDIN_FILENO),
             Subprocess::PATH(outfile),
             Subprocess::FD(STDERR_FILENO),
-            process::Setsid::NO_SETSID,
             environment);
       });
 
@@ -233,10 +219,6 @@ TEST_F(SubprocessTest, EnvironmentEcho)
 }
 
 
-// NOTE: These tests can't be run on Windows because the rely on functionality
-// that does not exist on Windows. For example, `os::nonblock` will not work on
-// all file descriptors on Windows.
-#ifndef __WINDOWS__
 TEST_F(SubprocessTest, Status)
 {
   // Exit 0.
@@ -246,18 +228,13 @@ TEST_F(SubprocessTest, Status)
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 
   // Exit 1.
   s = subprocess("exit 1");
@@ -266,62 +243,51 @@ TEST_F(SubprocessTest, Status)
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
+  AWAIT_EXPECT_WEXITSTATUS_EQ(1, s->status());
 
-  status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(1, WEXITSTATUS(status));
-
+  // NOTE: This part of the test does not run on Windows because
+  // Windows does not use `SIGTERM` etc. to kill processes.
+#ifndef __WINDOWS__
   // SIGTERM.
-  s = subprocess("sleep 60");
+  s = subprocess(SLEEP_COMMAND(60));
 
   ASSERT_SOME(s);
 
-  kill(s.get().pid(), SIGTERM);
+  kill(s->pid(), SIGTERM);
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  status = s.get().status().get().get();
-  EXPECT_TRUE(WIFSIGNALED(status));
-  EXPECT_EQ(SIGTERM, WTERMSIG(status));
+  AWAIT_EXPECT_WTERMSIG_EQ(SIGTERM, s->status());
 
   // SIGKILL.
-  s = subprocess("sleep 60");
+  s = subprocess(SLEEP_COMMAND(60));
 
   ASSERT_SOME(s);
 
-  kill(s.get().pid(), SIGKILL);
+  kill(s->pid(), SIGKILL);
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  status = s.get().status().get().get();
-  EXPECT_TRUE(WIFSIGNALED(status));
-  EXPECT_EQ(SIGKILL, WTERMSIG(status));
+  AWAIT_EXPECT_WTERMSIG_EQ(SIGKILL, s->status());
+#endif // __WINDOWS__
 }
 
 
@@ -335,23 +301,22 @@ TEST_F(SubprocessTest, PipeOutput)
       Subprocess::FD(STDERR_FILENO));
 
   ASSERT_SOME(s);
-  ASSERT_SOME(s.get().out());
-  AWAIT_EXPECT_EQ("hello\n", io::read(s.get().out().get()));
+  ASSERT_SOME(s->out());
+#ifdef __WINDOWS__
+  AWAIT_EXPECT_EQ("hello\r\n", io::read(s->out().get()));
+#else
+  AWAIT_EXPECT_EQ("hello\n", io::read(s->out().get()));
+#endif // __WINDOWS__
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 
   // Standard error.
   s = subprocess(
@@ -361,55 +326,117 @@ TEST_F(SubprocessTest, PipeOutput)
       Subprocess::PIPE());
 
   ASSERT_SOME(s);
-  ASSERT_SOME(s.get().err());
-  AWAIT_EXPECT_EQ("hello\n", io::read(s.get().err().get()));
+  ASSERT_SOME(s->err());
+#ifdef __WINDOWS__
+  AWAIT_EXPECT_EQ("hello \r\n", io::read(s->err().get()));
+#else
+  AWAIT_EXPECT_EQ("hello\n", io::read(s->err().get()));
+#endif // __WINDOWS__
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
+}
 
-  status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+
+// This test checks that we can open a subprocess, have it write a
+// substantial amount of data (two memory pages) to a pipe held by the
+// parent process (this test) without hanging, and then check that the
+// process exits and is reaped correctly.
+TEST_F(SubprocessTest, PipeLargeOutput)
+{
+  const string output(2 * os::pagesize(), 'c');
+  const string outfile = path::join(sandbox.get(), "out.txt");
+  ASSERT_SOME(os::write(outfile, output));
+
+  Try<Subprocess> s = subprocess(
+#ifdef __WINDOWS__
+      "type " + outfile,
+#else
+      "cat " + outfile,
+#endif // __WINDOWS__
+      Subprocess::FD(STDIN_FILENO),
+      Subprocess::PIPE(),
+      Subprocess::FD(STDERR_FILENO));
+
+  ASSERT_SOME(s);
+  ASSERT_SOME(s->out());
+
+#ifdef __WINDOWS__
+  ::SetLastError(0);
+#endif // __WINDOWS__
+
+  // Read 1 more than the input size, so we can trigger the EOF error
+  // on Windows.
+  EXPECT_SOME_EQ(output, os::read(s->out().get(), 1 + output.size()));
+
+#ifdef __WINDOWS__
+  // NOTE: On Windows, this is the end-of-file condition when reading
+  // from a pipe being written to by a child process. When it finishes
+  // writing, the last read will successfully return all the data, and
+  // the Windows error will be set to this.
+  EXPECT_EQ(::GetLastError(), ERROR_BROKEN_PIPE);
+#endif // __WINDOWS__
+
+  // Advance time until the internal reaper reaps the subprocess.
+  Clock::pause();
+  while (s->status().isPending()) {
+    Clock::advance(MAX_REAP_INTERVAL());
+    Clock::settle();
+  }
+  Clock::resume();
+
+  // NOTE: Because we are specifically writing more data (two pages)
+  // than can be held by the OS-allocated buffer, (on Windows this is
+  // one page), we cannot reap the process before reading because it
+  // will not exit until it has written all its data. It can only
+  // successfully write all its data if we read it in the parent
+  // process, otherwise the buffer fills up, and the OS makes the
+  // process wait until the buffer is emptied.
+
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 }
 
 
 TEST_F(SubprocessTest, PipeInput)
 {
   Try<Subprocess> s = subprocess(
+#ifdef __WINDOWS__
+      "powershell.exe",
+      {"powershell.exe", "-NoProfile", "-Command", "[Console]::In.Readline()"},
+#else
       "read word ; echo $word",
+#endif // __WINDOWS__
       Subprocess::PIPE(),
       Subprocess::PIPE(),
       Subprocess::FD(STDERR_FILENO));
 
   ASSERT_SOME(s);
-  ASSERT_SOME(s.get().in());
-  ASSERT_SOME(os::write(s.get().in().get(), "hello\n"));
+  ASSERT_SOME(s->in());
+  ASSERT_SOME(os::write(s->in().get(), "hello\n"));
 
-  ASSERT_SOME(s.get().out());
-  AWAIT_EXPECT_EQ("hello\n", io::read(s.get().out().get()));
+  ASSERT_SOME(s->out());
+#ifdef __WINDOWS__
+  AWAIT_EXPECT_EQ("hello\r\n", io::read(s->out().get()));
+#else
+  AWAIT_EXPECT_EQ("hello\n", io::read(s->out().get()));
+#endif // __WINDOWS__
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 }
 
 
@@ -426,40 +453,39 @@ TEST_F(SubprocessTest, PipeRedirect)
   // Create a temporary file for splicing into.
   string path = path::join(os::getcwd(), "stdout");
 
-  Try<int> fd = os::open(
+  Try<int_fd> fd = os::open(
       path,
       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
       S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
   ASSERT_SOME(fd);
-  ASSERT_SOME(os::nonblock(fd.get()));
+  ASSERT_SOME(io::prepare_async(fd.get()));
 
-  ASSERT_SOME(s.get().out());
-  ASSERT_SOME(os::nonblock(s.get().out().get()));
-  AWAIT_READY(io::redirect(s.get().out().get(), fd.get()));
+  ASSERT_SOME(s->out());
+  ASSERT_SOME(io::prepare_async(s->out().get()));
+  AWAIT_READY(io::redirect(s->out().get(), fd.get()));
 
   // Close our copy of the fd.
   EXPECT_SOME(os::close(fd.get()));
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 
   // Now make sure all the data is there!
   Try<string> read = os::read(path);
   ASSERT_SOME(read);
+#ifdef __WINDOWS__
+  EXPECT_EQ("'hello world'\n", read.get());
+#else
   EXPECT_EQ("hello world\n", read.get());
+#endif // __WINDOWS__
 }
 
 
@@ -479,18 +505,13 @@ TEST_F(SubprocessTest, PathOutput)
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 
   Try<string> read = os::read(out);
   ASSERT_SOME(read);
@@ -507,22 +528,21 @@ TEST_F(SubprocessTest, PathOutput)
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 
   read = os::read(err);
   ASSERT_SOME(read);
+#ifdef __WINDOWS__
+  EXPECT_EQ("hello \n", read.get());
+#else
   EXPECT_EQ("hello\n", read.get());
+#endif // __WINDOWS__
 }
 
 
@@ -533,29 +553,33 @@ TEST_F(SubprocessTest, PathInput)
   ASSERT_SOME(os::write(in, "hello\n"));
 
   Try<Subprocess> s = subprocess(
+#ifdef __WINDOWS__
+      "powershell.exe",
+      {"powershell.exe", "-NoProfile", "-Command", "[Console]::In.Readline()"},
+#else
       "read word ; echo $word",
+#endif // __WINDOWS__
       Subprocess::PATH(in),
       Subprocess::PIPE(),
       Subprocess::FD(STDERR_FILENO));
 
   ASSERT_SOME(s);
-  ASSERT_SOME(s.get().out());
-  AWAIT_EXPECT_EQ("hello\n", io::read(s.get().out().get()));
+  ASSERT_SOME(s->out());
+#ifdef __WINDOWS__
+  AWAIT_EXPECT_EQ("hello\r\n", io::read(s->out().get()));
+#else
+  AWAIT_EXPECT_EQ("hello\n", io::read(s->out().get()));
+#endif // __WINDOWS__
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 }
 
 
@@ -565,7 +589,7 @@ TEST_F(SubprocessTest, FdOutput)
   string err = path::join(os::getcwd(), "stderr");
 
   // Standard out.
-  Try<int> outFd = os::open(
+  Try<int_fd> outFd = os::open(
       out,
       O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
       S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
@@ -583,25 +607,20 @@ TEST_F(SubprocessTest, FdOutput)
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 
   Try<string> read = os::read(out);
   ASSERT_SOME(read);
   EXPECT_EQ("hello\n", read.get());
 
   // Standard error.
-  Try<int> errFd = os::open(
+  Try<int_fd> errFd = os::open(
       err,
       O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
       S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
@@ -619,22 +638,21 @@ TEST_F(SubprocessTest, FdOutput)
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 
   read = os::read(err);
   ASSERT_SOME(read);
+#ifdef __WINDOWS__
+  EXPECT_EQ("hello \n", read.get());
+#else
   EXPECT_EQ("hello\n", read.get());
+#endif // __WINDOWS__
 }
 
 
@@ -644,11 +662,16 @@ TEST_F(SubprocessTest, FdInput)
 
   ASSERT_SOME(os::write(in, "hello\n"));
 
-  Try<int> inFd = os::open(in, O_RDONLY | O_CLOEXEC);
+  Try<int_fd> inFd = os::open(in, O_RDONLY | O_CLOEXEC);
   ASSERT_SOME(inFd);
 
   Try<Subprocess> s = subprocess(
+#ifdef __WINDOWS__
+      "powershell.exe",
+      {"powershell.exe", "-NoProfile", "-Command", "[Console]::In.Readline()"},
+#else
       "read word ; echo $word",
+#endif // __WINDOWS__
       Subprocess::FD(inFd.get()),
       Subprocess::PIPE(),
       Subprocess::FD(STDERR_FILENO));
@@ -656,23 +679,22 @@ TEST_F(SubprocessTest, FdInput)
   ASSERT_SOME(os::close(inFd.get()));
 
   ASSERT_SOME(s);
-  ASSERT_SOME(s.get().out());
-  AWAIT_EXPECT_EQ("hello\n", io::read(s.get().out().get()));
+  ASSERT_SOME(s->out());
+#ifdef __WINDOWS__
+  AWAIT_EXPECT_EQ("hello\r\n", io::read(s->out().get()));
+#else
+  AWAIT_EXPECT_EQ("hello\n", io::read(s->out().get()));
+#endif // __WINDOWS__
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 }
 
 
@@ -684,34 +706,30 @@ TEST_F(SubprocessTest, Default)
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 }
-#endif // __WINDOWS__
 
 
-struct Flags : public flags::FlagsBase
+namespace {
+
+struct TestFlags : public virtual flags::FlagsBase
 {
-  Flags()
+  TestFlags()
   {
-    add(&b, "b", "bool");
-    add(&i, "i", "int");
-    add(&s, "s", "string");
-    add(&s2, "s2", "string with single quote");
-    add(&s3, "s3", "string with double quote");
-    add(&d, "d", "Duration");
-    add(&y, "y", "Bytes");
-    add(&j, "j", "JSON::Object");
+    add(&TestFlags::b, "b", "bool");
+    add(&TestFlags::i, "i", "int");
+    add(&TestFlags::s, "s", "string");
+    add(&TestFlags::s2, "s2", "string with single quote");
+    add(&TestFlags::s3, "s3", "string with double quote");
+    add(&TestFlags::d, "d", "Duration");
+    add(&TestFlags::y, "y", "Bytes");
+    add(&TestFlags::j, "j", "JSON::Object");
   }
 
   Option<bool> b;
@@ -724,14 +742,12 @@ struct Flags : public flags::FlagsBase
   Option<JSON::Object> j;
 };
 
+} // namespace {
 
-// NOTE: These tests can't be run on Windows because the rely on functionality
-// that does not exist on Windows. For example, `os::nonblock` will not work on
-// all file descriptors on Windows.
-#ifndef __WINDOWS__
+
 TEST_F(SubprocessTest, Flags)
 {
-  Flags flags;
+  TestFlags flags;
   flags.b = true;
   flags.i = 42;
   flags.s = "hello";
@@ -760,31 +776,55 @@ TEST_F(SubprocessTest, Flags)
 
   string out = path::join(os::getcwd(), "stdout");
 
+#ifdef __WINDOWS__
+  // The Windows version of `echo` is a built-in of the command
+  // prompt, and it simply reproduces the entire command line string.
+  // However, the flags class (and thus this test) is expecting the
+  // semantics of a native binary interpreting the command line
+  // arguments via the Windows API `CommandLineToArgv`. When a regular
+  // Windows application (in contrast to `echo`) gets command line
+  // arguments, the text is processed automatically by
+  // `CommandLineToArgv`, which converts the command line string into
+  // an array. For example, this is the output of `echo`:
+  //
+  //    > cmd.exe /c echo "--s3=\"geek\""
+  //    "--s3=\"geek\""
+  //
+  // With `test-echo.exe`, a small native binary that just prints its
+  // arguments, the output is:
+  //
+  //     > test-echo.exe "--s3=\"geek\""
+  //     --s3="geek"
+  //
+  // This is the behavior expected by the test as the POSIX version of
+  // `echo` is a native binary.
+  string test_echo_path = path::join(BUILD_DIR, "test-echo.exe");
+#endif
+
   Try<Subprocess> s = subprocess(
+#ifdef __WINDOWS__
+      test_echo_path,
+      {test_echo_path},
+#else
       "/bin/echo",
       vector<string>(1, "echo"),
+#endif // __WINDOWS__
       Subprocess::FD(STDIN_FILENO),
       Subprocess::PATH(out),
       Subprocess::FD(STDERR_FILENO),
-      process::NO_SETSID,
-      flags);
+      &flags);
 
   ASSERT_SOME(s);
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 
   // Parse the output and make sure that it matches the flags we
   // specified in the beginning.
@@ -801,10 +841,10 @@ TEST_F(SubprocessTest, Flags)
     argv[i] = ::strdup(split[i - 1].c_str());
   }
 
-  Flags flags2;
+  TestFlags flags2;
   Try<flags::Warnings> load = flags2.load(None(), argc, argv);
   ASSERT_SOME(load);
-  EXPECT_EQ(0, load->warnings.size());
+  EXPECT_TRUE(load->warnings.empty());
 
   EXPECT_EQ(flags.b, flags2.b);
   EXPECT_EQ(flags.i, flags2.i);
@@ -829,31 +869,33 @@ TEST_F(SubprocessTest, Environment)
   environment["MESSAGE"] = "hello";
 
   Try<Subprocess> s = subprocess(
+#ifdef __WINDOWS__
+      "echo %MESSAGE%",
+#else
       "echo $MESSAGE",
+#endif // __WINDOWS__
       Subprocess::FD(STDIN_FILENO),
       Subprocess::PIPE(),
       Subprocess::FD(STDERR_FILENO),
-      process::NO_SETSID,
       environment);
 
   ASSERT_SOME(s);
-  ASSERT_SOME(s.get().out());
-  AWAIT_EXPECT_EQ("hello\n", io::read(s.get().out().get()));
+  ASSERT_SOME(s->out());
+#ifdef __WINDOWS__
+  AWAIT_EXPECT_EQ("hello\r\n", io::read(s->out().get()));
+#else
+  AWAIT_EXPECT_EQ("hello\n", io::read(s->out().get()));
+#endif // __WINDOWS__
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 
   // Multiple key-value pairs.
   environment.clear();
@@ -861,31 +903,33 @@ TEST_F(SubprocessTest, Environment)
   environment["MESSAGE1"] = "world";
 
   s = subprocess(
+#ifdef __WINDOWS__
+      "echo %MESSAGE0% %MESSAGE1%",
+#else
       "echo $MESSAGE0 $MESSAGE1",
+#endif // __WINDOWS__
       Subprocess::FD(STDIN_FILENO),
       Subprocess::PIPE(),
       Subprocess::FD(STDERR_FILENO),
-      process::NO_SETSID,
       environment);
 
   ASSERT_SOME(s);
-  ASSERT_SOME(s.get().out());
-  AWAIT_EXPECT_EQ("hello world\n", io::read(s.get().out().get()));
+  ASSERT_SOME(s->out());
+#ifdef __WINDOWS__
+  AWAIT_EXPECT_EQ("hello world\r\n", io::read(s->out().get()));
+#else
+  AWAIT_EXPECT_EQ("hello world\n", io::read(s->out().get()));
+#endif // __WINDOWS__
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 }
 
 
@@ -896,31 +940,33 @@ TEST_F(SubprocessTest, EnvironmentWithSpaces)
   environment["MESSAGE"] = "hello world";
 
   Try<Subprocess> s = subprocess(
+#ifdef __WINDOWS__
+      "echo %MESSAGE%",
+#else
       "echo $MESSAGE",
+#endif // __WINDOWS__
       Subprocess::FD(STDIN_FILENO),
       Subprocess::PIPE(),
       Subprocess::FD(STDERR_FILENO),
-      process::NO_SETSID,
       environment);
 
   ASSERT_SOME(s);
-  ASSERT_SOME(s.get().out());
-  AWAIT_EXPECT_EQ("hello world\n", io::read(s.get().out().get()));
+  ASSERT_SOME(s->out());
+#ifdef __WINDOWS__
+  AWAIT_EXPECT_EQ("hello world\r\n", io::read(s->out().get()));
+#else
+  AWAIT_EXPECT_EQ("hello world\n", io::read(s->out().get()));
+#endif // __WINDOWS__
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 }
 
 
@@ -931,31 +977,33 @@ TEST_F(SubprocessTest, EnvironmentWithSpacesAndQuotes)
   environment["MESSAGE"] = "\"hello world\"";
 
   Try<Subprocess> s = subprocess(
+#ifdef __WINDOWS__
+      "echo %MESSAGE%",
+#else
       "echo $MESSAGE",
+#endif // __WINDOWS__
       Subprocess::FD(STDIN_FILENO),
       Subprocess::PIPE(),
       Subprocess::FD(STDERR_FILENO),
-      process::NO_SETSID,
       environment);
 
   ASSERT_SOME(s);
-  ASSERT_SOME(s.get().out());
-  AWAIT_EXPECT_EQ("\"hello world\"\n", io::read(s.get().out().get()));
+  ASSERT_SOME(s->out());
+#ifdef __WINDOWS__
+  AWAIT_EXPECT_EQ("\"hello world\"\r\n", io::read(s->out().get()));
+#else
+  AWAIT_EXPECT_EQ("\"hello world\"\n", io::read(s->out().get()));
+#endif // __WINDOWS__
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 }
 
 
@@ -969,45 +1017,113 @@ TEST_F(SubprocessTest, EnvironmentOverride)
   environment["MESSAGE2"] = "goodbye";
 
   Try<Subprocess> s = subprocess(
+#ifdef __WINDOWS__
+      "echo %MESSAGE1% %MESSAGE2%",
+#else
       "echo $MESSAGE1 $MESSAGE2",
+#endif // __WINDOWS__
       Subprocess::FD(STDIN_FILENO),
       Subprocess::PIPE(),
       Subprocess::FD(STDERR_FILENO),
-      process::NO_SETSID,
       environment);
 
   ASSERT_SOME(s);
-  ASSERT_SOME(s.get().out());
-  AWAIT_EXPECT_EQ("goodbye\n", io::read(s.get().out().get()));
+  ASSERT_SOME(s->out());
+  // NOTE: Windows will emit `%VAR%` if the environment variable `VAR`
+  // was not defined, unlike POSIX which will emit nothing.
+#ifdef __WINDOWS__
+  AWAIT_EXPECT_EQ("%MESSAGE1% goodbye\r\n", io::read(s->out().get()));
+#else
+  AWAIT_EXPECT_EQ("goodbye\n", io::read(s->out().get()));
+#endif // __WINDOWS__
 
   // Advance time until the internal reaper reaps the subprocess.
   Clock::pause();
-  while (s.get().status().isPending()) {
+  while (s->status().isPending()) {
     Clock::advance(MAX_REAP_INTERVAL());
     Clock::settle();
   }
   Clock::resume();
 
-  AWAIT_ASSERT_READY(s.get().status());
-  ASSERT_SOME(s.get().status().get());
-
-  int status = s.get().status().get().get();
-  EXPECT_TRUE(WIFEXITED(status));
-  EXPECT_EQ(0, WEXITSTATUS(status));
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 }
-#endif // __WINDOWS__
 
 
-static int setupChdir(const string& directory)
+#ifdef __linux__
+// This test verifies:
+//   1. The subprocess will have the stdio file descriptors.
+//   2. The whitelisted file descriptors will be successfully
+//      inherited by the subprocess.
+//   3. The non-whitelisted file descriptors will be not be
+//      inherited by the subprocess.
+TEST_F(SubprocessTest, WhiteListFds)
 {
-  // Keep everything async-signal safe.
-  if (::chdir(directory.c_str()) == -1) {
-    return errno;
+  Try<int_fd> fd1 = os::open(
+      path::join(os::getcwd(), id::UUID::random().toString()),
+      O_CREAT | O_EXCL | O_RDONLY | O_CLOEXEC);
+
+  Try<int_fd> fd2 = os::open(
+      path::join(os::getcwd(), id::UUID::random().toString()),
+      O_CREAT | O_EXCL | O_RDONLY);
+
+  ASSERT_SOME(fd1);
+  ASSERT_SOME(fd2);
+
+  Try<Subprocess> s = subprocess(
+      "ls /dev/fd",
+      Subprocess::FD(STDIN_FILENO),
+      Subprocess::PIPE(),
+      Subprocess::FD(STDERR_FILENO),
+      None(),
+      None(),
+      {},
+      {},
+      {fd1.get()});
+
+  ASSERT_SOME(s);
+  ASSERT_SOME(s->out());
+
+  Future<string> output = io::read(s->out().get());
+  AWAIT_READY(output);
+
+  hashset<int_fd> fds;
+
+  vector<string> tokens = strings::tokenize(output.get(), "\n");
+  foreach (const string& fdString, tokens) {
+    Try<int_fd> fd = numify<int_fd>(fdString);
+    ASSERT_SOME(fd);
+
+    fds.insert(fd.get());
   }
 
-  return 0;
+  // The subprocess should always have the stdio file descriptors.
+  EXPECT_TRUE(fds.contains(STDIN_FILENO));
+  EXPECT_TRUE(fds.contains(STDOUT_FILENO));
+  EXPECT_TRUE(fds.contains(STDERR_FILENO));
+
+  // `fd1` should be inherited by the subprocess since it is whitelisted even
+  // it has `O_CLOEXEC` set initially.
+  EXPECT_TRUE(fds.contains(fd1.get()));
+
+  // `fd2` should not be inherited by the subprocess since it is not whitelisted
+  // even it has no `O_CLOEXEC` set initially.
+  EXPECT_FALSE(fds.contains(fd2.get()));
+
+  ASSERT_SOME(os::close(fd1.get()));
+  ASSERT_SOME(os::close(fd2.get()));
+
+  // Advance time until the internal reaper reaps the subprocess.
+  Clock::pause();
+  while (s->status().isPending()) {
+    Clock::advance(MAX_REAP_INTERVAL());
+    Clock::settle();
+  }
+  Clock::resume();
+
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, s->status());
 }
+#endif // __linux__
 
 
 // TODO(joerg84): Consider adding tests for setsid, working_directory,
-// and watchdog options.
+// and supervisor childHooks.

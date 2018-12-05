@@ -27,9 +27,11 @@
 #include <boost/functional/hash.hpp>
 
 #include <process/address.hpp>
+#include <process/clock.hpp>
 #include <process/future.hpp>
 #include <process/owned.hpp>
 #include <process/pid.hpp>
+#include <process/socket.hpp>
 
 #include <stout/error.hpp>
 #include <stout/hashmap.hpp>
@@ -49,15 +51,21 @@ namespace process {
 template <typename T>
 class Future;
 
-namespace network {
-class Socket;
-} // namespace network {
-
 namespace http {
+
+enum class Scheme {
+  HTTP,
+#ifdef USE_SSL_SOCKET
+  HTTPS
+#endif
+};
+
 
 namespace authentication {
 
 class Authenticator;
+
+struct Principal;
 
 /**
  * Sets (or overwrites) the authenticator for the realm.
@@ -92,7 +100,7 @@ namespace authorization {
 typedef hashmap<std::string,
                 lambda::function<process::Future<bool>(
                     const Request,
-                    const Option<std::string> principal)>>
+                    const Option<authentication::Principal>)>>
   AuthorizationCallbacks;
 
 
@@ -109,9 +117,8 @@ void unsetCallbacks();
 
 } // namespace authorization {
 
-// Status code reason strings, from the HTTP1.1 RFC:
-// http://www.w3.org/Protocols/rfc2616/rfc2616-sec6.html
-extern hashmap<uint16_t, std::string>* statuses;
+// Checks if the given status code is defined by RFC 2616.
+bool isValidStatus(uint16_t code);
 
 // Represents a Uniform Resource Locator:
 //   scheme://domain|ip:port/path?query#fragment
@@ -152,6 +159,12 @@ struct URL
       fragment(_fragment) {}
 
   static Try<URL> parse(const std::string& urlString);
+
+  /**
+   * Returns whether the URL is absolute.
+   * See https://tools.ietf.org/html/rfc3986#section-4.3 for details.
+   */
+  bool isAbsolute() const;
 
   Option<std::string> scheme;
 
@@ -245,51 +258,6 @@ struct Status
 };
 
 
-typedef hashmap<std::string,
-                std::string,
-                CaseInsensitiveHash,
-                CaseInsensitiveEqual> Headers;
-
-
-struct Request
-{
-  std::string method;
-
-  // TODO(benh): Add major/minor version.
-
-  // For client requests, the URL should be a URI.
-  // For server requests, the URL may be a URI or a relative reference.
-  URL url;
-
-  Headers headers;
-
-  // TODO(bmahler): Add a 'query' field which contains both
-  // the URL query and the parsed form data from the body.
-
-  std::string body;
-
-  // TODO(bmahler): Ensure this is consistent with the 'Connection'
-  // header; perhaps make this a function that checks the header.
-  bool keepAlive;
-
-  // For server requests, this contains the address of the client.
-  // Note that this may correspond to a proxy or load balancer address.
-  network::Address client;
-
-  /**
-   * Returns whether the encoding is considered acceptable in the
-   * response. See RFC 2616 section 14.3 for details.
-   */
-  bool acceptsEncoding(const std::string& encoding) const;
-
-  /**
-   * Returns whether the media type is considered acceptable in the
-   * response. See RFC 2616, section 14.1 for the details.
-   */
-  bool acceptsMediaType(const std::string& mediaType) const;
-};
-
-
 // Represents an asynchronous in-memory unbuffered Pipe, currently
 // used for streaming HTTP responses via chunked encoding. Note that
 // being an in-memory pipe means that this cannot be used across OS
@@ -301,9 +269,8 @@ struct Request
 //
 // Unlike unix pipes, if the read-end of the pipe is closed before
 // the write-end is closed, rather than receiving SIGPIPE or EPIPE
-// during a write, the writer is notified via a future. Like unix
-// pipes, we are not notified if the read-end is closed after the
-// write-end is closed, even if data is remaining in the pipe!
+// during a write, the writer is notified via a future. This future
+// is discarded if the write-end is closed first.
 //
 // No buffering means that each non-empty write to the pipe will
 // correspond to to an equivalent read from the pipe, and the
@@ -341,6 +308,12 @@ public:
     // is closed.
     Future<std::string> read();
 
+    // Performs a series of asynchronous reads, until EOF is reached.
+    // Returns the concatenated result of the reads.
+    // Returns Failure if the writer failed, or the read-end
+    // is closed.
+    Future<std::string> readAll();
+
     // Closing the read-end of the pipe before the write-end closes
     // or fails will notify the writer that the reader is no longer
     // interested. Returns false if the read-end was already closed.
@@ -359,7 +332,8 @@ public:
       CLOSED,
     };
 
-    explicit Reader(const std::shared_ptr<Data>& _data) : data(_data) {}
+    explicit Reader(const std::shared_ptr<Data>& _data)
+      : data(_data) {}
 
     std::shared_ptr<Data> data;
   };
@@ -400,12 +374,14 @@ public:
       FAILED,
     };
 
-    explicit Writer(const std::shared_ptr<Data>& _data) : data(_data) {}
+    explicit Writer(const std::shared_ptr<Data>& _data)
+      : data(_data) {}
 
     std::shared_ptr<Data> data;
   };
 
-  Pipe() : data(new Data()) {}
+  Pipe()
+    : data(new Data()) {}
 
   Reader reader() const;
   Writer writer() const;
@@ -417,8 +393,7 @@ private:
   struct Data
   {
     Data()
-      : readEnd(Reader::OPEN),
-        writeEnd(Writer::OPEN) {}
+      : readEnd(Reader::OPEN), writeEnd(Writer::OPEN) {}
 
     // Rather than use a process to serialize access to the pipe's
     // internal data we use a 'std::atomic_flag'.
@@ -445,11 +420,186 @@ private:
 };
 
 
+namespace header {
+
+// https://tools.ietf.org/html/rfc2617.
+class WWWAuthenticate
+{
+public:
+  static constexpr const char* NAME = "WWW-Authenticate";
+
+  WWWAuthenticate(
+      const std::string& authScheme,
+      const hashmap<std::string, std::string>& authParam)
+    : authScheme_(authScheme),
+      authParam_(authParam) {}
+
+  static Try<WWWAuthenticate> create(const std::string& value);
+
+  std::string authScheme();
+  hashmap<std::string, std::string> authParam();
+
+private:
+  // According to RFC, HTTP/1.1 server may return multiple challenges
+  // with a 401 (Authenticate) response. Each challenage is in the
+  // format of 'auth-scheme 1*SP 1#auth-param' and each challenage may
+  // use a different auth-scheme.
+  // https://tools.ietf.org/html/rfc2617#section-4.6
+  //
+  // TODO(gilbert): We assume there is only one authenticate challenge.
+  // Multiple challenges should be supported as well.
+  std::string authScheme_;
+  hashmap<std::string, std::string> authParam_;
+};
+
+} // namespace header {
+
+
+class Headers : public hashmap<
+    std::string,
+    std::string,
+    CaseInsensitiveHash,
+    CaseInsensitiveEqual>
+{
+public:
+  Headers() {}
+
+  Headers(const std::map<std::string, std::string>& map)
+    : hashmap<
+          std::string,
+          std::string,
+          CaseInsensitiveHash,
+          CaseInsensitiveEqual>(map) {}
+
+  Headers(std::map<std::string, std::string>&& map)
+    : hashmap<
+          std::string,
+          std::string,
+          CaseInsensitiveHash,
+          CaseInsensitiveEqual>(map) {}
+
+  Headers(std::initializer_list<std::pair<std::string, std::string>> list)
+     : hashmap<
+          std::string,
+          std::string,
+          CaseInsensitiveHash,
+          CaseInsensitiveEqual>(list) {}
+
+  template <typename T>
+  Result<T> get() const
+  {
+    Option<std::string> value = get(T::NAME);
+    if (value.isNone()) {
+      return None();
+    }
+    Try<T> header = T::create(value.get());
+    if (header.isError()) {
+      return Error(header.error());
+    }
+    return header.get();
+  }
+
+  Option<std::string> get(const std::string& key) const
+  {
+    return hashmap<
+        std::string,
+        std::string,
+        CaseInsensitiveHash,
+        CaseInsensitiveEqual>::get(key);
+  }
+
+  Headers operator+(const Headers& that) const
+  {
+    Headers result = *this;
+    result.insert(that.begin(), that.end());
+    return result;
+  }
+};
+
+
+struct Request
+{
+  Request()
+    : keepAlive(false), type(BODY), received(Clock::now()) {}
+
+  std::string method;
+
+  // TODO(benh): Add major/minor version.
+
+  // For client requests, the URL should be a URI.
+  // For server requests, the URL may be a URI or a relative reference.
+  URL url;
+
+  Headers headers;
+
+  // TODO(bmahler): Ensure this is consistent with the 'Connection'
+  // header; perhaps make this a function that checks the header.
+  //
+  // TODO(anand): Ideally, this could default to 'true' since
+  // persistent connections are the default since HTTP 1.1.
+  // Perhaps, we need to go from `keepAlive` to `closeConnection`
+  // to reflect the header more accurately, and to have an
+  // intuitive default of false.
+  //
+  // Default: false.
+  bool keepAlive;
+
+  // For server requests, this contains the address of the client.
+  // Note that this may correspond to a proxy or load balancer address.
+  Option<network::Address> client;
+
+  // Clients can choose to provide the entire body at once
+  // via BODY or can choose to stream the body over to the
+  // server via PIPE.
+  //
+  // Default: BODY.
+  enum
+  {
+    BODY,
+    PIPE
+  } type;
+
+  // TODO(bmahler): Add a 'query' field which contains both
+  // the URL query and the parsed form data from the body.
+
+  std::string body;
+  Option<Pipe::Reader> reader;
+
+  Time received;
+
+  /**
+   * Returns whether the encoding is considered acceptable in the
+   * response. See RFC 2616 section 14.3 for details.
+   */
+  bool acceptsEncoding(const std::string& encoding) const;
+
+  /**
+   * Returns whether the media type in the "Accept" header  is considered
+   * acceptable in the response. See RFC 2616, section 14.1 for the details.
+   */
+  bool acceptsMediaType(const std::string& mediaType) const;
+
+  /**
+   * Returns whether the media type in the `name` header is considered
+   * acceptable in the response. The media type should have similar
+   * semantics as the "Accept" header. See RFC 2616, section 14.1 for
+   * the details.
+   */
+  bool acceptsMediaType(
+      const std::string& name,
+      const std::string& mediaType) const;
+
+private:
+  bool _acceptsMediaType(
+      Option<std::string> name,
+      const std::string& mediaType) const;
+};
+
+
 struct Response
 {
   Response()
-    : type(NONE)
-  {}
+    : type(NONE) {}
 
   Response(uint16_t _code)
     : type(NONE), code(_code)
@@ -514,12 +664,14 @@ struct Response
 
 struct OK : Response
 {
-  OK() : Response(Status::OK) {}
+  OK()
+    : Response(Status::OK) {}
 
   explicit OK(const char* body)
     : Response(std::string(body), Status::OK) {}
 
-  explicit OK(const std::string& body) : Response(body, Status::OK) {}
+  explicit OK(const std::string& body)
+    : Response(body, Status::OK) {}
 
   explicit OK(const std::string& body, const std::string& contentType)
     : Response(body, Status::OK, contentType) {}
@@ -532,7 +684,8 @@ struct OK : Response
 
 struct Accepted : Response
 {
-  Accepted() : Response(Status::ACCEPTED) {}
+  Accepted()
+    : Response(Status::ACCEPTED) {}
 
   explicit Accepted(const std::string& body)
     : Response(body, Status::ACCEPTED) {}
@@ -551,7 +704,8 @@ struct TemporaryRedirect : Response
 
 struct BadRequest : Response
 {
-  BadRequest() : Response(Status::BAD_REQUEST) {}
+  BadRequest()
+    : BadRequest("400 Bad Request.") {}
 
   explicit BadRequest(const std::string& body)
     : Response(body, Status::BAD_REQUEST) {}
@@ -561,14 +715,7 @@ struct BadRequest : Response
 struct Unauthorized : Response
 {
   explicit Unauthorized(const std::vector<std::string>& challenges)
-    : Response(Status::UNAUTHORIZED)
-  {
-    // TODO(arojas): Many HTTP client implementations do not support
-    // multiple challenges within a single 'WWW-Authenticate' header.
-    // Once MESOS-3306 is fixed, we can use multiple entries for the
-    // same header.
-    headers["WWW-Authenticate"] = strings::join(", ", challenges);
-  }
+    : Unauthorized(challenges, "401 Unauthorized.") {}
 
   Unauthorized(
       const std::vector<std::string>& challenges,
@@ -586,7 +733,8 @@ struct Unauthorized : Response
 
 struct Forbidden : Response
 {
-  Forbidden() : Response(Status::FORBIDDEN) {}
+  Forbidden()
+    : Forbidden("403 Forbidden.") {}
 
   explicit Forbidden(const std::string& body)
     : Response(body, Status::FORBIDDEN) {}
@@ -595,7 +743,8 @@ struct Forbidden : Response
 
 struct NotFound : Response
 {
-  NotFound() : Response(Status::NOT_FOUND) {}
+  NotFound()
+    : NotFound("404 Not Found.") {}
 
   explicit NotFound(const std::string& body)
     : Response(body, Status::NOT_FOUND) {}
@@ -607,16 +756,9 @@ struct MethodNotAllowed : Response
   // According to RFC 2616, "An Allow header field MUST be present in a
   // 405 (Method Not Allowed) response".
 
-  explicit MethodNotAllowed(
-      const std::initializer_list<std::string>& allowedMethods)
-    : Response(Status::METHOD_NOT_ALLOWED)
-  {
-    headers["Allow"] = strings::join(", ", allowedMethods);
-  }
-
   MethodNotAllowed(
       const std::initializer_list<std::string>& allowedMethods,
-      const std::string& requestMethod)
+      const Option<std::string>& requestMethod = None())
     : Response(
         constructBody(allowedMethods, requestMethod),
         Status::METHOD_NOT_ALLOWED)
@@ -627,17 +769,23 @@ struct MethodNotAllowed : Response
 private:
   static std::string constructBody(
       const std::initializer_list<std::string>& allowedMethods,
-      const std::string& requestMethod)
+      const Option<std::string>& requestMethod)
   {
-    return "Expecting one of { '" + strings::join("', '", allowedMethods) +
-           "' }, but received '" + requestMethod + "'";
+    return
+        "405 Method Not Allowed. Expecting one of { '" +
+        strings::join("', '", allowedMethods) + "' }" +
+        (requestMethod.isSome()
+           ? ", but received '" + requestMethod.get() + "'"
+           : "") +
+        ".";
   }
 };
 
 
 struct NotAcceptable : Response
 {
-  NotAcceptable() : Response(Status::NOT_ACCEPTABLE) {}
+  NotAcceptable()
+    : NotAcceptable("406 Not Acceptable.") {}
 
   explicit NotAcceptable(const std::string& body)
     : Response(body, Status::NOT_ACCEPTABLE) {}
@@ -646,7 +794,8 @@ struct NotAcceptable : Response
 
 struct Conflict : Response
 {
-  Conflict() : Response(Status::CONFLICT) {}
+  Conflict()
+    : Conflict("409 Conflict.") {}
 
   explicit Conflict(const std::string& body)
     : Response(body, Status::CONFLICT) {}
@@ -655,7 +804,8 @@ struct Conflict : Response
 
 struct PreconditionFailed : Response
 {
-  PreconditionFailed() : Response(Status::PRECONDITION_FAILED) {}
+  PreconditionFailed()
+    : PreconditionFailed("412 Precondition Failed.") {}
 
   explicit PreconditionFailed(const std::string& body)
     : Response(body, Status::PRECONDITION_FAILED) {}
@@ -664,7 +814,8 @@ struct PreconditionFailed : Response
 
 struct UnsupportedMediaType : Response
 {
-  UnsupportedMediaType() : Response(Status::UNSUPPORTED_MEDIA_TYPE) {}
+  UnsupportedMediaType()
+    : UnsupportedMediaType("415 Unsupported Media Type.") {}
 
   explicit UnsupportedMediaType(const std::string& body)
     : Response(body, Status::UNSUPPORTED_MEDIA_TYPE) {}
@@ -673,7 +824,8 @@ struct UnsupportedMediaType : Response
 
 struct InternalServerError : Response
 {
-  InternalServerError() : Response(Status::INTERNAL_SERVER_ERROR) {}
+  InternalServerError()
+    : InternalServerError("500 Internal Server Error.") {}
 
   explicit InternalServerError(const std::string& body)
     : Response(body, Status::INTERNAL_SERVER_ERROR) {}
@@ -682,7 +834,8 @@ struct InternalServerError : Response
 
 struct NotImplemented : Response
 {
-  NotImplemented() : Response(Status::NOT_IMPLEMENTED) {}
+  NotImplemented()
+    : NotImplemented("501 Not Implemented.") {}
 
   explicit NotImplemented(const std::string& body)
     : Response(body, Status::NOT_IMPLEMENTED) {}
@@ -691,7 +844,8 @@ struct NotImplemented : Response
 
 struct ServiceUnavailable : Response
 {
-  ServiceUnavailable() : Response(Status::SERVICE_UNAVAILABLE) {}
+  ServiceUnavailable()
+    : ServiceUnavailable("503 Service Unavailable.") {}
 
   explicit ServiceUnavailable(const std::string& body)
     : Response(body, Status::SERVICE_UNAVAILABLE) {}
@@ -738,9 +892,18 @@ Try<hashmap<std::string, std::string>> parse(
 } // namespace path {
 
 
-// Returns a percent-encoded string according to RFC 3986.
-// The input string must not already be percent encoded.
-std::string encode(const std::string& s);
+/**
+ * Returns a percent-encoded string according to RFC 3986.
+ * @see <a href="https://tools.ietf.org/html/rfc3986#section-2.3">RFC3986</a>
+ *
+ * @param s The input string, must not arleady be percent-encoded.
+ * @param additional_chars When specified, all characters in it are also
+ *     percent-encoded.
+ * @return The percent-encoded string of `s`.
+ */
+std::string encode(
+    const std::string& s,
+    const std::string& additional_chars = "");
 
 
 // Decodes a percent-encoded string according to RFC 3986.
@@ -813,8 +976,17 @@ public:
   bool operator==(const Connection& c) const { return data == c.data; }
   bool operator!=(const Connection& c) const { return !(*this == c); }
 
+  const network::Address localAddress;
+  const network::Address peerAddress;
+
 private:
-  Connection(const network::Socket& s);
+  Connection(
+      const network::Socket& s,
+      const network::Address& _localAddress,
+      const network::Address& _peerAddress);
+
+  friend Future<Connection> connect(
+      const network::Address& address, Scheme scheme);
   friend Future<Connection> connect(const URL&);
 
   // Forward declaration.
@@ -824,7 +996,168 @@ private:
 };
 
 
+Future<Connection> connect(const network::Address& address, Scheme scheme);
+
+
 Future<Connection> connect(const URL& url);
+
+
+namespace internal {
+
+Future<Nothing> serve(
+    network::Socket s,
+    std::function<Future<Response>(const Request&)>&& f);
+
+} // namespace internal {
+
+
+// Serves HTTP requests on the specified socket using the specified
+// handler.
+//
+// Returns `Nothing` after serving has completed, either because (1) a
+// failure occurred receiving requests or sending responses or (2) the
+// HTTP connection was not persistent (i.e., a 'Connection: close'
+// header existed either on the request or the response) or (3)
+// serving was discarded.
+//
+// Doing a `discard()` on the Future returned from `serve` will
+// discard any current socket receiving and any current socket
+// sending and shutdown the socket in both directions.
+//
+// NOTE: HTTP pipelining is automatically performed. If you don't want
+// pipelining you must explicitly sequence/serialize the requests to
+// wait for previous responses yourself.
+//
+// NOTE: The `Request` passed to the handler is of type `PIPE` and should
+// always be read using `Request.reader`.
+template <typename F>
+Future<Nothing> serve(const network::Socket& s, F&& f)
+{
+  return internal::serve(
+      s,
+      std::function<Future<Response>(const Request&)>(std::forward<F>(f)));
+}
+
+
+// Forward declaration.
+class ServerProcess;
+
+
+class Server
+{
+public:
+  // Options for creating a server.
+  //
+  // NOTE: until GCC 5.0 default member initializers prevented the
+  // class from being an aggregate which prevented you from being able
+  // to use aggregate initialization, thus we introduce and use
+  // `DEFAULT_CREATE_OPTIONS` for the default parameter of `create`.
+  struct CreateOptions
+  {
+    Scheme scheme;
+    size_t backlog;
+  };
+
+  static CreateOptions DEFAULT_CREATE_OPTIONS()
+  {
+    return {
+      /* .scheme = */ Scheme::HTTP,
+      /* .backlog = */ 16384,
+    };
+  };
+
+  // Options for stopping a server.
+  //
+  // NOTE: see note above as to why we have `DEFAULT_STOP_OPTIONS`.
+  struct StopOptions
+  {
+    // During the grace period:
+    //   * No new sockets will be accepted (but on OS X they'll still queue).
+    //   * Existing sockets will be shut down for reads to prevent new
+    //     requests from arriving.
+    //   * Existing sockets will be shut down after already received
+    //     requests have their responses sent.
+    // After the grace period connections will be forcibly shut down.
+    Duration grace_period;
+  };
+
+  static StopOptions DEFAULT_STOP_OPTIONS()
+  {
+    return {
+      /* .grace_period = */ Seconds(0),
+    };
+  };
+
+  static Try<Server> create(
+      network::Socket socket,
+      std::function<Future<Response>(
+          const network::Socket& socket,
+          const Request&)>&& f,
+      const CreateOptions& options = DEFAULT_CREATE_OPTIONS());
+
+  template <typename F>
+  static Try<Server> create(
+      network::Socket socket,
+      F&& f,
+      const CreateOptions& options = DEFAULT_CREATE_OPTIONS())
+  {
+    return create(
+        std::move(socket),
+        std::function<Future<Response>(
+            const network::Socket&,
+            const Request&)>(std::forward<F>(f)),
+        options);
+  }
+
+  static Try<Server> create(
+      const network::Address& address,
+      std::function<Future<Response>(
+          const network::Socket&,
+          const Request&)>&& f,
+      const CreateOptions& options = DEFAULT_CREATE_OPTIONS());
+
+  template <typename F>
+  static Try<Server> create(
+      const network::Address& address,
+      F&& f,
+      const CreateOptions& options = DEFAULT_CREATE_OPTIONS())
+  {
+    return create(
+        address,
+        std::function<Future<Response>(
+            const network::Socket&,
+            const Request&)>(std::forward<F>(f)),
+        options);
+  }
+
+  // Movable but not copyable, not assignable.
+  Server(Server&& that) = default;
+  Server(const Server&) = delete;
+  Server& operator=(const Server&) = delete;
+
+  ~Server();
+
+  // Runs the server, returns nothing after the server has been
+  // stopped or a failure if one occured.
+  Future<Nothing> run();
+
+  // Returns after the server has been stopped and all existing
+  // connections have been closed.
+  Future<Nothing> stop(const StopOptions& options = DEFAULT_STOP_OPTIONS());
+
+  // Returns the bound address of the server.
+  Try<network::Address> address() const;
+
+private:
+  Server(
+      network::Socket&& socket,
+      std::function<Future<Response>(
+          const network::Socket&,
+          const Request&)>&& f);
+
+  network::Socket socket;
+  Owned<ServerProcess> process;
+};
 
 
 // Create a http Request from the specified parameters.
@@ -881,7 +1214,8 @@ Future<Response> get(
     const UPID& upid,
     const Option<std::string>& path = None(),
     const Option<std::string>& query = None(),
-    const Option<Headers>& headers = None());
+    const Option<Headers>& headers = None(),
+    const Option<std::string>& scheme = None());
 
 
 // Asynchronously sends an HTTP POST request to the specified URL
@@ -902,7 +1236,8 @@ Future<Response> post(
     const Option<std::string>& path = None(),
     const Option<Headers>& headers = None(),
     const Option<std::string>& body = None(),
-    const Option<std::string>& contentType = None());
+    const Option<std::string>& contentType = None(),
+    const Option<std::string>& scheme = None());
 
 
 /**
@@ -926,12 +1261,14 @@ Future<Response> requestDelete(
  * @param path The optional path to be be deleted. If not send the
      request is send to the process directly.
  * @param headers Optional headers for the request.
+ * @param scheme Optional scheme for the request.
  * @return A future with the HTTP response.
  */
 Future<Response> requestDelete(
     const UPID& upid,
     const Option<std::string>& path = None(),
-    const Option<Headers>& headers = None());
+    const Option<Headers>& headers = None(),
+    const Option<std::string>& scheme = None());
 
 
 namespace streaming {
@@ -952,7 +1289,8 @@ Future<Response> get(
     const UPID& upid,
     const Option<std::string>& path = None(),
     const Option<std::string>& query = None(),
-    const Option<Headers>& headers = None());
+    const Option<Headers>& headers = None(),
+    const Option<std::string>& scheme = None());
 
 // Asynchronously sends an HTTP POST request to the specified URL
 // and returns the HTTP response of type 'PIPE' once the response
@@ -973,7 +1311,8 @@ Future<Response> post(
     const Option<std::string>& path = None(),
     const Option<Headers>& headers = None(),
     const Option<std::string>& body = None(),
-    const Option<std::string>& contentType = None());
+    const Option<std::string>& contentType = None(),
+    const Option<std::string>& scheme = None());
 
 } // namespace streaming {
 

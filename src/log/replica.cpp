@@ -33,7 +33,9 @@
 #include <stout/try.hpp>
 #include <stout/utils.hpp>
 
+#ifndef __WINDOWS__
 #include "log/leveldb.hpp"
+#endif // __WINDOWS__
 #include "log/replica.hpp"
 #include "log/storage.hpp"
 
@@ -63,7 +65,7 @@ public:
   // directory for storing the underlying log.
   explicit ReplicaProcess(const string& path);
 
-  virtual ~ReplicaProcess();
+  ~ReplicaProcess() override;
 
   // Returns the action associated with this position. A none result
   // means that no action is known for this position. An error result
@@ -347,6 +349,7 @@ bool ReplicaProcess::updatePromised(uint64_t promised)
   return true;
 }
 
+
 // When handling replicated log protocol requests, we handle errors in
 // three different ways:
 //
@@ -354,7 +357,7 @@ bool ReplicaProcess::updatePromised(uint64_t promised)
 //     number, we return a REJECT response.
 //  2. If we can't vote on the request because we're in the wrong
 //     state (e.g., not finished the recovery or catchup protocols),
-//     we return an IGNORE response.
+//     we return an IGNORED response.
 //  3. If we encounter an error (e.g., I/O failure) handling the
 //     request, we log the error and silently ignore the request.
 //
@@ -377,7 +380,7 @@ void ReplicaProcess::promise(const UPID& from, const PromiseRequest& request)
               << " as it is in " << status() << " status";
 
     PromiseResponse response;
-    response.set_type(PromiseResponse::IGNORE);
+    response.set_type(PromiseResponse::IGNORED);
     response.set_okay(false);
     response.set_proposal(request.proposal());
     reply(response);
@@ -391,7 +394,7 @@ void ReplicaProcess::promise(const UPID& from, const PromiseRequest& request)
 
     // If the position has been truncated, tell the proposer that it's
     // a learned no-op. This can happen when a replica has missed some
-    // truncates and it's proposer tries to fill some truncated
+    // truncates and its proposer tries to fill some truncated
     // positions on election. A learned no-op is safe since the
     // proposer should eventually learn that this position was
     // actually truncated. The action must be _learned_ so that the
@@ -410,6 +413,7 @@ void ReplicaProcess::promise(const UPID& from, const PromiseRequest& request)
       action.set_learned(true);
       action.set_type(Action::NOP);
       action.mutable_nop()->MergeFrom(Action::Nop());
+      action.mutable_nop()->set_tombstone(true);
 
       PromiseResponse response;
       response.set_type(PromiseResponse::ACCEPT);
@@ -526,7 +530,7 @@ void ReplicaProcess::write(const UPID& from, const WriteRequest& request)
               << " as it is in " << status() << " status";
 
     WriteResponse response;
-    response.set_type(WriteResponse::IGNORE);
+    response.set_type(WriteResponse::IGNORED);
     response.set_okay(false);
     response.set_proposal(request.proposal());
     response.set_position(request.position());
@@ -692,11 +696,7 @@ void ReplicaProcess::learned(const UPID& from, const Action& action)
             << action.position() << " from " << from;
 
   CHECK(action.learned());
-
-  if (persist(action)) {
-    LOG(INFO) << "Replica learned " << action.type()
-              << " action at position " << action.position();
-  }
+  persist(action);
 }
 
 
@@ -709,7 +709,8 @@ bool ReplicaProcess::persist(const Action& action)
     return false;
   }
 
-  LOG(INFO) << "Persisted action at " << action.position();
+  VLOG(1) << "Persisted action " << action.type()
+          << " at position " << action.position();
 
   // No longer a hole here (if there even was one).
   holes -= action.position();
@@ -731,6 +732,21 @@ bool ReplicaProcess::persist(const Action& action)
 
       // And update the beginning position.
       begin = std::max(begin, action.truncate().to());
+    } else if (action.has_type() && action.type() == Action::NOP &&
+               action.nop().has_tombstone() && action.nop().tombstone()) {
+      // No longer consider truncated positions as holes (so that a
+      // coordinator doesn't try and fill them).
+      holes -= (Bound<uint64_t>::open(0),
+                Bound<uint64_t>::open(action.position()));
+
+      // No longer consider truncated positions as unlearned (so that
+      // a coordinator doesn't try and fill them).
+      unlearned -= (Bound<uint64_t>::open(0),
+                    Bound<uint64_t>::open(action.position()));
+
+      // And update the beginning position. There must exist at least
+      // 1 position (TRUNCATE) in the log after the tombstone.
+      begin = std::max(begin, action.position() + 1);
     }
   } else {
     // We just introduced an unlearned position.
@@ -759,13 +775,13 @@ void ReplicaProcess::restore(const string& path)
   }
 
   // Pull out and save some of the state.
-  metadata = state.get().metadata;
-  begin = state.get().begin;
-  end = state.get().end;
-  unlearned = state.get().unlearned;
+  metadata = state->metadata;
+  begin = state->begin;
+  end = state->end;
+  unlearned = state->unlearned;
 
   // Only use the learned positions to help determine the holes.
-  const IntervalSet<uint64_t>& learned = state.get().learned;
+  const IntervalSet<uint64_t>& learned = state->learned;
 
   // Holes are those positions in [begin, end] that are not in both
   // learned and unlearned sets. In the case of a brand new log (begin

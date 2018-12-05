@@ -33,22 +33,24 @@
 #include <process/protobuf.hpp>
 #include <process/timer.hpp>
 
+#include <process/ssl/flags.hpp>
+
 #include <stout/duration.hpp>
 #include <stout/lambda.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
+#include <stout/unreachable.hpp>
 #include <stout/uuid.hpp>
 
 #include "common/http.hpp"
 #include "common/recordio.hpp"
+#include "common/validation.hpp"
 
 #include "internal/devolve.hpp"
 
 #include "logging/flags.hpp"
 #include "logging/logging.hpp"
-
-#include "slave/validation.hpp"
 
 #include "version/version.hpp"
 
@@ -60,8 +62,6 @@ using std::queue;
 using std::string;
 
 using mesos::internal::recordio::Reader;
-
-using mesos::internal::slave::validation::executor::call::validate;
 
 using process::async;
 using process::Clock;
@@ -94,10 +94,11 @@ class ShutdownProcess : public process::Process<ShutdownProcess>
 {
 public:
   explicit ShutdownProcess(const Duration& _gracePeriod)
-    : gracePeriod(_gracePeriod) {}
+    : ProcessBase(generate("__shutdown_executor__")),
+      gracePeriod(_gracePeriod) {}
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     VLOG(1) << "Scheduling shutdown of the executor in " << gracePeriod;
 
@@ -153,7 +154,8 @@ public:
       ContentType _contentType,
       const lambda::function<void(void)>& connected,
       const lambda::function<void(void)>& disconnected,
-      const lambda::function<void(const queue<Event>&)>& received)
+      const lambda::function<void(const queue<Event>&)>& received,
+      const std::map<std::string, std::string>& environment)
     : ProcessBase(generate("executor")),
       state(DISCONNECTED),
       contentType(_contentType),
@@ -164,7 +166,18 @@ public:
     // Load any logging flags from the environment.
     logging::Flags flags;
 
-    Try<flags::Warnings> load = flags.load("MESOS_");
+    // Filter out environment variables whose keys don't start with "MESOS_".
+    //
+    // TODO(alexr): This should be supported by `FlagsBase`, see MESOS-9001.
+    std::map<std::string, std::string> mesosEnvironment;
+
+    foreachpair (const string& key, const string& value, environment) {
+      if (strings::startsWith(key, "MESOS_")) {
+        mesosEnvironment.emplace(key, value);
+      }
+    }
+
+    Try<flags::Warnings> load = flags.load(mesosEnvironment, true);
 
     if (load.isError()) {
       EXIT(EXIT_FAILURE) << "Failed to load flags: " << load.error();
@@ -175,7 +188,7 @@ public:
 
     // Initialize logging.
     if (flags.initialize_driver_logging) {
-      logging::initialize("mesos", flags);
+      logging::initialize("mesos", false, flags);
     } else {
       VLOG(1) << "Disabling initialization of GLOG logging";
     }
@@ -189,13 +202,15 @@ public:
 
     spawn(new VersionProcess(), true);
 
+    hashmap<string, string> env(mesosEnvironment);
+
     // Check if this is local (for example, for testing).
-    local = os::getenv("MESOS_LOCAL").isSome();
+    local = env.get("MESOS_LOCAL").isSome();
 
     Option<string> value;
 
     // Get agent PID from environment.
-    value = os::getenv("MESOS_SLAVE_PID");
+    value = env.get("MESOS_SLAVE_PID");
     if (value.isNone()) {
       EXIT(EXIT_FAILURE)
         << "Expecting 'MESOS_SLAVE_PID' to be set in the environment";
@@ -204,20 +219,37 @@ public:
     UPID upid(value.get());
     CHECK(upid) << "Failed to parse MESOS_SLAVE_PID '" << value.get() << "'";
 
+    string scheme = "http";
+
+#ifdef USE_SSL_SOCKET
+    if (process::network::openssl::flags().enabled) {
+      scheme = "https";
+    }
+#endif // USE_SSL_SOCKET
+
     agent = ::URL(
-        "http",
+        scheme,
         upid.address.ip,
         upid.address.port,
         upid.id +
         "/api/v1/executor");
 
+    value = env.get("MESOS_EXECUTOR_AUTHENTICATION_TOKEN");
+    if (value.isSome()) {
+      authenticationToken = value.get();
+    }
+
+    // Erase the auth token from the environment so that it is not visible to
+    // other processes in the same PID namespace.
+    os::eraseenv("MESOS_EXECUTOR_AUTHENTICATION_TOKEN");
+
     // Get checkpointing status from environment.
-    value = os::getenv("MESOS_CHECKPOINT");
+    value = env.get("MESOS_CHECKPOINT");
     checkpoint = value.isSome() && value.get() == "1";
 
     if (checkpoint) {
       // Get recovery timeout from environment.
-      value = os::getenv("MESOS_RECOVERY_TIMEOUT");
+      value = env.get("MESOS_RECOVERY_TIMEOUT");
       if (value.isSome()) {
         Try<Duration> _recoveryTimeout = Duration::parse(value.get());
 
@@ -232,7 +264,7 @@ public:
       }
 
       // Get maximum backoff factor from environment.
-      value = os::getenv("MESOS_SUBSCRIPTION_BACKOFF_MAX");
+      value = env.get("MESOS_SUBSCRIPTION_BACKOFF_MAX");
       if (value.isSome()) {
         Try<Duration> _maxBackoff = Duration::parse(value.get());
 
@@ -249,7 +281,7 @@ public:
     }
 
     // Get executor shutdown grace period from the environment.
-    value = os::getenv("MESOS_EXECUTOR_SHUTDOWN_GRACE_PERIOD");
+    value = env.get("MESOS_EXECUTOR_SHUTDOWN_GRACE_PERIOD");
     if (value.isSome()) {
       Try<Duration> _shutdownGracePeriod = Duration::parse(value.get());
 
@@ -267,7 +299,8 @@ public:
 
   void send(const Call& call)
   {
-    Option<Error> error = validate(devolve(call));
+    Option<Error> error =
+      common::validation::validateExecutorCall(devolve(call));
     if (error.isSome()) {
       drop(call, error->message);
       return;
@@ -297,6 +330,10 @@ public:
     request.headers = {{"Accept", stringify(contentType)},
                        {"Content-Type", stringify(contentType)}};
 
+    if (authenticationToken.isSome()) {
+      request.headers["Authorization"] = "Bearer " + authenticationToken.get();
+    }
+
     CHECK_SOME(connections);
 
     Future<Response> response;
@@ -317,13 +354,13 @@ public:
                          lambda::_1));
   }
 
-  ~MesosProcess()
+  ~MesosProcess() override
   {
     disconnect();
   }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     connect();
   }
@@ -332,14 +369,14 @@ protected:
   {
     CHECK(state == DISCONNECTED || state == CONNECTING) << state;
 
-    connectionId = UUID::random();
+    connectionId = id::UUID::random();
 
     state = CONNECTING;
 
     // This automatic variable is needed for lambda capture. We need to
     // create a copy here because `connectionId` might change by the time the
     // second `http::connect()` gets called.
-    UUID connectionId_ = connectionId.get();
+    id::UUID connectionId_ = connectionId.get();
 
     // We create two persistent connections here, one for subscribe
     // call/streaming response and another for non-subscribe calls/responses.
@@ -356,7 +393,7 @@ protected:
   }
 
   void connected(
-      const UUID& _connectionId,
+      const id::UUID& _connectionId,
       const Future<Connection>& connection1,
       const Future<Connection>& connection2)
   {
@@ -424,7 +461,7 @@ protected:
   }
 
   void disconnected(
-      const UUID& _connectionId,
+      const id::UUID& _connectionId,
       const string& failure)
   {
     // Ignore if the disconnection happened from an old stale connection.
@@ -477,10 +514,7 @@ protected:
       // Backoff and reconnect only if framework checkpointing is enabled.
       backoff();
     } else {
-      Event event;
-      event.set_type(Event::SHUTDOWN);
-
-      receive(event, true);
+      shutdown();
     }
   }
 
@@ -562,7 +596,7 @@ protected:
   }
 
   void _send(
-      const UUID& _connectionId,
+      const id::UUID& _connectionId,
       const Call& call,
       const Future<Response>& response)
   {
@@ -675,8 +709,8 @@ protected:
 
     // This could happen if the agent failed over after sending an event.
     if (event->isNone()) {
-      const string error =  "End-Of-File received from agent. The agent closed "
-                            "the event stream";
+      const string error = "End-Of-File received from agent. The agent closed"
+                           " the event stream";
       LOG(ERROR) << error;
 
       disconnected(connectionId.get(), error);
@@ -688,7 +722,7 @@ protected:
       return;
     }
 
-    receive(event.get().get(), false);
+    receive(event->get(), false);
     read();
   }
 
@@ -720,11 +754,19 @@ protected:
     }
 
     if (event.type() == Event::SHUTDOWN) {
-      shutdown();
+      _shutdown();
     }
   }
 
   void shutdown()
+  {
+    Event event;
+    event.set_type(Event::SHUTDOWN);
+
+    receive(event, true);
+  }
+
+  void _shutdown()
   {
     if (!local) {
       spawn(new ShutdownProcess(shutdownGracePeriod), true);
@@ -779,7 +821,7 @@ private:
   // the agent (e.g., the agent process restarted while an attempt was in
   // progress). This helps us in uniquely identifying the current connection
   // instance and ignoring the stale instance.
-  Option<UUID> connectionId; // UUID to identify the connection instance.
+  Option<id::UUID> connectionId; // UUID to identify the connection instance.
 
   ContentType contentType;
   Callbacks callbacks;
@@ -794,6 +836,7 @@ private:
   Option<Duration> maxBackoff;
   Option<Timer> recoveryTimer;
   Duration shutdownGracePeriod;
+  Option<string> authenticationToken;
 };
 
 
@@ -802,7 +845,21 @@ Mesos::Mesos(
     const lambda::function<void(void)>& connected,
     const lambda::function<void(void)>& disconnected,
     const lambda::function<void(const queue<Event>&)>& received)
-  : process(new MesosProcess(contentType, connected, disconnected, received))
+  : process(new MesosProcess(
+      contentType, connected, disconnected, received, os::environment()))
+{
+  spawn(process.get());
+}
+
+
+Mesos::Mesos(
+    ContentType contentType,
+    const lambda::function<void(void)>& connected,
+    const lambda::function<void(void)>& disconnected,
+    const lambda::function<void(const queue<Event>&)>& received,
+    const std::map<std::string, std::string>& environment)
+  : process(new MesosProcess(
+      contentType, connected, disconnected, received, environment))
 {
   spawn(process.get());
 }

@@ -41,9 +41,9 @@ namespace log {
 class Varint64Comparator : public leveldb::Comparator
 {
 public:
-  virtual int Compare(
+  int Compare(
       const leveldb::Slice& a,
-      const leveldb::Slice& b) const
+      const leveldb::Slice& b) const override
   {
     // TODO(benh): Use varint comparator.
     LOG(FATAL) << "Unimplemented";
@@ -55,7 +55,7 @@ public:
     UNREACHABLE();
   }
 
-  virtual const char* Name() const
+  const char* Name() const override
   {
     // Note that this name MUST NOT CHANGE across uses of this
     // comparator with the same DB (the semantics of doing so are
@@ -63,14 +63,14 @@ public:
     return "varint64";
   }
 
-  virtual void FindShortestSeparator(
+  void FindShortestSeparator(
       string* start,
-      const leveldb::Slice& limit) const
+      const leveldb::Slice& limit) const override
   {
     // Intentional no-op.
   }
 
-  virtual void FindShortSuccessor(string* key) const
+  void FindShortSuccessor(string* key) const override
   {
     // Intentional no-op.
   }
@@ -171,14 +171,14 @@ Try<Storage::State> LevelDBStorage::restore(const string& path)
     return Error(status.ToString());
   }
 
-  LOG(INFO) << "Opened db in " << stopwatch.elapsed();
+  VLOG(1) << "Opened db in " << stopwatch.elapsed();
 
   stopwatch.start(); // Restart the stopwatch.
 
   // TODO(benh): Conditionally compact to avoid long recovery times?
   db->CompactRange(nullptr, nullptr);
 
-  LOG(INFO) << "Compacted db in " << stopwatch.elapsed();
+  VLOG(1) << "Compacted db in " << stopwatch.elapsed();
 
   State state;
   state.begin = 0;
@@ -193,13 +193,13 @@ Try<Storage::State> LevelDBStorage::restore(const string& path)
 
   leveldb::Iterator* iterator = db->NewIterator(leveldb::ReadOptions());
 
-  LOG(INFO) << "Created db iterator in " << stopwatch.elapsed();
+  VLOG(1) << "Created db iterator in " << stopwatch.elapsed();
 
   stopwatch.start(); // Restart the stopwatch.
 
   iterator->SeekToFirst();
 
-  LOG(INFO) << "Seeked to beginning of db in " << stopwatch.elapsed();
+  VLOG(1) << "Seeked to beginning of db in " << stopwatch.elapsed();
 
   stopwatch.start(); // Restart the stopwatch.
 
@@ -243,6 +243,12 @@ Try<Storage::State> LevelDBStorage::restore(const string& path)
           state.unlearned.erase(action.position());
           if (action.has_type() && action.type() == Action::TRUNCATE) {
             state.begin = std::max(state.begin, action.truncate().to());
+          } else if (action.has_type() && action.type() == Action::NOP &&
+                     action.nop().has_tombstone() && action.nop().tombstone()) {
+            // If we see a tombstone, this position was truncated.
+            // There must exist at least 1 position (TRUNCATE) in the
+            // log after it.
+            state.begin = std::max(state.begin, action.position() + 1);
           }
         } else {
           state.learned.erase(action.position());
@@ -268,8 +274,8 @@ Try<Storage::State> LevelDBStorage::restore(const string& path)
     iterator->Next();
   }
 
-  LOG(INFO) << "Iterated through " << keys
-            << " keys in the db in " << stopwatch.elapsed();
+  VLOG(1) << "Iterated through " << keys
+          << " keys in the db in " << stopwatch.elapsed();
 
   delete iterator;
 
@@ -301,8 +307,8 @@ Try<Nothing> LevelDBStorage::persist(const Metadata& metadata)
     return Error(status.ToString());
   }
 
-  LOG(INFO) << "Persisting metadata (" << value.size()
-            << " bytes) to leveldb took " << stopwatch.elapsed();
+  VLOG(1) << "Persisting metadata (" << value.size()
+          << " bytes) to leveldb took " << stopwatch.elapsed();
 
   return Nothing();
 }
@@ -338,16 +344,34 @@ Try<Nothing> LevelDBStorage::persist(const Action& action)
   // catch-up policy is used).
   first = min(first, action.position());
 
-  LOG(INFO) << "Persisting action (" << value.size()
-            << " bytes) to leveldb took " << stopwatch.elapsed();
+  VLOG(1) << "Persisting action (" << value.size()
+          << " bytes) to leveldb took " << stopwatch.elapsed();
 
-  // Delete positions if a truncate action has been *learned*. Note
-  // that we do this in a best-effort fashion (i.e., we ignore any
-  // failures to the database since we can always try again).
+  Option<uint64_t> truncateTo;
+
+  // Delete positions if a truncate action has been *learned*.
   if (action.has_type() && action.type() == Action::TRUNCATE &&
       action.has_learned() && action.learned()) {
     CHECK(action.has_truncate());
+    truncateTo = action.truncate().to();
+  }
 
+  // Delete positions if a tombstone NOP action has been *learned*.
+  if (action.has_type() && action.type() == Action::NOP &&
+      action.nop().has_tombstone() && action.nop().tombstone() &&
+      action.has_learned() && action.learned()) {
+    // We truncate the log up to the tombstone position instead of the
+    // next one to allow the recovery code to see the tombstone and
+    // learn about the truncation. It's OK to persist a tombstone NOP,
+    // because eventually we'll remove it once we see the actual
+    // TRUNCATE action.
+    truncateTo = action.position();
+  }
+
+  // Delete truncated positions. Note that we do this in a best-effort
+  // fashion (i.e., we ignore any failures to the database since we
+  // can always try again).
+  if (truncateTo.isSome()) {
     stopwatch.start(); // Restart the stopwatch.
 
     // To actually perform the truncation in leveldb we need to remove
@@ -378,7 +402,7 @@ Try<Nothing> LevelDBStorage::persist(const Action& action)
     // out of order) bulk catch-up and the truncate operation is
     // caught up first.
     uint64_t index = 0;
-    while ((first.get() + index) < action.truncate().to()) {
+    while ((first.get() + index) < truncateTo.get()) {
       batch.Delete(encode(first.get() + index));
       index++;
     }
@@ -393,11 +417,11 @@ Try<Nothing> LevelDBStorage::persist(const Action& action)
                      << status.ToString();
       } else {
         // Save the new first position!
-        CHECK_LT(first.get(), action.truncate().to());
-        first = action.truncate().to();
+        CHECK_LT(first.get(), truncateTo.get());
+        first = truncateTo.get();
 
-        LOG(INFO) << "Deleting ~" << index
-                  << " keys from leveldb took " << stopwatch.elapsed();
+        VLOG(1) << "Deleting ~" << index
+                << " keys from leveldb took " << stopwatch.elapsed();
       }
     }
   }
@@ -433,7 +457,7 @@ Try<Action> LevelDBStorage::read(uint64_t position)
     return Error("Bad record");
   }
 
-  LOG(INFO) << "Reading position from leveldb took " << stopwatch.elapsed();
+  VLOG(1) << "Reading position from leveldb took " << stopwatch.elapsed();
 
   return record.action();
 }

@@ -31,6 +31,7 @@
 #include <stout/os/getcwd.hpp>
 #include <stout/os/ls.hpp>
 #include <stout/os/write.hpp>
+#include <stout/uri.hpp>
 
 #include <stout/tests/utils.hpp>
 
@@ -47,6 +48,8 @@ namespace http = process::http;
 
 using std::list;
 using std::string;
+
+using mesos::uri::DockerFetcherPlugin;
 
 using process::Future;
 using process::Owned;
@@ -74,14 +77,14 @@ public:
 class CurlFetcherPluginTest : public TemporaryDirectoryTest
 {
 protected:
-  virtual void SetUp()
+  void SetUp() override
   {
     TemporaryDirectoryTest::SetUp();
 
     spawn(server);
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     terminate(server);
     wait(server);
@@ -129,21 +132,46 @@ TEST_F(CurlFetcherPluginTest, CURL_InvalidUri)
 }
 
 
+// This test verifies invoking 'fetch' by plugin name.
+TEST_F(CurlFetcherPluginTest, CURL_InvokeFetchByName)
+{
+  URI uri = uri::http(
+      stringify(server.self().address.ip),
+      "/TestHttpServer/test",
+      server.self().address.port);
+
+  EXPECT_CALL(server, test(_))
+    .WillOnce(Return(http::OK("test")));
+
+  Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
+  ASSERT_SOME(fetcher);
+
+  AWAIT_READY(fetcher.get()->fetch(uri, os::getcwd(), "curl", None()));
+
+  EXPECT_TRUE(os::exists(path::join(os::getcwd(), "test")));
+}
+
+
 class HadoopFetcherPluginTest : public TemporaryDirectoryTest
 {
 public:
-  virtual void SetUp()
+  void SetUp() override
   {
     TemporaryDirectoryTest::SetUp();
 
     // Create a fake hadoop command line tool. It emulates the hadoop
     // client's logic while operating on the local filesystem.
+#ifndef __WINDOWS__
     hadoop = path::join(os::getcwd(), "hadoop");
+#else
+    hadoop = path::join(os::getcwd(), "hadoop.bat");
+#endif // __WINDOWS__
 
     // The script emulating 'hadoop fs -copyToLocal <from> <to>'.
     // NOTE: We emulate a version call here which is exercised when
     // creating the HDFS client. But, we don't expect any other
     // command to be called.
+#ifndef __WINDOWS__
     ASSERT_SOME(os::write(
         hadoop,
         "#!/bin/sh\n"
@@ -162,6 +190,20 @@ public:
     ASSERT_SOME(os::chmod(
         hadoop,
         S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH));
+#else
+    // NOTE: This is a `.bat` file instead of PowerShell so that it can be
+    // directly executed. Windows "knows" how to launch files ending in `.bat`,
+    // similar to the shebang logic for POSIX. However, this does not extend to
+    // PowerShell's `.ps1` scripts.
+    ASSERT_SOME(os::write(
+        hadoop,
+        "if \"%1\" == \"version\" (exit 0)\n"
+        "if NOT \"%1\" == \"fs\" (exit 1)\n"
+        "if NOT \"%2\" == \"-copyToLocal\" (exit 1)\n"
+        "copy %3 %4\n"));
+
+    // Windows has no notion of "execution permission".
+#endif // __WINDOWS__
   }
 
 protected:
@@ -207,9 +249,42 @@ TEST_F(HadoopFetcherPluginTest, FetchNonExistingFile)
 }
 
 
+// This test verifies invoking 'fetch' by plugin name.
+TEST_F(HadoopFetcherPluginTest, InvokeFetchByName)
+{
+  string file = path::join(os::getcwd(), "file");
+
+  ASSERT_SOME(os::write(file, "abc"));
+
+  URI uri = uri::hdfs(file);
+
+  uri::fetcher::Flags flags;
+  flags.hadoop_client = hadoop;
+
+  Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create(flags);
+  ASSERT_SOME(fetcher);
+
+  string dir = path::join(os::getcwd(), "dir");
+
+  AWAIT_READY(fetcher.get()->fetch(uri, dir, "hadoop", None()));
+
+  EXPECT_SOME_EQ("abc", os::read(path::join(dir, "file")));
+}
+
+
 // TODO(jieyu): Expose this constant so that other docker related
 // tests can use this as well.
 static constexpr char DOCKER_REGISTRY_HOST[] = "registry-1.docker.io";
+
+#ifdef __WINDOWS__
+static constexpr char TEST_REPOSITORY[] = "microsoft/nanoserver";
+static constexpr char TEST_DIGEST[] = "sha256:54389c2d19b423943102864aaf3fc"
+                                      "1296e5dd140a074b5bd6700de858a8e5479";
+#else
+static constexpr char TEST_REPOSITORY[] = "library/busybox";
+static constexpr char TEST_DIGEST[] = "sha256:a3ed95caeb02ffe68cdd9fd844066"
+                                      "80ae93d633cb16422d00e8a7c22955b46d4";
+#endif // __WINDOWS__
 
 
 class DockerFetcherPluginTest : public TemporaryDirectoryTest {};
@@ -218,9 +293,7 @@ class DockerFetcherPluginTest : public TemporaryDirectoryTest {};
 TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchManifest)
 {
   URI uri = uri::docker::manifest(
-      "library/busybox",
-      "latest",
-      DOCKER_REGISTRY_HOST);
+      TEST_REPOSITORY, "latest", DOCKER_REGISTRY_HOST);
 
   Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
   ASSERT_SOME(fetcher);
@@ -229,27 +302,36 @@ TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchManifest)
 
   AWAIT_READY_FOR(fetcher.get()->fetch(uri, dir), Seconds(60));
 
-  Try<string> _manifest = os::read(path::join(dir, "manifest"));
-  ASSERT_SOME(_manifest);
+  // Version 2 schema 1 image manifest test
+  Try<string> _s1Manifest = os::read(path::join(dir, "manifest"));
+  ASSERT_SOME(_s1Manifest);
 
-  Try<docker::spec::v2::ImageManifest> manifest =
-    docker::spec::v2::parse(_manifest.get());
+  Try<docker::spec::v2::ImageManifest> s1Manifest =
+    docker::spec::v2::parse(_s1Manifest.get());
 
-  ASSERT_SOME(manifest);
-  EXPECT_EQ("library/busybox", manifest->name());
-  EXPECT_EQ("latest", manifest->tag());
+  ASSERT_SOME(s1Manifest);
+  EXPECT_EQ(1u, s1Manifest->schemaversion());
+  EXPECT_EQ(TEST_REPOSITORY, s1Manifest->name());
+  EXPECT_EQ("latest", s1Manifest->tag());
+
+#ifdef __WINDOWS__
+  // Version 2 schema 2 image manifest test
+  Try<string> _s2Manifest = os::read(path::join(dir, "manifest_v2s2"));
+  ASSERT_SOME(_s2Manifest);
+
+  Try<docker::spec::v2_2::ImageManifest> s2Manifest =
+    docker::spec::v2_2::parse(_s2Manifest.get());
+
+  ASSERT_SOME(s2Manifest);
+  EXPECT_EQ(2u, s2Manifest->schemaversion());
+#endif // __WINDOWS__
 }
 
 
 TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchBlob)
 {
-  const string digest =
-    "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4";
-
   URI uri = uri::docker::blob(
-      "library/busybox",
-      digest,
-      DOCKER_REGISTRY_HOST);
+      TEST_REPOSITORY, TEST_DIGEST, DOCKER_REGISTRY_HOST);
 
   Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
   ASSERT_SOME(fetcher);
@@ -258,7 +340,7 @@ TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchBlob)
 
   AWAIT_READY_FOR(fetcher.get()->fetch(uri, dir), Seconds(60));
 
-  EXPECT_TRUE(os::exists(path::join(dir, digest)));
+  EXPECT_TRUE(os::exists(DockerFetcherPlugin::getBlobPath(dir, TEST_DIGEST)));
 }
 
 
@@ -266,9 +348,7 @@ TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchBlob)
 TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchImage)
 {
   URI uri = uri::docker::image(
-      "library/busybox",
-      "latest",
-      DOCKER_REGISTRY_HOST);
+      TEST_REPOSITORY, "latest", DOCKER_REGISTRY_HOST);
 
   Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
   ASSERT_SOME(fetcher);
@@ -281,14 +361,53 @@ TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchImage)
   ASSERT_SOME(_manifest);
 
   Try<docker::spec::v2::ImageManifest> manifest =
-    docker::spec::v2::parse(_manifest.get());
+      docker::spec::v2::parse(_manifest.get());
 
   ASSERT_SOME(manifest);
-  EXPECT_EQ("library/busybox", manifest->name());
+  EXPECT_EQ(1u, manifest->schemaversion());
+  EXPECT_EQ(TEST_REPOSITORY, manifest->name());
   EXPECT_EQ("latest", manifest->tag());
 
   for (int i = 0; i < manifest->fslayers_size(); i++) {
-    EXPECT_TRUE(os::exists(path::join(dir, manifest->fslayers(i).blobsum())));
+    EXPECT_TRUE(os::exists(
+        DockerFetcherPlugin::getBlobPath(
+            dir,
+            manifest->fslayers(i).blobsum())));
+  }
+}
+
+
+// This test verifies invoking 'fetch' by plugin name.
+TEST_F(DockerFetcherPluginTest, INTERNET_CURL_InvokeFetchByName)
+{
+  URI uri = uri::docker::image(
+      TEST_REPOSITORY, "latest", DOCKER_REGISTRY_HOST);
+
+  Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
+  ASSERT_SOME(fetcher);
+
+  string dir = path::join(os::getcwd(), "dir");
+
+  AWAIT_READY_FOR(
+      fetcher.get()->fetch(uri, dir, "docker", None()),
+      Seconds(60));
+
+  Try<string> _manifest = os::read(path::join(dir, "manifest"));
+  ASSERT_SOME(_manifest);
+
+  Try<docker::spec::v2::ImageManifest> manifest =
+      docker::spec::v2::parse(_manifest.get());
+
+  ASSERT_SOME(manifest);
+  EXPECT_EQ(1u, manifest->schemaversion());
+  EXPECT_EQ(TEST_REPOSITORY, manifest->name());
+  EXPECT_EQ("latest", manifest->tag());
+
+  for (int i = 0; i < manifest->fslayers_size(); i++) {
+    EXPECT_TRUE(os::exists(
+        DockerFetcherPlugin::getBlobPath(
+            dir,
+            manifest->fslayers(i).blobsum())));
   }
 }
 
@@ -334,6 +453,28 @@ TEST_F(CopyFetcherPluginTest, FetchNonExistingFile)
   AWAIT_FAILED(fetcher.get()->fetch(uri, dir));
 }
 
+
+// This test verifies invoking 'fetch' by plugin name.
+TEST_F_TEMP_DISABLED_ON_WINDOWS(CopyFetcherPluginTest, InvokeFetchByName)
+{
+  const string file = path::join(os::getcwd(), "file");
+
+  ASSERT_SOME(os::write(file, "abc"));
+
+  // Create a URI for the test file.
+  const URI uri = uri::file(file);
+
+  // Use the file fetcher to fetch the URI.
+  Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
+  ASSERT_SOME(fetcher);
+
+  const string dir = path::join(os::getcwd(), "dir");
+
+  AWAIT_READY(fetcher.get()->fetch(uri, dir, "copy", None()));
+
+  // Validate the fetched file's content.
+  EXPECT_SOME_EQ("abc", os::read(path::join(dir, "file")));
+}
 
 // TODO(jieyu): Add Docker fetcher plugin tests to test with a local
 // registry server (w/ or w/o authentication).

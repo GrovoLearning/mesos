@@ -47,6 +47,7 @@
 
 #include "messages/messages.hpp"
 
+#include "slave/constants.hpp"
 #include "slave/slave.hpp"
 
 #include "tests/containerizer.hpp"
@@ -67,6 +68,7 @@ using mesos::master::detector::StandaloneMasterDetector;
 
 using process::Clock;
 using process::Future;
+using process::Message;
 using process::Owned;
 using process::PID;
 using process::Promise;
@@ -82,14 +84,30 @@ using testing::_;
 using testing::An;
 using testing::AtMost;
 using testing::DoAll;
+using testing::Eq;
 using testing::Return;
 
 namespace mesos {
 namespace internal {
 namespace tests {
 
+class MasterAuthorizationTest : public MesosTest
+{
+protected:
+  slave::Flags CreateSlaveFlags() override
+  {
+    slave::Flags flags = MesosTest::CreateSlaveFlags();
 
-class MasterAuthorizationTest : public MesosTest {};
+#ifndef __WINDOWS__
+    // We don't need to actually launch tasks as the specified
+    // user, since we are only interested in testing the
+    // authorization path.
+    flags.switch_user = false;
+#endif
+
+    return flags;
+  }
+};
 
 
 // This test verifies that an authorized task launch is successful.
@@ -108,7 +126,7 @@ TEST_F(MasterAuthorizationTest, AuthorizedTask)
   ASSERT_SOME(master);
 
   // Create an authorized executor.
-  ExecutorInfo executor = CREATE_EXECUTOR_INFO("test-executor", "exit 1");
+  ExecutorInfo executor = createExecutorInfo("test-executor", "exit 1");
   executor.mutable_command()->set_user("foo");
 
   MockExecutor exec(executor.executor_id());
@@ -122,10 +140,9 @@ TEST_F(MasterAuthorizationTest, AuthorizedTask)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
-  Future<vector<Offer> > offers;
+  Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers))
     .WillRepeatedly(Return()); // Ignore subsequent offers.
@@ -133,7 +150,7 @@ TEST_F(MasterAuthorizationTest, AuthorizedTask)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   // Create an authorized task.
   TaskInfo task;
@@ -143,8 +160,7 @@ TEST_F(MasterAuthorizationTest, AuthorizedTask)
   task.mutable_resources()->MergeFrom(offers.get()[0].resources());
   task.mutable_executor()->MergeFrom(executor);
 
-  EXPECT_CALL(exec, registered(_, _, _, _))
-    .Times(1);
+  EXPECT_CALL(exec, registered(_, _, _, _));
 
   EXPECT_CALL(exec, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
@@ -156,7 +172,7 @@ TEST_F(MasterAuthorizationTest, AuthorizedTask)
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  EXPECT_EQ(TASK_RUNNING, status->state());
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -182,7 +198,7 @@ TEST_F(MasterAuthorizationTest, UnauthorizedTask)
   ASSERT_SOME(master);
 
   // Create an unauthorized executor.
-  ExecutorInfo executor = CREATE_EXECUTOR_INFO("test-executor", "exit 1");
+  ExecutorInfo executor = createExecutorInfo("test-executor", "exit 1");
   executor.mutable_command()->set_user("foo");
 
   MockExecutor exec(executor.executor_id());
@@ -196,10 +212,9 @@ TEST_F(MasterAuthorizationTest, UnauthorizedTask)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
-  Future<vector<Offer> > offers;
+  Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers))
     .WillRepeatedly(Return()); // Ignore subsequent offers.
@@ -207,7 +222,7 @@ TEST_F(MasterAuthorizationTest, UnauthorizedTask)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   // Create an unauthorized task.
   TaskInfo task;
@@ -224,8 +239,129 @@ TEST_F(MasterAuthorizationTest, UnauthorizedTask)
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_ERROR, status.get().state());
-  EXPECT_EQ(TaskStatus::REASON_TASK_UNAUTHORIZED, status.get().reason());
+  EXPECT_EQ(TASK_ERROR, status->state());
+  EXPECT_EQ(TaskStatus::REASON_TASK_UNAUTHORIZED, status->reason());
+
+  // Make sure the task is not known to master anymore.
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(0);
+
+  driver.reconcileTasks({});
+
+  // We settle the clock here to ensure any updates sent by the master
+  // are received. There shouldn't be any updates in this case.
+  Clock::pause();
+  Clock::settle();
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that even if one of the tasks in a task group is
+// unauthorized, all the tasks in the task group are rejected.
+TEST_F(MasterAuthorizationTest, UnauthorizedTaskGroup)
+{
+  // Setup ACLs so that no framework can launch as "foo".
+  ACLs acls;
+  mesos::ACL::RunTask* acl = acls.add_run_tasks();
+  acl->mutable_principals()->set_type(mesos::ACL::Entity::NONE);
+  acl->mutable_users()->add_values("foo");
+
+  master::Flags flags = CreateMasterFlags();
+  flags.acls = acls;
+
+  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Resources resources =
+    Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  ExecutorInfo executor;
+  executor.set_type(ExecutorInfo::DEFAULT);
+  executor.mutable_executor_id()->set_value("E");
+  executor.mutable_framework_id()->CopyFrom(frameworkId.get());
+  executor.mutable_resources()->CopyFrom(resources);
+
+  // Create an unauthorized task.
+  TaskInfo task1;
+  task1.set_name("1");
+  task1.mutable_task_id()->set_value("1");
+  task1.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task1.mutable_resources()->MergeFrom(resources);
+  task1.mutable_command()->set_value("echo hello");
+  task1.mutable_command()->set_user("foo");
+
+  // Create an authorized task.
+  TaskInfo task2;
+  task2.set_name("2");
+  task2.mutable_task_id()->set_value("2");
+  task2.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task2.mutable_resources()->MergeFrom(resources);
+
+  TaskGroupInfo taskGroup;
+  taskGroup.add_tasks()->CopyFrom(task1);
+  taskGroup.add_tasks()->CopyFrom(task2);
+
+  Future<TaskStatus> task1Status;
+  Future<TaskStatus> task2Status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&task1Status))
+    .WillOnce(FutureArg<1>(&task2Status));
+
+  Offer::Operation operation;
+  operation.set_type(Offer::Operation::LAUNCH_GROUP);
+
+  Offer::Operation::LaunchGroup* launchGroup =
+    operation.mutable_launch_group();
+
+  launchGroup->mutable_executor()->CopyFrom(executor);
+  launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+  driver.acceptOffers({offers.get()[0].id()}, {operation});
+
+  AWAIT_READY(task1Status);
+  EXPECT_EQ(TASK_ERROR, task1Status->state());
+  EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_UNAUTHORIZED, task1Status->reason());
+
+  AWAIT_READY(task2Status);
+  EXPECT_EQ(TASK_ERROR, task2Status->state());
+  EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_UNAUTHORIZED, task2Status->reason());
+
+  // Make sure the task group is not known to master anymore.
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(0);
+
+  driver.reconcileTasks({});
+
+  // We settle the clock here to ensure any updates sent by the master
+  // are received. There shouldn't be any updates in this case.
+  Clock::pause();
+  Clock::settle();
 
   driver.stop();
   driver.join();
@@ -233,7 +369,7 @@ TEST_F(MasterAuthorizationTest, UnauthorizedTask)
 
 
 // This test verifies that a 'killTask()' that comes before
-// '_launchTasks()' is called results in TASK_KILLED.
+// '_accept()' is called results in TASK_KILLED.
 TEST_F(MasterAuthorizationTest, KillTask)
 {
   MockAuthorizer authorizer;
@@ -251,10 +387,9 @@ TEST_F(MasterAuthorizationTest, KillTask)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
-  Future<vector<Offer> > offers;
+  Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers))
     .WillRepeatedly(Return()); // Ignore subsequent offers.
@@ -262,7 +397,7 @@ TEST_F(MasterAuthorizationTest, KillTask)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
 
@@ -287,7 +422,8 @@ TEST_F(MasterAuthorizationTest, KillTask)
 
   // Framework should get a TASK_KILLED right away.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_KILLED, status.get().state());
+  EXPECT_EQ(TASK_KILLED, status->state());
+  EXPECT_EQ(TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH, status->reason());
 
   Future<Nothing> recoverResources =
     FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
@@ -299,14 +435,160 @@ TEST_F(MasterAuthorizationTest, KillTask)
   // returned to the allocator.
   AWAIT_READY(recoverResources);
 
+  // Make sure the task is not known to master anymore.
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(0);
+
+  driver.reconcileTasks({});
+
+  // We settle the clock here to ensure any updates sent by the master
+  // are received. There shouldn't be any updates in this case.
+  Clock::pause();
+  Clock::settle();
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that if a pending task in a task group
+// is killed, then the entire group will be killed.
+TEST_F(MasterAuthorizationTest, KillPendingTaskInTaskGroup)
+{
+  MockAuthorizer authorizer;
+  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Resources resources =
+    Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  ExecutorInfo executor;
+  executor.set_type(ExecutorInfo::DEFAULT);
+  executor.mutable_executor_id()->set_value("E");
+  executor.mutable_framework_id()->CopyFrom(frameworkId.get());
+  executor.mutable_resources()->CopyFrom(resources);
+
+  TaskInfo task1;
+  task1.set_name("1");
+  task1.mutable_task_id()->set_value("1");
+  task1.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task1.mutable_resources()->MergeFrom(resources);
+
+  TaskInfo task2;
+  task2.set_name("2");
+  task2.mutable_task_id()->set_value("2");
+  task2.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task2.mutable_resources()->MergeFrom(resources);
+
+  TaskGroupInfo taskGroup;
+  taskGroup.add_tasks()->CopyFrom(task1);
+  taskGroup.add_tasks()->CopyFrom(task2);
+
+  // Return a pending future from authorizer.
+  Future<Nothing> authorize1;
+  Future<Nothing> authorize2;
+  Promise<bool> promise1;
+  Promise<bool> promise2;
+  EXPECT_CALL(authorizer, authorized(_))
+    .WillOnce(DoAll(FutureSatisfy(&authorize1),
+                    Return(promise1.future())))
+    .WillOnce(DoAll(FutureSatisfy(&authorize2),
+                    Return(promise2.future())));
+
+  Future<TaskStatus> task1Status;
+  Future<TaskStatus> task2Status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&task1Status))
+    .WillOnce(FutureArg<1>(&task2Status));
+
+  Offer::Operation operation;
+  operation.set_type(Offer::Operation::LAUNCH_GROUP);
+
+  Offer::Operation::LaunchGroup* launchGroup =
+    operation.mutable_launch_group();
+
+  launchGroup->mutable_executor()->CopyFrom(executor);
+  launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+  driver.acceptOffers({offers.get()[0].id()}, {operation});
+
+  // Wait until all authorizations are in progress.
+  AWAIT_READY(authorize1);
+  AWAIT_READY(authorize2);
+
+  // Now kill task1.
+  driver.killTask(task1.task_id());
+
+  AWAIT_READY(task1Status);
+  EXPECT_EQ(TASK_KILLED, task1Status->state());
+  EXPECT_TRUE(strings::contains(
+      task1Status->message(), "Killed before delivery to the agent"));
+  EXPECT_EQ(TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
+            task1Status->reason());
+
+  Future<Nothing> recoverResources =
+    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
+
+  // Now complete authorizations for task1 and task2.
+  promise1.set(true);
+  promise2.set(true);
+
+  AWAIT_READY(task2Status);
+  EXPECT_EQ(TASK_KILLED, task2Status->state());
+  EXPECT_TRUE(strings::contains(
+      task2Status->message(),
+      "A task within the task group was killed before delivery to the agent"));
+  EXPECT_EQ(TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
+            task2Status->reason());
+
+  // No task launch should happen resulting in all resources being
+  // returned to the allocator.
+  AWAIT_READY(recoverResources);
+
+  // Make sure the task group is not known to master anymore.
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(0);
+
+  driver.reconcileTasks({});
+
+  // We settle the clock here to ensure any updates sent by the master
+  // are received. There shouldn't be any updates in this case.
+  Clock::pause();
+  Clock::settle();
+
   driver.stop();
   driver.join();
 }
 
 
 // This test verifies that a slave removal that comes before
-// '_launchTasks()' is called results in TASK_LOST.
-TEST_F(MasterAuthorizationTest, SlaveRemoved)
+// '_accept()' is called results in TASK_LOST for a framework that is
+// not partition-aware.
+TEST_F(MasterAuthorizationTest, SlaveRemovedLost)
 {
   MockAuthorizer authorizer;
   Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
@@ -323,10 +605,9 @@ TEST_F(MasterAuthorizationTest, SlaveRemoved)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
-  Future<vector<Offer> > offers;
+  Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers))
     .WillRepeatedly(Return()); // Ignore subsequent offers.
@@ -334,7 +615,7 @@ TEST_F(MasterAuthorizationTest, SlaveRemoved)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
 
@@ -373,7 +654,10 @@ TEST_F(MasterAuthorizationTest, SlaveRemoved)
 
   // Framework should get a TASK_LOST.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_LOST, status.get().state());
+
+  EXPECT_EQ(TASK_LOST, status->state());
+  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status->source());
+  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status->reason());
 
   // No task launch should happen resulting in all resources being
   // returned to the allocator.
@@ -381,21 +665,31 @@ TEST_F(MasterAuthorizationTest, SlaveRemoved)
 
   // Check metrics.
   JSON::Object stats = Metrics();
-  EXPECT_EQ(1u, stats.values.count("master/tasks_lost"));
-  EXPECT_EQ(1u, stats.values.count(
-                    "master/task_lost/source_master/reason_slave_removed"));
+  EXPECT_EQ(0u, stats.values["master/tasks_dropped"]);
   EXPECT_EQ(1u, stats.values["master/tasks_lost"]);
   EXPECT_EQ(
       1u, stats.values["master/task_lost/source_master/reason_slave_removed"]);
+
+  // Make sure the task is not known to master anymore.
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(0);
+
+  driver.reconcileTasks({});
+
+  // We settle the clock here to ensure any updates sent by the master
+  // are received. There shouldn't be any updates in this case.
+  Clock::pause();
+  Clock::settle();
 
   driver.stop();
   driver.join();
 }
 
 
-// This test verifies that a slave disconnection that comes before
-// '_launchTasks()' is called results in TASK_LOST.
-TEST_F(MasterAuthorizationTest, SlaveDisconnected)
+// This test verifies that a slave removal that comes before
+// '_accept()' is called results in TASK_DROPPED for a framework that
+// is partition-aware.
+TEST_F(MasterAuthorizationTest, SlaveRemovedDropped)
 {
   MockAuthorizer authorizer;
   Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
@@ -408,14 +702,17 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
   ASSERT_SOME(slave);
 
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.add_capabilities()->set_type(
+      FrameworkInfo::Capability::PARTITION_AWARE);
+
   MockScheduler sched;
   MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
-  Future<vector<Offer> > offers;
+  Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers))
     .WillRepeatedly(Return()); // Ignore subsequent offers.
@@ -423,7 +720,7 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
 
@@ -439,18 +736,16 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
   // Wait until authorization is in progress.
   AWAIT_READY(authorize);
 
+  Future<Nothing> slaveLost;
   EXPECT_CALL(sched, slaveLost(&driver, _))
-    .Times(AtMost(1));
+    .WillOnce(FutureSatisfy(&slaveLost));
 
-  Future<Nothing> deactivateSlave =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::deactivateSlave);
-
-  // Stop the slave with explicit shutdown message so that the master does not
-  // wait for it to reconnect.
+  // Stop the slave with explicit shutdown as otherwise with
+  // checkpointing the master will wait for the slave to reconnect.
   slave.get()->shutdown();
   slave->reset();
 
-  AWAIT_READY(deactivateSlave);
+  AWAIT_READY(slaveLost);
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
@@ -462,9 +757,12 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
   // Now complete authorization.
   promise.set(true);
 
-  // Framework should get a TASK_LOST.
+  // Framework should get a TASK_DROPPED.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_LOST, status.get().state());
+
+  EXPECT_EQ(TASK_DROPPED, status->state());
+  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status->source());
+  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status->reason());
 
   // No task launch should happen resulting in all resources being
   // returned to the allocator.
@@ -472,14 +770,22 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
 
   // Check metrics.
   JSON::Object stats = Metrics();
-  EXPECT_EQ(1u, stats.values.count("master/tasks_lost"));
-  EXPECT_EQ(1u, stats.values["master/tasks_lost"]);
-  EXPECT_EQ(1u,
-            stats.values.count(
-                "master/task_lost/source_master/reason_slave_removed"));
+  EXPECT_EQ(0u, stats.values["master/tasks_lost"]);
+  EXPECT_EQ(1u, stats.values["master/tasks_dropped"]);
   EXPECT_EQ(
       1u,
-      stats.values["master/task_lost/source_master/reason_slave_removed"]);
+      stats.values["master/task_dropped/source_master/reason_slave_removed"]);
+
+  // Make sure the task is not known to master anymore.
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(0);
+
+  driver.reconcileTasks({});
+
+  // We settle the clock here to ensure any updates sent by the master
+  // are received. There shouldn't be any updates in this case.
+  Clock::pause();
+  Clock::settle();
 
   driver.stop();
   driver.join();
@@ -487,7 +793,7 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
 
 
 // This test verifies that a framework removal that comes before
-// '_launchTasks()' is called results in recovery of resources.
+// '_accept()' is called results in recovery of resources.
 TEST_F(MasterAuthorizationTest, FrameworkRemoved)
 {
   MockAuthorizer authorizer;
@@ -505,10 +811,9 @@ TEST_F(MasterAuthorizationTest, FrameworkRemoved)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
-  Future<vector<Offer> > offers;
+  Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers))
     .WillRepeatedly(Return()); // Ignore subsequent offers.
@@ -516,7 +821,7 @@ TEST_F(MasterAuthorizationTest, FrameworkRemoved)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
 
@@ -574,7 +879,7 @@ TEST_F(MasterAuthorizationTest, PendingExecutorInfoDiffersOnDifferentSlaves)
 
   AWAIT_READY(registered);
 
-  Future<vector<Offer> > offers1;
+  Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers1));
 
@@ -588,7 +893,7 @@ TEST_F(MasterAuthorizationTest, PendingExecutorInfoDiffersOnDifferentSlaves)
   ASSERT_SOME(slave1);
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
   // Launch the first task with the default executor id.
   ExecutorInfo executor1;
@@ -599,18 +904,24 @@ TEST_F(MasterAuthorizationTest, PendingExecutorInfoDiffersOnDifferentSlaves)
       offers1.get()[0], executor1.command().value(), executor1.executor_id());
 
   // Return a pending future from authorizer.
+  // Note that we retire this expectation after its use because
+  // the authorizer will next be called when `slave2` registers and
+  // this expectation would be hit again (and be oversaturated) if
+  // we don't retire. New expectations on `authorizer` will be set
+  // after `slave2` is registered.
   Future<Nothing> authorize;
   Promise<bool> promise;
   EXPECT_CALL(authorizer, authorized(_))
     .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())));
+                    Return(promise.future())))
+    .RetiresOnSaturation();
 
   driver.launchTasks(offers1.get()[0].id(), {task1});
 
   // Wait until authorization is in progress.
   AWAIT_READY(authorize);
 
-  Future<vector<Offer> > offers2;
+  Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers2))
     .WillRepeatedly(Return()); // Ignore subsequent offers.
@@ -624,7 +935,7 @@ TEST_F(MasterAuthorizationTest, PendingExecutorInfoDiffersOnDifferentSlaves)
   ASSERT_SOME(slave2);
 
   AWAIT_READY(offers2);
-  EXPECT_NE(0u, offers2.get().size());
+  ASSERT_FALSE(offers2->empty());
 
   // Now launch the second task with the same executor id but
   // a different executor command.
@@ -635,8 +946,7 @@ TEST_F(MasterAuthorizationTest, PendingExecutorInfoDiffersOnDifferentSlaves)
   TaskInfo task2 = createTask(
       offers2.get()[0], executor2.command().value(), executor2.executor_id());
 
-  EXPECT_CALL(exec2, registered(_, _, _, _))
-    .Times(1);
+  EXPECT_CALL(exec2, registered(_, _, _, _));
 
   EXPECT_CALL(exec2, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
@@ -651,10 +961,9 @@ TEST_F(MasterAuthorizationTest, PendingExecutorInfoDiffersOnDifferentSlaves)
   driver.launchTasks(offers2.get()[0].id(), {task2});
 
   AWAIT_READY(status2);
-  ASSERT_EQ(TASK_RUNNING, status2.get().state());
+  ASSERT_EQ(TASK_RUNNING, status2->state());
 
-  EXPECT_CALL(exec1, registered(_, _, _, _))
-    .Times(1);
+  EXPECT_CALL(exec1, registered(_, _, _, _));
 
   EXPECT_CALL(exec1, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
@@ -667,7 +976,7 @@ TEST_F(MasterAuthorizationTest, PendingExecutorInfoDiffersOnDifferentSlaves)
   promise.set(true);
 
   AWAIT_READY(status1);
-  ASSERT_EQ(TASK_RUNNING, status1.get().state());
+  ASSERT_EQ(TASK_RUNNING, status1->state());
 
   EXPECT_CALL(exec1, shutdown(_))
     .Times(AtMost(1));
@@ -699,7 +1008,7 @@ TEST_F(MasterAuthorizationTest, AuthorizedRole)
   ASSERT_SOME(master);
 
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.set_role("foo");
+  frameworkInfo.set_roles(0, "foo");
 
   MockScheduler sched;
   MesosSchedulerDriver driver(
@@ -737,7 +1046,7 @@ TEST_F(MasterAuthorizationTest, UnauthorizedRole)
   ASSERT_SOME(master);
 
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.set_role("foo");
+  frameworkInfo.set_roles(0, "foo");
 
   MockScheduler sched;
   MesosSchedulerDriver driver(
@@ -828,7 +1137,7 @@ TEST_F(MasterAuthorizationTest, DuplicateRegistration)
 // This test verifies that an authentication request that comes from
 // the same instance of the framework (e.g., ZK blip) before
 // 'Master::_reregisterFramework()' from an earlier attempt, causes
-// the master to successfully re-register the framework.
+// the master to successfully reregister the framework.
 TEST_F(MasterAuthorizationTest, DuplicateReregistration)
 {
   MockAuthorizer authorizer;
@@ -995,7 +1304,7 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeReregistration)
 
   EXPECT_CALL(sched, disconnected(&driver));
 
-  // Framework should not be re-registered.
+  // Framework should not be reregistered.
   EXPECT_CALL(sched, reregistered(&driver, _))
     .Times(0);
 
@@ -1027,13 +1336,31 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeReregistration)
 
 
 template <typename T>
-class MasterAuthorizerTest : public MesosTest {};
+class MasterAuthorizerTest : public MesosTest
+{
+protected:
+  slave::Flags CreateSlaveFlags() override
+  {
+    slave::Flags flags = MesosTest::CreateSlaveFlags();
+
+#ifndef __WINDOWS__
+    // We don't need to actually launch tasks as the specified
+    // user, since we are only interested in testing the
+    // authorization path.
+    flags.switch_user = false;
+#endif
+
+    return flags;
+  }
+};
 
 
 typedef ::testing::Types<
-  LocalAuthorizer,
-  tests::Module<Authorizer, TestLocalAuthorizer>>
-  AuthorizerTypes;
+// TODO(josephw): Modules are not supported on Windows (MESOS-5994).
+#ifndef __WINDOWS__
+    tests::Module<Authorizer, TestLocalAuthorizer>,
+#endif // __WINDOWS__
+    LocalAuthorizer> AuthorizerTypes;
 
 
 TYPED_TEST_CASE(MasterAuthorizerTest, AuthorizerTypes);
@@ -1073,7 +1400,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterStateSummaryEndpoint)
 
   // Start framwork with user "bar".
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.set_role("role");
+  frameworkInfo.set_roles(0, "role");
   frameworkInfo.set_user(user);
 
   MockScheduler sched;
@@ -1096,10 +1423,9 @@ TYPED_TEST(MasterAuthorizerTest, FilterStateSummaryEndpoint)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
 
     JSON::Object stateSummary = parse.get();
@@ -1117,10 +1443,9 @@ TYPED_TEST(MasterAuthorizerTest, FilterStateSummaryEndpoint)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL_2));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
 
     JSON::Object stateSummary = parse.get();
@@ -1205,11 +1530,11 @@ TYPED_TEST(MasterAuthorizerTest, FilterStateEndpoint)
 
   // Start framwork with user "bar".
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.set_role("role");
+  frameworkInfo.set_roles(0, "role");
   frameworkInfo.set_user(user);
 
   // Create an executor with user "bar".
-  ExecutorInfo executor = CREATE_EXECUTOR_INFO("test-executor", "sleep 2");
+  ExecutorInfo executor = createExecutorInfo("test-executor", "sleep 2");
   executor.mutable_command()->set_user(user);
 
   MockExecutor exec(executor.executor_id());
@@ -1243,7 +1568,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterStateEndpoint)
   AWAIT_READY(registered);
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("test");
@@ -1263,7 +1588,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterStateEndpoint)
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  EXPECT_EQ(TASK_RUNNING, status->state());
 
   // Retrieve endpoint with the user allowed to view the framework.
   {
@@ -1273,10 +1598,9 @@ TYPED_TEST(MasterAuthorizerTest, FilterStateEndpoint)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
 
     JSON::Object state = parse.get();
@@ -1302,10 +1626,9 @@ TYPED_TEST(MasterAuthorizerTest, FilterStateEndpoint)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL_2));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
 
     JSON::Object state = parse.get();
@@ -1394,11 +1717,11 @@ TYPED_TEST(MasterAuthorizerTest, FilterFrameworksEndpoint)
 
   // Start framwork with user "bar".
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.set_role("role");
+  frameworkInfo.set_roles(0, "role");
   frameworkInfo.set_user("bar");
 
   // Create an executor with user "bar".
-  ExecutorInfo executor = CREATE_EXECUTOR_INFO("test-executor", "sleep 2");
+  ExecutorInfo executor = createExecutorInfo("test-executor", "sleep 2");
   executor.mutable_command()->set_user("bar");
 
   MockExecutor exec(executor.executor_id());
@@ -1432,7 +1755,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterFrameworksEndpoint)
   AWAIT_READY(registered);
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("test");
@@ -1452,7 +1775,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterFrameworksEndpoint)
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  EXPECT_EQ(TASK_RUNNING, status->state());
 
   // Retrieve endpoint with the user allowed to view the framework.
   {
@@ -1462,10 +1785,9 @@ TYPED_TEST(MasterAuthorizerTest, FilterFrameworksEndpoint)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
 
     JSON::Object state = parse.get();
@@ -1491,10 +1813,9 @@ TYPED_TEST(MasterAuthorizerTest, FilterFrameworksEndpoint)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL_2));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
 
     JSON::Object state = parse.get();
@@ -1585,11 +1906,11 @@ TYPED_TEST(MasterAuthorizerTest, FilterTasksEndpoint)
 
   // Start framwork with user "bar".
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.set_role("role");
+  frameworkInfo.set_roles(0, "role");
   frameworkInfo.set_user(user);
 
   // Create an executor with user "bar".
-  ExecutorInfo executor = CREATE_EXECUTOR_INFO("test-executor", "sleep 2");
+  ExecutorInfo executor = createExecutorInfo("test-executor", "sleep 2");
   executor.mutable_command()->set_user(user);
 
   MockExecutor exec(executor.executor_id());
@@ -1623,7 +1944,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterTasksEndpoint)
   AWAIT_READY(registered);
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("test");
@@ -1643,7 +1964,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterTasksEndpoint)
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  EXPECT_EQ(TASK_RUNNING, status->state());
 
   // Retrieve endpoint with the user allowed to view the framework.
   {
@@ -1653,10 +1974,9 @@ TYPED_TEST(MasterAuthorizerTest, FilterTasksEndpoint)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
 
     JSON::Object tasks = parse.get();
@@ -1673,10 +1993,9 @@ TYPED_TEST(MasterAuthorizerTest, FilterTasksEndpoint)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL_2));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
 
     JSON::Object tasks = parse.get();
@@ -1704,7 +2023,7 @@ TYPED_TEST(MasterAuthorizerTest, ViewFlags)
   }
 
   {
-    // Second default principal can not see the flags.
+    // Second default principal cannot see the flags.
     mesos::ACL::ViewFlags* acl = acls.add_view_flags();
     acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL_2.principal());
     acl->mutable_flags()->set_type(ACL::Entity::NONE);
@@ -1726,8 +2045,7 @@ TYPED_TEST(MasterAuthorizerTest, ViewFlags)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-        << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
     response = http::get(
         master.get()->pid,
@@ -1735,10 +2053,9 @@ TYPED_TEST(MasterAuthorizerTest, ViewFlags)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-        << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
     JSON::Object state = parse.get();
 
@@ -1755,8 +2072,7 @@ TYPED_TEST(MasterAuthorizerTest, ViewFlags)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL_2));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Forbidden().status, response)
-        << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Forbidden().status, response);
 
     response = http::get(
         master.get()->pid,
@@ -1764,10 +2080,9 @@ TYPED_TEST(MasterAuthorizerTest, ViewFlags)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL_2));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-        << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
     JSON::Object state = parse.get();
 
@@ -1823,10 +2138,9 @@ TYPED_TEST(MasterAuthorizerTest, FilterRolesEndpoint)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
 
     JSON::Object tasks = parse.get();
@@ -1842,23 +2156,24 @@ TYPED_TEST(MasterAuthorizerTest, FilterRolesEndpoint)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL_2));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
 
     JSON::Object tasks = parse.get();
     ASSERT_TRUE(tasks.values["roles"].is<JSON::Array>());
-    EXPECT_EQ(0u, tasks.values["roles"].as<JSON::Array>().values.size());
+    EXPECT_TRUE(tasks.values["roles"].as<JSON::Array>().values.empty());
   }
 }
 
 
 // This test verifies that authorization based endpoint filtering
-// works correctly on the /state endpoint with orphaned tasks.
-// Both default users are allowed to to view high level frameworks, but only
-// one is allowed to view the tasks.
+// works correctly on the /state endpoint with orphaned tasks.  Both
+// default users are allowed to to view high level frameworks, but
+// only one is allowed to view the tasks. Although the tasks are
+// "orphaned" (in the sense that their framework has not yet
+// reregistered), they are now reported under the "tasks" key.
 TYPED_TEST(MasterAuthorizerTest, FilterOrphanedTasks)
 {
   ACLs acls;
@@ -1951,7 +2266,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterOrphanedTasks)
   EXPECT_CALL(exec, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
 
-    // Wait until TASK_RUNNING of the task is received.
+  // Wait until TASK_RUNNING of the task is received.
   AWAIT_READY(statusUpdate);
 
   Future<SlaveReregisteredMessage> slaveReregisteredMessage =
@@ -1965,7 +2280,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterOrphanedTasks)
   // Simulate a new master detected event to the slave.
   detector.appoint(master.get()->pid);
 
-  // The framework will not re-register with the new master as the
+  // The framework will not reregister with the new master as the
   // scheduler is bound to the old master pid.
 
   AWAIT_READY(slaveReregisteredMessage);
@@ -1981,15 +2296,24 @@ TYPED_TEST(MasterAuthorizerTest, FilterOrphanedTasks)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
 
     JSON::Object tasks = parse.get();
+
+    // The "orphan_tasks" array should be empty, regardless of authorization.
     ASSERT_TRUE(tasks.values["orphan_tasks"].is<JSON::Array>());
-    EXPECT_EQ(1u, tasks.values["orphan_tasks"].as<JSON::Array>().values.size());
+    EXPECT_TRUE(tasks.values["orphan_tasks"].as<JSON::Array>().values.empty());
+
+    ASSERT_TRUE(tasks.values["frameworks"].is<JSON::Array>());
+
+    JSON::Array frameworks = tasks.values["frameworks"].as<JSON::Array>();
+    EXPECT_EQ(1u, frameworks.values.size());
+
+    JSON::Object framework = frameworks.values.front().as<JSON::Object>();
+    EXPECT_EQ(1u, framework.values["tasks"].as<JSON::Array>().values.size());
   }
 
   // Retrieve endpoint with the user allowed to view the framework,
@@ -2001,15 +2325,24 @@ TYPED_TEST(MasterAuthorizerTest, FilterOrphanedTasks)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL_2));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response.get().body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
 
     JSON::Object tasks = parse.get();
+
+    // The "orphan_tasks" array should be empty, regardless of authorization.
     ASSERT_TRUE(tasks.values["orphan_tasks"].is<JSON::Array>());
     EXPECT_TRUE(tasks.values["orphan_tasks"].as<JSON::Array>().values.empty());
+
+    ASSERT_TRUE(tasks.values["frameworks"].is<JSON::Array>());
+
+    JSON::Array frameworks = tasks.values["frameworks"].as<JSON::Array>();
+    EXPECT_EQ(1u, frameworks.values.size());
+
+    JSON::Object framework = frameworks.values.front().as<JSON::Object>();
+    EXPECT_TRUE(framework.values["tasks"].as<JSON::Array>().values.empty());
   }
 
   EXPECT_CALL(exec, shutdown(_))
@@ -2017,6 +2350,402 @@ TYPED_TEST(MasterAuthorizerTest, FilterOrphanedTasks)
 
   driver.stop();
   driver.join();
+}
+
+
+TEST_F(MasterAuthorizationTest, AuthorizedToRegisterAndReregisterAgent)
+{
+  // Set up ACLs so that the agent can (re)register.
+  ACLs acls;
+  mesos::ACL::RegisterAgent* acl = acls.add_register_agents();
+  acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+  acl->mutable_agents()->set_type(ACL::Entity::ANY);
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.acls = acls;
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Future<Message> slaveRegisteredMessage =
+    FUTURE_MESSAGE(Eq(SlaveRegisteredMessage().GetTypeName()), _, _);
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  // Simulate a recovered agent and verify that it is allowed to reregister.
+  slave->reset();
+
+  Future<Message> slaveReregisteredMessage =
+    FUTURE_MESSAGE(Eq(SlaveReregisteredMessage().GetTypeName()), _, _);
+
+  slave = StartSlave(detector.get(), slaveFlags);
+
+  AWAIT_READY(slaveReregisteredMessage);
+}
+
+
+// This test verifies that an agent without the right ACLs
+// is not allowed to register and is not shut down.
+TEST_F(MasterAuthorizationTest, UnauthorizedToRegisterAgent)
+{
+  Clock::pause();
+
+  // Set up ACLs that disallows the agent's principal to register.
+  ACLs acls;
+  mesos::ACL::RegisterAgent* acl = acls.add_register_agents();
+  acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+  acl->mutable_agents()->set_type(ACL::Entity::NONE);
+
+  master::Flags flags = CreateMasterFlags();
+  flags.acls = acls;
+
+  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  ASSERT_SOME(master);
+
+  // Previously, agents were shut down when registration failed due to
+  // authorization. We verify that this no longer occurs.
+  EXPECT_NO_FUTURE_PROTOBUFS(ShutdownMessage(), _, _);
+
+  // We verify that the agent isn't allowed to register.
+  EXPECT_NO_FUTURE_PROTOBUFS(SlaveRegisteredMessage(), _, _);
+
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    FUTURE_PROTOBUF(RegisterSlaveMessage(), _, _);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Advance the clock to trigger the registration attempt.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+
+  AWAIT_READY(registerSlaveMessage);
+
+  // Settle to make sure neither `SlaveRegisteredMessage` nor
+  // `ShutdownMessage` are sent.
+  Clock::settle();
+}
+
+
+// This test verifies that an agent authorized to register can be
+// unauthorized to reregister due to master ACL change (after failover).
+TEST_F(MasterAuthorizationTest, UnauthorizedToReregisterAgent)
+{
+  // Set up ACLs so that the agent can register.
+  ACLs acls;
+  mesos::ACL::RegisterAgent* acl = acls.add_register_agents();
+  acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+  acl->mutable_agents()->set_type(ACL::Entity::ANY);
+
+  master::Flags flags = CreateMasterFlags();
+  flags.acls = acls;
+
+  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  ASSERT_SOME(master);
+
+  // Previously, agents were shut down when registration failed due to
+  // authorization. We verify that this no longer occurs.
+  EXPECT_NO_FUTURE_PROTOBUFS(ShutdownMessage(), _, _);
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  StandaloneMasterDetector detector(master.get()->pid);
+  Try<Owned<cluster::Slave>> slave = StartSlave(&detector);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  // Master fails over.
+  master->reset();
+
+  // The new master doesn't allow this agent principal to reregister.
+  acl->mutable_agents()->set_type(ACL::Entity::NONE);
+  flags.acls = acls;
+
+  // The agent should try but not be able to reregister.
+  Future<ReregisterSlaveMessage> reregisterSlaveMessage =
+    FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
+
+  EXPECT_NO_FUTURE_PROTOBUFS(SlaveReregisteredMessage(), _, _);
+
+  master = StartMaster(flags);
+  ASSERT_SOME(master);
+
+  detector.appoint(master.get()->pid);
+
+  AWAIT_READY(reregisterSlaveMessage);
+
+  // Settle to make sure neither `SlaveReregisteredMessage` nor
+  // `ShutdownMessage` are sent.
+  Clock::pause();
+  Clock::settle();
+}
+
+
+// This test verifies that duplicate agent registration attempts are
+// ignored when the ongoing registration is pending in the authorizer.
+TEST_F(MasterAuthorizationTest, RetryRegisterAgent)
+{
+  // Use a paused clock to control agent registration retries.
+  Clock::pause();
+
+  MockAuthorizer authorizer;
+  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
+  ASSERT_SOME(master);
+
+  // Return a pending future from authorizer.
+  Future<Nothing> authorize;
+  Promise<bool> promise;
+
+  // Expect the authorizer to be called only once, i.e.,
+  // the retry is ignored.
+  EXPECT_CALL(authorizer, authorized(_))
+    .WillOnce(DoAll(FutureSatisfy(&authorize),
+                    Return(promise.future())));
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  // Trigger the first registration attempt (with authentication).
+  Clock::advance(slave::DEFAULT_REGISTRATION_BACKOFF_FACTOR);
+
+  // Wait until the authorization is in progress.
+  AWAIT_READY(authorize);
+
+  // Advance to trigger the second registration attempt.
+  Clock::advance(slave::REGISTER_RETRY_INTERVAL_MAX);
+
+  // Settle to make sure the second registration attempt is received
+  // by the master. We can verify that it's ignored if the EXPECT_CALL
+  // above doesn't oversaturate.
+  Clock::settle();
+
+  Future<Message> slaveRegisteredMessage =
+    FUTURE_MESSAGE(Eq(SlaveRegisteredMessage().GetTypeName()), _, _);
+
+  // Now authorize the agent and verify it's registered.
+  promise.set(true);
+
+  AWAIT_READY(slaveRegisteredMessage);
+}
+
+
+// This test verifies that the agent is not allowed to register if it tries to
+// statically reserve resources, but it is not allowed to.
+TEST_F(MasterAuthorizationTest, UnauthorizedToStaticallyReserveResources)
+{
+  Clock::pause();
+
+  // Set up ACLs so that the agent can (re)register.
+  ACLs acls;
+
+  {
+    mesos::ACL::RegisterAgent* acl = acls.add_register_agents();
+    acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+    acl->mutable_agents()->set_type(ACL::Entity::ANY);
+  }
+
+  // The agent cannot statically reserve resources of any role.
+  {
+    mesos::ACL::ReserveResources* acl = acls.add_reserve_resources();
+    acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+    acl->mutable_roles()->set_type(ACL::Entity::NONE);
+  }
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.acls = acls;
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  // Previously, agents were shut down when registration failed due to
+  // authorization. We verify that this no longer occurs.
+  EXPECT_NO_FUTURE_PROTOBUFS(ShutdownMessage(), _, _);
+
+  // We verify that the agent isn't allowed to register.
+  EXPECT_NO_FUTURE_PROTOBUFS(SlaveRegisteredMessage(), _, _);
+
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    FUTURE_PROTOBUF(RegisterSlaveMessage(), _, _);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags agentFlags = CreateSlaveFlags();
+  agentFlags.resources = "cpus(foo):1;mem(foo):1";
+
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), agentFlags);
+  ASSERT_SOME(agent);
+
+  // Advance the clock to trigger the registration attempt.
+  Clock::advance(agentFlags.registration_backoff_factor);
+  Clock::settle();
+
+  AWAIT_READY(registerSlaveMessage);
+
+  // Settle to make sure neither `SlaveRegisteredMessage` nor
+  // `ShutdownMessage` are sent.
+  Clock::settle();
+}
+
+
+// This test verifies that the agent is shut down by the master if it is
+// not authorized to statically reserve certain roles.
+TEST_F(MasterAuthorizationTest, UnauthorizedToStaticallyReserveRole)
+{
+  Clock::pause();
+
+  // Set up ACLs so that the agent can (re)register.
+  ACLs acls;
+
+  {
+    mesos::ACL::RegisterAgent* acl = acls.add_register_agents();
+    acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+    acl->mutable_agents()->set_type(ACL::Entity::ANY);
+  }
+
+  // Only `high-security-principal` (not the principal that the agent in
+  // this test has) can statically reserve resources for `high-security-role`.
+  {
+    mesos::ACL::ReserveResources* acl = acls.add_reserve_resources();
+    acl->mutable_principals()->add_values("high-security-principal");
+    acl->mutable_roles()->add_values("high-security-role");
+  }
+
+  // No other can statically reserve resources of this role.
+  {
+    mesos::ACL::ReserveResources* acl = acls.add_reserve_resources();
+    acl->mutable_principals()->set_type(ACL::Entity::NONE);
+    acl->mutable_roles()->add_values("high-security-role");
+  }
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.acls = acls;
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  // Previously, agents were shut down when registration failed due to
+  // authorization. We verify that this no longer occurs.
+  EXPECT_NO_FUTURE_PROTOBUFS(ShutdownMessage(), _, _);
+
+  // We verify that the agent isn't allowed to register.
+  EXPECT_NO_FUTURE_PROTOBUFS(SlaveRegisteredMessage(), _, _);
+
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    FUTURE_PROTOBUF(RegisterSlaveMessage(), _, _);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags agentFlags = CreateSlaveFlags();
+  agentFlags.resources = "cpus(high-security-role):1;mem(high-security-role):1";
+
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), agentFlags);
+  ASSERT_SOME(agent);
+
+  // Advance the clock to trigger the registration attempt.
+  Clock::advance(agentFlags.registration_backoff_factor);
+  Clock::settle();
+
+  AWAIT_READY(registerSlaveMessage);
+
+  // Settle to make sure neither `SlaveRegisteredMessage` nor
+  // `ShutdownMessage` are sent.
+  Clock::settle();
+}
+
+
+// This test verifies that the agent successfully registers while statically
+// reserving resource for a certain role when permitted in the ACLs.
+TEST_F(MasterAuthorizationTest, AuthorizedToStaticallyReserveRole)
+{
+  // Set up ACLs so that the agent can register.
+  ACLs acls;
+
+  {
+    mesos::ACL::RegisterAgent* acl = acls.add_register_agents();
+    acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+    acl->mutable_agents()->set_type(ACL::Entity::ANY);
+  }
+
+  // The agent principal is allowed to statically reserve resources of
+  // `high-security-role`.
+  {
+    mesos::ACL::ReserveResources* acl = acls.add_reserve_resources();
+    acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+    acl->mutable_roles()->add_values("high-security-role");
+  }
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.acls = acls;
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  // Start a slave with no static reservations.
+  slave::Flags agentFlags = CreateSlaveFlags();
+  agentFlags.resources = "cpus(high-security-role):1;mem(high-security-role):1";
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Future<Message> slaveRegisteredMessage =
+    FUTURE_MESSAGE(Eq(SlaveRegisteredMessage().GetTypeName()), _, _);
+
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), agentFlags);
+  ASSERT_SOME(agent);
+
+  AWAIT_READY(slaveRegisteredMessage);
+}
+
+
+// This test verifies that the agent is authorized if ACLs don't allow
+// any agents to statically reserve resources but the agent only registers
+// with unreserved resources.
+TEST_F(MasterAuthorizationTest, AuthorizedToRegisterNoStaticReservations)
+{
+  // Set up ACLs so that the agent can (re)register.
+  ACLs acls;
+
+  {
+    mesos::ACL::RegisterAgent* acl = acls.add_register_agents();
+    acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+    acl->mutable_agents()->set_type(ACL::Entity::ANY);
+  }
+
+  {
+    // No agent is allowed to statically reserve resources.
+    mesos::ACL::ReserveResources* acl = acls.add_reserve_resources();
+    acl->mutable_principals()->set_type(ACL::Entity::ANY);
+    acl->mutable_roles()->set_type(ACL::Entity::NONE);
+  }
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.acls = acls;
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  // Start a slave with no static reservations.
+  slave::Flags agentFlags = CreateSlaveFlags();
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Future<Message> slaveRegisteredMessage =
+    FUTURE_MESSAGE(Eq(SlaveRegisteredMessage().GetTypeName()), _, _);
+
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), agentFlags);
+  ASSERT_SOME(agent);
+
+  AWAIT_READY(slaveRegisteredMessage);
 }
 
 } // namespace tests {

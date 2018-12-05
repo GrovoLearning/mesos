@@ -15,15 +15,19 @@
 
 #include <boost/shared_array.hpp>
 
+#include <process/io.hpp>
+#include <process/loop.hpp>
 #include <process/network.hpp>
 #include <process/owned.hpp>
 #include <process/socket.hpp>
 
+#include <process/ssl/flags.hpp>
+
 #include <stout/os.hpp>
+#include <stout/unreachable.hpp>
 
 #ifdef USE_SSL_SOCKET
-#include "libevent_ssl_socket.hpp"
-#include "openssl.hpp"
+#include "posix/libevent/libevent_ssl_socket.hpp"
 #endif
 #include "poll_socket.hpp"
 
@@ -31,90 +35,86 @@ using std::string;
 
 namespace process {
 namespace network {
+namespace internal {
 
-Try<Socket> Socket::create(Kind kind, Option<int> s)
+Try<std::shared_ptr<SocketImpl>> SocketImpl::create(int_fd s, Kind kind)
 {
-  // If the caller passed in a file descriptor, we do
-  // not own its life cycle and must not close it.
-  bool owned = s.isNone();
-
-  if (owned) {
-    // Supported in Linux >= 2.6.27.
-#if defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
-    Try<int> fd =
-      network::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-
-    if (fd.isError()) {
-      return Error("Failed to create socket: " + fd.error());
-    }
-#else
-    Try<int> fd = network::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd.isError()) {
-      return Error("Failed to create socket: " + fd.error());
-    }
-
-    Try<Nothing> nonblock = os::nonblock(fd.get());
-    if (nonblock.isError()) {
-      os::close(fd.get());
-      return Error("Failed to create socket, nonblock: " + nonblock.error());
-    }
-
-    Try<Nothing> cloexec = os::cloexec(fd.get());
-    if (cloexec.isError()) {
-      os::close(fd.get());
-      return Error("Failed to create socket, cloexec: " + cloexec.error());
-    }
-#endif
-
-    s = fd.get();
-  }
-
   switch (kind) {
-    case POLL: {
-      Try<std::shared_ptr<Socket::Impl>> socket =
-        PollSocketImpl::create(s.get());
-      if (socket.isError()) {
-        if (owned) {
-          os::close(s.get());
-        }
-        return Error(socket.error());
-      }
-      return Socket(socket.get());
-    }
+    case Kind::POLL:
+      return PollSocketImpl::create(s);
 #ifdef USE_SSL_SOCKET
-    case SSL: {
-      Try<std::shared_ptr<Socket::Impl>> socket =
-        LibeventSSLSocketImpl::create(s.get());
-      if (socket.isError()) {
-        if (owned) {
-          os::close(s.get());
-        }
-        return Error(socket.error());
-      }
-      return Socket(socket.get());
-    }
+    case Kind::SSL:
+      return LibeventSSLSocketImpl::create(s);
 #endif
-    // By not setting a default we leverage the compiler errors when
-    // the enumeration is augmented to find all the cases we need to
-    // provide.
   }
+  UNREACHABLE();
 }
 
 
-const Socket::Kind& Socket::DEFAULT_KIND()
+Try<std::shared_ptr<SocketImpl>> SocketImpl::create(
+    Address::Family family,
+    Kind kind)
 {
-  static const Kind DEFAULT =
-#ifdef USE_SSL_SOCKET
-      network::openssl::flags().enabled ? Socket::SSL : Socket::POLL;
+  int domain = [=]() {
+    switch (family) {
+      case Address::Family::INET4: return AF_INET;
+      case Address::Family::INET6: return AF_INET6;
+#ifndef __WINDOWS__
+      case Address::Family::UNIX: return AF_UNIX;
+#endif // __WINDOWS__
+    }
+    UNREACHABLE();
+  }();
+
+  // Supported in Linux >= 2.6.27.
+#if defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
+  Try<int_fd> s =
+    network::socket(domain, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+
+  if (s.isError()) {
+    return Error("Failed to create socket: " + s.error());
+  }
 #else
-      Socket::POLL;
+  Try<int_fd> s = network::socket(domain, SOCK_STREAM, 0);
+  if (s.isError()) {
+    return Error("Failed to create socket: " + s.error());
+  }
+
+  Try<Nothing> async = io::prepare_async(s.get());
+  if (async.isError()) {
+    os::close(s.get());
+    return Error("Failed to create socket, prepare_async: " + async.error());
+  }
+
+  Try<Nothing> cloexec = os::cloexec(s.get());
+  if (cloexec.isError()) {
+    os::close(s.get());
+    return Error("Failed to create socket, cloexec: " + cloexec.error());
+  }
 #endif
 
-  return DEFAULT;
+  Try<std::shared_ptr<SocketImpl>> impl = create(s.get(), kind);
+  if (impl.isError()) {
+    os::close(s.get());
+  }
+
+  return impl;
 }
 
 
-Try<Address> Socket::Impl::address() const
+SocketImpl::Kind SocketImpl::DEFAULT_KIND()
+{
+  // NOTE: Some tests may change the OpenSSL flags and reinitialize
+  // libprocess. In non-test code, the return value should be constant.
+#ifdef USE_SSL_SOCKET
+  return network::openssl::flags().enabled ? Kind::SSL : Kind::POLL;
+#else
+  return Kind::POLL;
+#endif
+}
+
+
+Try<Address> SocketImpl::address() const
 {
   // TODO(benh): Cache this result so that we don't have to make
   // unnecessary system calls each time.
@@ -122,7 +122,7 @@ Try<Address> Socket::Impl::address() const
 }
 
 
-Try<Address> Socket::Impl::peer() const
+Try<Address> SocketImpl::peer() const
 {
   // TODO(benh): Cache this result so that we don't have to make
   // unnecessary system calls each time.
@@ -130,7 +130,7 @@ Try<Address> Socket::Impl::peer() const
 }
 
 
-Try<Address> Socket::Impl::bind(const Address& address)
+Try<Address> SocketImpl::bind(const Address& address)
 {
   Try<Nothing> bind = network::bind(get(), address);
   if (bind.isError()) {
@@ -142,107 +142,82 @@ Try<Address> Socket::Impl::bind(const Address& address)
 }
 
 
-static Future<string> _recv(
-    Socket socket,
-    const Option<ssize_t>& size,
-    Owned<string> buffer,
-    size_t chunk,
-    boost::shared_array<char> data,
-    size_t length)
+Future<string> SocketImpl::recv(const Option<ssize_t>& size)
 {
-  if (length == 0) { // EOF.
-    // Return everything we've received thus far, a subsequent receive
-    // will return an empty string.
-    return string(*buffer);
-  }
+  // Extend lifetime by holding onto a reference to ourself!
+  auto self = shared_from_this();
 
-  buffer->append(data.get(), length);
-
-  if (size.isNone()) {
-    // We've been asked just to return any data that we receive!
-    return string(*buffer);
-  } else if (size.get() < 0) {
-    // We've been asked to receive until EOF so keep receiving since
-    // according to the 'length == 0' check above we haven't reached
-    // EOF yet.
-    return socket.recv(data.get(), chunk)
-      .then(lambda::bind(&_recv,
-                         socket,
-                         size,
-                         buffer,
-                         chunk,
-                         data,
-                         lambda::_1));
-  } else if (size.get() > buffer->size()) {
-    // We've been asked to receive a particular amount of data and we
-    // haven't yet received that much data so keep receiving.
-    return socket.recv(data.get(), size.get() - buffer->size())
-      .then(lambda::bind(&_recv,
-                         socket,
-                         size,
-                         buffer,
-                         chunk,
-                         data,
-                         lambda::_1));
-  }
-
-  // We've received as much data as requested, so return that data!
-  return string(*buffer);
-}
-
-
-Future<string> Socket::Impl::recv(const Option<ssize_t>& size)
-{
   // Default chunk size to attempt to receive when nothing is
   // specified represents roughly 16 pages.
   static const size_t DEFAULT_CHUNK = 16 * os::pagesize();
 
-  size_t chunk = (size.isNone() || size.get() < 0)
+  const size_t chunk = (size.isNone() || size.get() < 0)
     ? DEFAULT_CHUNK
     : size.get();
 
-  Owned<string> buffer(new string());
   boost::shared_array<char> data(new char[chunk]);
+  string buffer;
 
-  return recv(data.get(), chunk)
-    .then(lambda::bind(&_recv,
-                       socket(),
-                       size,
-                       buffer,
-                       chunk,
-                       data,
-                       lambda::_1));
+  return loop(
+      None(),
+      [=]() {
+        return self->recv(data.get(), chunk);
+      },
+      [=](size_t length) mutable -> ControlFlow<string> {
+        if (length == 0) { // EOF.
+          // Return everything we've received thus far, a subsequent
+          // receive will return an empty string.
+          return Break(std::move(buffer));
+        }
+
+        buffer.append(data.get(), length);
+
+        if (size.isNone()) {
+          // We've been asked just to return any data that we receive!
+          return Break(std::move(buffer));
+        } else if (size.get() < 0) {
+          // We've been asked to receive until EOF so keep receiving
+          // since according to the 'length == 0' check above we
+          // haven't reached EOF yet.
+          return Continue();
+        } else if (
+            static_cast<string::size_type>(size.get()) > buffer.size()) {
+          // We've been asked to receive a particular amount of data and we
+          // haven't yet received that much data so keep receiving.
+          return Continue();
+        }
+
+        // We've received as much data as requested, so return that data!
+        return Break(std::move(buffer));
+      });
 }
 
 
-static Future<Nothing> _send(
-    Socket socket,
-    Owned<string> data,
-    size_t index,
-    size_t length)
+Future<Nothing> SocketImpl::send(const string& data)
 {
-  // Increment the index into the data.
-  index += length;
+  // Extend lifetime by holding onto a reference to ourself!
+  auto self = shared_from_this();
 
-  // Check if we've sent all of the data.
-  if (index == data->size()) {
-    return Nothing();
-  }
+  // We need to share the `index` between both lambdas below.
+  std::shared_ptr<size_t> index(new size_t(0));
 
-  // Keep sending!
-  return socket.send(data->data() + index, data->size() - index)
-    .then(lambda::bind(&_send, socket, data, index, lambda::_1));
+  // We store `data.size()` so that we won't make a copy of `data` in
+  // each lambda below since some `data` might be very big!
+  const size_t size = data.size();
+
+  return loop(
+      None(),
+      [=]() {
+        return self->send(data.data() + *index, size - *index);
+      },
+      [=](size_t length) -> ControlFlow<Nothing> {
+        if ((*index += length) != size) {
+          return Continue();
+        }
+        return Break();
+      });
 }
 
-
-Future<Nothing> Socket::Impl::send(const string& _data)
-{
-  Owned<string> data(new string(_data));
-
-  return send(data->data(), data->size())
-    .then(lambda::bind(&_send, socket(), data, 0, lambda::_1));
-}
-
-
+} // namespace internal {
 } // namespace network {
 } // namespace process {

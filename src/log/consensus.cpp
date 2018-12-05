@@ -42,10 +42,11 @@ namespace mesos {
 namespace internal {
 namespace log {
 
-static bool isRejectedPromise(const PromiseResponse& response) {
+static bool isRejectedPromise(const PromiseResponse& response)
+{
   if (response.has_type()) {
     // New format (Mesos >= 0.26).
-    return response.type() ==  PromiseResponse::REJECT;
+    return response.type() == PromiseResponse::REJECT;
   } else {
     // Old format (Mesos < 0.26).
     return !response.okay();
@@ -53,7 +54,8 @@ static bool isRejectedPromise(const PromiseResponse& response) {
 }
 
 
-static bool isRejectedWrite(const WriteResponse& response) {
+static bool isRejectedWrite(const WriteResponse& response)
+{
   if (response.has_type()) {
     // New format (Mesos >= 0.26).
     return response.type() == WriteResponse::REJECT;
@@ -80,12 +82,12 @@ public:
       responsesReceived(0),
       ignoresReceived(0) {}
 
-  virtual ~ExplicitPromiseProcess() {}
+  ~ExplicitPromiseProcess() override {}
 
   Future<PromiseResponse> future() { return promise.future(); }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // Stop when no one cares.
     promise.future().onDiscard(lambda::bind(
@@ -98,7 +100,7 @@ protected:
       .onAny(defer(self(), &Self::watched, lambda::_1));
   }
 
-  virtual void finalize()
+  void finalize() override
   {
     // This process will be terminated when we get responses from a
     // quorum of replicas. In that case, we no longer care about
@@ -130,7 +132,7 @@ private:
       .onAny(defer(self(), &Self::broadcasted, lambda::_1));
   }
 
-  void broadcasted(const Future<set<Future<PromiseResponse> > >& future)
+  void broadcasted(const Future<set<Future<PromiseResponse>>>& future)
   {
     if (!future.isReady()) {
       promise.fail(
@@ -149,7 +151,8 @@ private:
 
   void received(const PromiseResponse& response)
   {
-    if (response.has_type() && response.type() == PromiseResponse::IGNORE) {
+    if (response.has_type() && response.type() ==
+        PromiseResponse::IGNORED) {
       ignoresReceived++;
 
       // A quorum of replicas have ignored the request.
@@ -157,10 +160,10 @@ private:
         LOG(INFO) << "Aborting explicit promise request because "
                   << ignoresReceived << " ignores received";
 
-        // If the "type" is PromiseResponse::IGNORE, the rest of the
+        // If the "type" is PromiseResponse::IGNORED, the rest of the
         // fields don't matter.
         PromiseResponse result;
-        result.set_type(PromiseResponse::IGNORE);
+        result.set_type(PromiseResponse::IGNORED);
 
         promise.set(result);
         terminate(self());
@@ -214,8 +217,7 @@ private:
           // An action has already been performed in this position, we
           // need to save the action with the highest proposal number.
           if (highestAckAction.isNone() ||
-              (highestAckAction.get().performed() <
-               response.action().performed())) {
+              (highestAckAction->performed() < response.action().performed())) {
             highestAckAction = response.action();
           }
         } else {
@@ -260,7 +262,7 @@ private:
   const uint64_t position;
 
   PromiseRequest request;
-  set<Future<PromiseResponse> > responses;
+  set<Future<PromiseResponse>> responses;
   size_t responsesReceived;
   size_t ignoresReceived;
   Option<uint64_t> highestNackProposal;
@@ -284,12 +286,12 @@ public:
       responsesReceived(0),
       ignoresReceived(0) {}
 
-  virtual ~ImplicitPromiseProcess() {}
+  ~ImplicitPromiseProcess() override {}
 
   Future<PromiseResponse> future() { return promise.future(); }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // Stop when no one cares.
     promise.future().onDiscard(lambda::bind(
@@ -302,7 +304,7 @@ protected:
       .onAny(defer(self(), &Self::watched, lambda::_1));
   }
 
-  virtual void finalize()
+  void finalize() override
   {
     // This process will be terminated when we get responses from a
     // quorum of replicas. In that case, we no longer care about
@@ -333,7 +335,7 @@ private:
       .onAny(defer(self(), &Self::broadcasted, lambda::_1));
   }
 
-  void broadcasted(const Future<set<Future<PromiseResponse> > >& future)
+  void broadcasted(const Future<set<Future<PromiseResponse>>>& future)
   {
     if (!future.isReady()) {
       promise.fail(
@@ -352,7 +354,8 @@ private:
 
   void received(const PromiseResponse& response)
   {
-    if (response.has_type() && response.type() == PromiseResponse::IGNORE) {
+    if (response.has_type() && response.type() ==
+        PromiseResponse::IGNORED) {
       ignoresReceived++;
 
       // A quorum of replicas have ignored the request.
@@ -360,10 +363,10 @@ private:
         LOG(INFO) << "Aborting implicit promise request because "
                   << ignoresReceived << " ignores received";
 
-        // If the "type" is PromiseResponse::IGNORE, the rest of the
+        // If the "type" is PromiseResponse::IGNORED, the rest of the
         // fields don't matter.
         PromiseResponse result;
-        result.set_type(PromiseResponse::IGNORE);
+        result.set_type(PromiseResponse::IGNORED);
 
         promise.set(result);
         terminate(self());
@@ -422,7 +425,7 @@ private:
   const uint64_t proposal;
 
   PromiseRequest request;
-  set<Future<PromiseResponse> > responses;
+  set<Future<PromiseResponse>> responses;
   size_t responsesReceived;
   size_t ignoresReceived;
   Option<uint64_t> highestNackProposal;
@@ -448,12 +451,12 @@ public:
       responsesReceived(0),
       ignoresReceived(0) {}
 
-  virtual ~WriteProcess() {}
+  ~WriteProcess() override {}
 
   Future<WriteResponse> future() { return promise.future(); }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // Stop when no one cares.
     promise.future().onDiscard(lambda::bind(
@@ -466,7 +469,7 @@ protected:
       .onAny(defer(self(), &Self::watched, lambda::_1));
   }
 
-  virtual void finalize()
+  void finalize() override
   {
     // This process will be terminated when we get responses from a
     // quorum of replicas. In that case, we no longer care about
@@ -515,7 +518,7 @@ private:
       .onAny(defer(self(), &Self::broadcasted, lambda::_1));
   }
 
-  void broadcasted(const Future<set<Future<WriteResponse> > >& future)
+  void broadcasted(const Future<set<Future<WriteResponse>>>& future)
   {
     if (!future.isReady()) {
       promise.fail(
@@ -536,17 +539,18 @@ private:
   {
     CHECK_EQ(response.position(), request.position());
 
-    if (response.has_type() && response.type() == WriteResponse::IGNORE) {
+    if (response.has_type() && response.type() ==
+        WriteResponse::IGNORED) {
       ignoresReceived++;
 
       if (ignoresReceived >= quorum) {
         LOG(INFO) << "Aborting write request because "
                   << ignoresReceived << " ignores received";
 
-        // If the "type" is WriteResponse::IGNORE, the rest of the
+        // If the "type" is WriteResponse::IGNORED, the rest of the
         // fields don't matter.
         WriteResponse result;
-        result.set_type(WriteResponse::IGNORE);
+        result.set_type(WriteResponse::IGNORED);
 
         promise.set(result);
         terminate(self());
@@ -593,7 +597,7 @@ private:
   const Action action;
 
   WriteRequest request;
-  set<Future<WriteResponse> > responses;
+  set<Future<WriteResponse>> responses;
   size_t responsesReceived;
   size_t ignoresReceived;
   Option<uint64_t> highestNackProposal;
@@ -616,12 +620,12 @@ public:
       position(_position),
       proposal(_proposal) {}
 
-  virtual ~FillProcess() {}
+  ~FillProcess() override {}
 
   Future<Action> future() { return promise.future(); }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // Stop when no one cares.
     promise.future().onDiscard(lambda::bind(
@@ -630,7 +634,7 @@ protected:
     runPromisePhase();
   }
 
-  virtual void finalize()
+  void finalize() override
   {
     // Discard the futures we're waiting for.
     promising.discard();
@@ -764,7 +768,7 @@ private:
     static const Duration T = Milliseconds(100);
 
     // Bump the proposal number.
-    CHECK(highestNackProposal >= proposal);
+    CHECK_GE(highestNackProposal, proposal);
     proposal = highestNackProposal + 1;
 
     // Randomized back-off. Generate a random delay in [T, 2T). T has

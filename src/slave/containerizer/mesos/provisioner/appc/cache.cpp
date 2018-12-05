@@ -80,24 +80,27 @@ Try<Nothing> Cache::recover()
 
 Try<Nothing> Cache::add(const string& imageId)
 {
-  const Path imageDir(paths::getImagePath(storeDir, imageId));
+  const string path = spec::getImageManifestPath(
+      paths::getImagePath(storeDir, imageId));
 
-  Try<string> read = os::read(spec::getImageManifestPath(imageDir));
+  Try<string> read = os::read(path);
   if (read.isError()) {
-    return Error("Failed to read manifest: " + read.error());
+    return Error(
+        "Failed to read manifest from '" + path + "': " + read.error());
   }
 
   Try<spec::ImageManifest> manifest = spec::parse(read.get());
   if (manifest.isError()) {
-    return Error("Failed to parse manifest: " + manifest.error());
+    return Error(
+        "Failed to parse manifest from '" + path + "': " + manifest.error());
   }
 
   map<string, string> labels;
-  foreach (const spec::ImageManifest::Label& label, manifest.get().labels()) {
+  foreach (const spec::ImageManifest::Label& label, manifest->labels()) {
     labels.insert({label.name(), label.value()});
   }
 
-  imageIds.put(Key(manifest.get().name(), labels), imageId);
+  imageIds.put(Key(manifest->name(), labels), imageId);
 
   VLOG(1) << "Added image with id '" << imageId << "' to cache";
 
@@ -135,7 +138,7 @@ Cache::Key::Key(const Image::Appc& image)
 
 Cache::Key::Key(
     const string& _name,
-    const map<string, std::string> _labels)
+    const map<string, string>& _labels)
   : name(_name),
     labels(_labels) {}
 
@@ -146,18 +149,8 @@ bool Cache::Key::operator==(const Cache::Key& other) const
     return false;
   }
 
-  foreachpair (const string& name, const string& value, other.labels) {
-    map<string, string>::const_iterator itr = labels.find(name);
-    if ((itr == labels.end()) || (labels.at(name) != value)) {
-      return false;
-    }
-  }
-
-  foreachpair (const string& name, const string& value, labels) {
-    map<string, string>::const_iterator itr = other.labels.find(name);
-    if ((itr == other.labels.end()) || (other.labels.at(name) != value)) {
-      return false;
-    }
+  if (labels != other.labels) {
+    return false;
   }
 
   return true;
@@ -169,11 +162,7 @@ size_t Cache::KeyHasher::operator()(const Cache::Key& key) const
   size_t seed = 0;
 
   boost::hash_combine(seed, key.name);
-
-  foreachpair (const string& name, const string& value, key.labels) {
-    boost::hash_combine(seed, name);
-    boost::hash_combine(seed, value);
-  }
+  boost::hash_combine(seed, key.labels);
 
   return seed;
 }

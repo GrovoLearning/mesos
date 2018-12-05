@@ -19,6 +19,10 @@
 
 #include <stout/subcommand.hpp>
 
+namespace mesos {
+namespace internal {
+namespace tests {
+
 class SetnsTestHelper : public Subcommand
 {
 public:
@@ -27,7 +31,11 @@ public:
   SetnsTestHelper() : Subcommand(NAME) {}
 
 protected:
-  virtual int execute();
+  int execute() override;
 };
+
+} // namespace tests {
+} // namespace internal {
+} // namespace mesos {
 
 #endif // __SETNS_TEST_HELPER_HPP__

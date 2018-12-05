@@ -20,14 +20,16 @@
 // TODO(benh): Eventually move and associate this code with the
 // libprocess protobuf code rather than keep it here.
 
-#include <list>
+#include <deque>
 #include <set>
 #include <string>
+#include <vector>
 
 #include <mesos/zookeeper/group.hpp>
 
 #include <process/collect.hpp>
 #include <process/executor.hpp>
+#include <process/id.hpp>
 #include <process/protobuf.hpp>
 
 #include <stout/duration.hpp>
@@ -83,7 +85,7 @@ public:
   // Sends a request to each member of the network and returns a set
   // of futures that represent their responses.
   template <typename Req, typename Res>
-  process::Future<std::set<process::Future<Res> > > broadcast(
+  process::Future<std::set<process::Future<Res>>> broadcast(
       const Protocol<Req, Res>& protocol,
       const Req& req,
       const std::set<process::UPID>& filter = std::set<process::UPID>()) const;
@@ -125,14 +127,14 @@ private:
   void watch(const std::set<zookeeper::Group::Membership>& expected);
 
   // Invoked when the group memberships have changed.
-  void watched(const process::Future<std::set<zookeeper::Group::Membership> >&);
+  void watched(const process::Future<std::set<zookeeper::Group::Membership>>&);
 
   // Invoked when group members data has been collected.
   void collected(
-      const process::Future<std::list<Option<std::string> > >& datas);
+      const process::Future<std::vector<Option<std::string>>>& datas);
 
   zookeeper::Group group;
-  process::Future<std::set<zookeeper::Group::Membership> > memberships;
+  process::Future<std::set<zookeeper::Group::Membership>> memberships;
 
   // The set of PIDs that are always in the network.
   std::set<process::UPID> base;
@@ -147,9 +149,10 @@ private:
 class NetworkProcess : public ProtobufProcess<NetworkProcess>
 {
 public:
-  NetworkProcess() {}
+  NetworkProcess() : ProcessBase(process::ID::generate("log-network")) {}
 
   explicit NetworkProcess(const std::set<process::UPID>& pids)
+    : ProcessBase(process::ID::generate("log-network"))
   {
     set(pids);
   }
@@ -214,15 +217,15 @@ public:
     return watch->promise.future();
   }
 
-  // Sends a request to each of the groups members and returns a set
+  // Sends a request to each of the group members and returns a set
   // of futures that represent their responses.
   template <typename Req, typename Res>
-  std::set<process::Future<Res> > broadcast(
+  std::set<process::Future<Res>> broadcast(
       const Protocol<Req, Res>& protocol,
       const Req& req,
       const std::set<process::UPID>& filter)
   {
-    std::set<process::Future<Res> > futures;
+    std::set<process::Future<Res>> futures;
     typename std::set<process::UPID>::const_iterator iterator;
     for (iterator = pids.begin(); iterator != pids.end(); ++iterator) {
       const process::UPID& pid = *iterator;
@@ -233,6 +236,7 @@ public:
     return futures;
   }
 
+  // Sends a request to each of the group members without expecting responses.
   template <typename M>
   Nothing broadcast(
       const M& m,
@@ -242,14 +246,17 @@ public:
     for (iterator = pids.begin(); iterator != pids.end(); ++iterator) {
       const process::UPID& pid = *iterator;
       if (filter.count(pid) == 0) {
-        process::post(pid, m);
+        // NOTE: Just send this message as the network process itself
+        // since we don't need to deliver responses back to the caller.
+        // Incoming messages addressed to the network are simply dropped.
+        send(pid, m);
       }
     }
     return Nothing();
   }
 
 protected:
-  virtual void finalize()
+  void finalize() override
   {
     foreach (Watch* watch, watches) {
       watch->promise.fail("Network is being terminated");
@@ -314,7 +321,7 @@ private:
   }
 
   std::set<process::UPID> pids;
-  std::list<Watch*> watches;
+  std::deque<Watch*> watches;
 };
 
 
@@ -366,7 +373,7 @@ inline process::Future<size_t> Network::watch(
 
 
 template <typename Req, typename Res>
-process::Future<std::set<process::Future<Res> > > Network::broadcast(
+process::Future<std::set<process::Future<Res>>> Network::broadcast(
     const Protocol<Req, Res>& protocol,
     const Req& req,
     const std::set<process::UPID>& filter) const
@@ -415,7 +422,7 @@ inline void ZooKeeperNetwork::watch(
 
 
 inline void ZooKeeperNetwork::watched(
-    const process::Future<std::set<zookeeper::Group::Membership> >&)
+    const process::Future<std::set<zookeeper::Group::Membership>>&)
 {
   if (memberships.isFailed()) {
     // We can't do much here, we could try creating another Group but
@@ -430,7 +437,7 @@ inline void ZooKeeperNetwork::watched(
   LOG(INFO) << "ZooKeeper group memberships changed";
 
   // Get data for each membership in order to convert them to PIDs.
-  std::list<process::Future<Option<std::string> > > futures;
+  std::vector<process::Future<Option<std::string>>> futures;
 
   foreach (const zookeeper::Group::Membership& membership, memberships.get()) {
     futures.push_back(group.data(membership));
@@ -438,7 +445,7 @@ inline void ZooKeeperNetwork::watched(
 
   process::collect(futures)
     .after(Seconds(5),
-           [](process::Future<std::list<Option<std::string>>> datas) {
+           [](process::Future<std::vector<Option<std::string>>> datas) {
              // Handling time outs when collecting membership
              // data. For now, a timeout is treated as a failure.
              datas.discard();
@@ -449,7 +456,7 @@ inline void ZooKeeperNetwork::watched(
 
 
 inline void ZooKeeperNetwork::collected(
-    const process::Future<std::list<Option<std::string> > >& datas)
+    const process::Future<std::vector<Option<std::string>>>& datas)
 {
   if (datas.isFailed()) {
     LOG(WARNING) << "Failed to get data for ZooKeeper group members: "

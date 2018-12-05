@@ -13,7 +13,9 @@
 #ifndef __PROCESS_METRICS_METRICS_HPP__
 #define __PROCESS_METRICS_METRICS_HPP__
 
+#include <map>
 #include <string>
+#include <vector>
 
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
@@ -23,32 +25,27 @@
 
 #include <process/metrics/metric.hpp>
 
-#include <stout/hashmap.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
 
 namespace process {
 namespace metrics {
-
-// Initializes the metrics library.
-void initialize(const Option<std::string>& authenticationRealm = None());
-
 namespace internal {
 
 class MetricsProcess : public Process<MetricsProcess>
 {
 public:
-  static MetricsProcess* instance();
+  static MetricsProcess* create(const Option<std::string>& authenticationRealm);
 
   Future<Nothing> add(Owned<Metric> metric);
 
   Future<Nothing> remove(const std::string& name);
 
-  Future<hashmap<std::string, double>> snapshot(
+  Future<std::map<std::string, double>> snapshot(
       const Option<Duration>& timeout);
 
 protected:
-  virtual void initialize();
+  void initialize() override;
 
 private:
   static std::string help();
@@ -67,29 +64,29 @@ private:
 
   Future<http::Response> _snapshot(
       const http::Request& request,
-      const Option<std::string>& /* principal */);
+      const Option<http::authentication::Principal>&);
 
-  static std::list<Future<double>> _snapshotTimeout(
-      const std::list<Future<double>>& futures);
-
-  static Future<hashmap<std::string, double>> __snapshot(
+  // TODO(bmahler): Make this static once we can move
+  // capture with C++14.
+  Future<std::map<std::string, double>> __snapshot(
       const Option<Duration>& timeout,
-      const hashmap<std::string, Future<double>>& metrics,
-      const hashmap<std::string, Option<Statistics<double>>>& statistics);
+      std::vector<std::string>&& keys,
+      std::vector<Future<double>>&& metrics,
+      std::vector<Option<Statistics<double>>>&& statistics);
 
   // The Owned<Metric> is an explicit copy of the Metric passed to 'add'.
-  hashmap<std::string, Owned<Metric>> metrics;
+  std::map<std::string, Owned<Metric>> metrics;
 
   // Used to rate limit the snapshot endpoint.
   Option<Owned<RateLimiter>> limiter;
 
-  // Needed for access to the private constructor.
-  friend void process::metrics::initialize(
-      const Option<std::string>& authenticationRealm);
-
   // The authentication realm that metrics HTTP endpoints are installed into.
   const Option<std::string> authenticationRealm;
 };
+
+
+// Global metrics process. Defined in process.cpp.
+extern PID<MetricsProcess> metrics;
 
 }  // namespace internal {
 
@@ -97,10 +94,13 @@ private:
 template <typename T>
 Future<Nothing> add(const T& metric)
 {
+  // The metrics process is instantiated in `process::initialize`.
+  process::initialize();
+
   // There is an explicit copy in this call to ensure we end up owning
   // the last copy of a Metric when we remove it.
   return dispatch(
-      internal::MetricsProcess::instance(),
+      internal::metrics,
       &internal::MetricsProcess::add,
       Owned<Metric>(new T(metric)));
 }
@@ -108,18 +108,24 @@ Future<Nothing> add(const T& metric)
 
 inline Future<Nothing> remove(const Metric& metric)
 {
+  // The metrics process is instantiated in `process::initialize`.
+  process::initialize();
+
   return dispatch(
-      internal::MetricsProcess::instance(),
+      internal::metrics,
       &internal::MetricsProcess::remove,
       metric.name());
 }
 
 
-inline Future<hashmap<std::string, double>> snapshot(
+inline Future<std::map<std::string, double>> snapshot(
     const Option<Duration>& timeout)
 {
+  // The metrics process is instantiated in `process::initialize`.
+  process::initialize();
+
   return dispatch(
-      internal::MetricsProcess::instance(),
+      internal::metrics,
       &internal::MetricsProcess::snapshot,
       timeout);
 }

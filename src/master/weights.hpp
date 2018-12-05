@@ -41,22 +41,19 @@ namespace weights {
 // will render the operation hanging (i.e. `Future` for the operation
 // will not be set).
 
-// The `strict` flag is not relevant for weights update operations: they will
-// always succeed, even if the flag is set to `true`.
-
 /**
  * Updates weights for the specified roles. No assumptions are made here:
  * the roles may be unknown to the master, or weights can be already set
  * for the roles. If there are no weights stored for the roles, some new
  * entries are created, otherwise the existing entries are updated.
  */
-class UpdateWeights : public Operation
+class UpdateWeights : public RegistryOperation
 {
 public:
   explicit UpdateWeights(const std::vector<WeightInfo>& _weightInfos);
 
 protected:
-  Try<bool> perform(Registry* registry, hashset<SlaveID>*, bool);
+  Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs) override;
 
 private:
   const std::vector<WeightInfo> weightInfos;

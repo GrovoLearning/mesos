@@ -15,6 +15,7 @@
 
 #include <memory> // TODO(benh): Replace shared_ptr with unique_ptr.
 
+#include <process/id.hpp>
 #include <process/process.hpp>
 
 #include <stout/lambda.hpp>
@@ -30,13 +31,14 @@ class ThunkProcess : public Process<ThunkProcess<R>>
 public:
   ThunkProcess(std::shared_ptr<lambda::function<R()>> _thunk,
                std::shared_ptr<Promise<R>> _promise)
-    : thunk(_thunk),
+    : ProcessBase(ID::generate("__thunk__")),
+      thunk(_thunk),
       promise(_promise) {}
 
-  virtual ~ThunkProcess() {}
+  ~ThunkProcess() override {}
 
 protected:
-  virtual void serve(const Event& event)
+  void serve(Event&& event) override
   {
     promise->set((*thunk)());
   }
@@ -85,7 +87,7 @@ Future<R> run(R (*method)())
     return future;                                                      \
   }
 
-  REPEAT_FROM_TO(1, 11, TEMPLATE, _) // Args A0 -> A9.
+  REPEAT_FROM_TO(1, 13, TEMPLATE, _) // Args A0 -> A11.
 #undef TEMPLATE
 
 } // namespace process {

@@ -41,41 +41,48 @@ using std::endl;
 using std::string;
 
 
-int main(int argc, char** argv)
+class Flags : public virtual flags::FlagsBase
 {
-  flags::FlagsBase flags;
-  flags.setUsageMessage("Usage: " + Path(argv[0]).basename() + " <master>");
+public:
+  Flags()
+  {
+    add(&Flags::timeout,
+        "timeout",
+        "How long to wait to resolve master",
+        Seconds(5));
+
+    add(&Flags::verbose, "verbose", "Be verbose", false);
+  }
 
   Duration timeout;
-  flags.add(&timeout,
-            "timeout",
-            "How long to wait to resolve master",
-            Seconds(5));
 
   // TODO(marco): `verbose` is also a great candidate for FlagsBase.
   bool verbose;
-  flags.add(&verbose,
-            "verbose",
-            "Be verbose",
-            false);
+};
+
+
+int main(int argc, char** argv)
+{
+  Flags flags;
+  flags.setUsageMessage("Usage: " + Path(argv[0]).basename() + " <master>");
 
   // Load flags from environment and command line, and remove
   // them from argv.
   Try<flags::Warnings> load = flags.load(None(), &argc, &argv);
-
-  if (load.isError()) {
-    cerr << flags.usage(load.error()) << endl;
-    return EXIT_FAILURE;
-  }
 
   if (flags.help) {
     cout << flags.usage() << endl;
     return EXIT_SUCCESS;
   }
 
+  if (load.isError()) {
+    cerr << flags.usage(load.error()) << endl;
+    return EXIT_FAILURE;
+  }
+
   // Log any flag warnings.
   foreach (const flags::Warning& warning, load->warnings) {
-    LOG(WARNING) << warning.message;
+    cerr << warning.message << endl;
   }
 
   // 'master' argument must be the only argument left after parsing.
@@ -93,11 +100,11 @@ int main(int argc, char** argv)
     return EXIT_FAILURE;
   }
 
-  Future<Option<MasterInfo> > masterInfo = detector.get()->detect();
+  Future<Option<MasterInfo>> masterInfo = detector.get()->detect();
 
-  if (!masterInfo.await(timeout)) {
+  if (!masterInfo.await(flags.timeout)) {
     cerr << "Failed to detect master from '" << master
-         << "' within " << timeout << endl;
+         << "' within " << flags.timeout << endl;
     return -1;
   } else {
     CHECK(!masterInfo.isDiscarded());
@@ -111,7 +118,7 @@ int main(int argc, char** argv)
 
   // The future is not satisfied unless the result is Some.
   CHECK_SOME(masterInfo.get());
-  cout << strings::remove(masterInfo.get().get().pid(), "master@") << endl;
+  cout << strings::remove(masterInfo->get().pid(), "master@") << endl;
 
   return EXIT_SUCCESS;
 }

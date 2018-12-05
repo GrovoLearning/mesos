@@ -9,8 +9,10 @@ Mesos User Groups (MUGs) are responsible for organizing local meetups, hackathon
 
 ## Local Groups
 
+### Belgium
+* [Belgian Mesos User Group](https://www.meetup.com/Belgian-Mesos-User-Group/)
+
 ### China
-* [Beijing](http://www.meetup.com/Beijing-Mesos-User-Group/)
 * [Shanghai](http://www.weibo.com/u/3068800961)
 * [Shenzhen](http://www.meetup.com/Shenzhen-Mesos-User-Group/)
 * [Xian](http://www.meetup.com/Xian-Mesos-User-Group/)
@@ -23,26 +25,25 @@ Mesos User Groups (MUGs) are responsible for organizing local meetups, hackathon
 * [Cologne](http://www.meetup.com/Mesos-User-Group-Cologne/)
 * [Hamburg](http://www.meetup.com/Hamburg-Mesos-User-Group/)
 
-### Greece
-* [Athens](http://www.meetup.com/Hellenic-Mesos-User-Group/)
-
 ### India
 * [Bangalore](http://www.meetup.com/Bangalore-Mesos-User-Group/)
 * [Pune](http://www.meetup.com/Pune-Mesos-Users-Group/)
 
-### Poland
-* [Warsaw](http://www.meetup.com/Warsaw-Mesos-User-Group/)
+### Japan
+* [Tokyo](https://mesos.connpass.com/)
 
 ### Netherlands
+* [Dutch Mesos User Group](https://www.meetup.com/Dutch-Mesos-User-Group/)
 * [Amsterdam](http://www.meetup.com/Mesos-Amsterdam/)
+
+### Poland
+* [Warsaw](http://www.meetup.com/Warsaw-Mesos-User-Group/)
 
 ### United Kingdom
 * [London](http://www.meetup.com/London-Mesos-User-Group/)
 
 ### USA
-* [Albany, NY](http://www.meetup.com/Apache-Mesos-Albany-NY-Meetup/)
 * [Atlanta, GA](http://www.meetup.com/mesosatl/)
-* [Austin, TX](http://www.meetup.com/Austin-Mesos-Users-Group/)
 * [Dallas, TX](http://www.meetup.com/Metroplex-Mesos-Group/)
 * [Denver, CO](http://www.meetup.com/Denver-Mesos-User-Group/)
 * [Los Angeles / Santa Monica, CA](http://www.meetup.com/Los-Angeles-Santa-Monica-Mesos-Users-Group/)

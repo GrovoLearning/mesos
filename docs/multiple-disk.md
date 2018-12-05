@@ -41,21 +41,19 @@ the agent. Data is mapped into the `work_dir` of the agent.
 
 An example resources value for a root disk is shown below. Note that the
 operator could optionally specify a `role` for the disk, which would result in
-[statically reserving](reservations.md) the disk for a single [role](roles.md).
+[statically reserving](reservation.md) the disk for a single [role](roles.md).
 
-        {
-          "resources" : [
-            {
-              "name" : "disk",
-              "type" : "SCALAR",
-              "scalar" : { "value" : 2048 }
-            }
-          ]
-        }
+        [
+          {
+            "name" : "disk",
+            "type" : "SCALAR",
+            "scalar" : { "value" : 2048 }
+          }
+        ]
 
 ### `Path` disks
 
-A `Path` disk is an auxiliary disk resource provided by the operator. This can
+A `Path` disk is an auxiliary disk resource provided by the operator. This
 can be carved up into smaller chunks by creating persistent volumes that use
 less than the total available space on the disk. Common uses for this kind of
 disk are extra logging space, file archives or caches, or other non
@@ -75,23 +73,21 @@ most 10GB of disk space in total.
 
 An example resources value for a `Path` disk is shown below. Note that the
 operator could optionally specify a `role` for the disk, which would result in
-[statically reserving](reservations.md) the disk for a single [role](roles.md).
+[statically reserving](reservation.md) the disk for a single [role](roles.md).
 
-        {
-          "resources" : [
-            {
-              "name" : "disk",
-              "type" : "SCALAR",
-              "scalar" : { "value" : 2048 },
-              "disk" : {
-                "source" : {
-                  "type" : "PATH",
-                  "path" : { "root" : "/mnt/data" }
-                }
+        [
+          {
+            "name" : "disk",
+            "type" : "SCALAR",
+            "scalar" : { "value" : 2048 },
+            "disk" : {
+              "source" : {
+                "type" : "PATH",
+                "path" : { "root" : "/mnt/data" }
               }
             }
-          ]
-        }
+          }
+        ]
 
 ### `Mount` disks
 
@@ -115,23 +111,21 @@ isolation is disabled for `Mount` disks.
 
 An example resources value for a `Mount` disk is shown below. Note that the
 operator could optionally specify a `role` for the disk, which would result in
-[statically reserving](reservations.md) the disk for a single [role](roles.md).
+[statically reserving](reservation.md) the disk for a single [role](roles.md).
 
-        {
-          "resources" : [
-            {
-              "name" : "disk",
-              "type" : "SCALAR",
-              "scalar" : { "value" : 2048 },
-              "disk" : {
-                "source" : {
-                  "type" : "MOUNT",
-                  "mount" : { "root" : "/mnt/data" }
-                }
+        [
+          {
+            "name" : "disk",
+            "type" : "SCALAR",
+            "scalar" : { "value" : 2048 },
+            "disk" : {
+              "source" : {
+                "type" : "MOUNT",
+                "mount" : { "root" : "/mnt/data" }
               }
             }
-          ]
-        }
+          }
+        ]
 
 #### `Block` disks
 

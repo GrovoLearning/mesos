@@ -19,8 +19,11 @@
 
 #include <stdint.h>
 
+#include <mesos/mesos.hpp>
+
 #include <stout/bytes.hpp>
 #include <stout/duration.hpp>
+#include <stout/version.hpp>
 
 namespace mesos {
 namespace internal {
@@ -44,6 +47,14 @@ constexpr double MIN_CPUS = 0.01;
 // Minimum amount of memory per offer.
 constexpr Bytes MIN_MEM = Megabytes(32);
 
+// Default timeout for v0 framework and agent authentication
+// before the master cancels an in-progress authentication.
+//
+// TODO(bmahler): Ideally, we remove this v0-style authentication
+// in favor of just using HTTP authentication at the libprocess
+// layer.
+constexpr Duration DEFAULT_AUTHENTICATION_V0_TIMEOUT = Seconds(15);
+
 // Default interval the master uses to send heartbeats to an HTTP
 // scheduler.
 constexpr Duration DEFAULT_HEARTBEAT_INTERVAL = Seconds(15);
@@ -60,8 +71,10 @@ constexpr Duration DEFAULT_AGENT_PING_TIMEOUT = Seconds(15);
 constexpr size_t DEFAULT_MAX_AGENT_PING_TIMEOUTS = 5;
 
 // The minimum timeout that can be used by a newly elected leader to
-// allow re-registration of slaves. Any slaves that do not re-register
-// within this timeout will be shutdown.
+// allow re-registration of slaves. Any slaves that do not reregister
+// within this timeout will be marked unreachable; if/when the agent
+// reregisters, non-partition-aware tasks running on the agent will
+// be terminated.
 constexpr Duration MIN_AGENT_REREGISTER_TIMEOUT = Minutes(10);
 
 // Default limit on the percentage of slaves that will be removed
@@ -85,11 +98,21 @@ constexpr size_t DEFAULT_MAX_COMPLETED_FRAMEWORKS = 50;
 // to store in the cache.
 constexpr size_t DEFAULT_MAX_COMPLETED_TASKS_PER_FRAMEWORK = 1000;
 
+// Default maximum number of unreachable tasks per framework
+// to store in the cache.
+constexpr size_t DEFAULT_MAX_UNREACHABLE_TASKS_PER_FRAMEWORK = 1000;
+
 // Time interval to check for updated watchers list.
 constexpr Duration WHITELIST_WATCH_INTERVAL = Seconds(5);
 
 // Default number of tasks (limit) for /master/tasks endpoint.
 constexpr size_t TASK_LIMIT = 100;
+
+constexpr Duration DEFAULT_REGISTRY_GC_INTERVAL = Minutes(15);
+
+constexpr Duration DEFAULT_REGISTRY_MAX_AGENT_AGE = Weeks(2);
+
+constexpr size_t DEFAULT_REGISTRY_MAX_AGENT_COUNT = 100 * 1024;
 
 /**
  * Label used by the Leader Contender and Detector.
@@ -112,8 +135,8 @@ constexpr Duration ZOOKEEPER_SESSION_TIMEOUT = Seconds(10);
 // Name of the default, CRAM-MD5 authenticator.
 constexpr char DEFAULT_AUTHENTICATOR[] = "crammd5";
 
-// Name of the default, HierarchicalDRF authenticator.
-constexpr char DEFAULT_ALLOCATOR[] = "HierarchicalDRF";
+// Name of the default hierarchical allocator.
+constexpr char DEFAULT_ALLOCATOR[] = "hierarchical";
 
 // The default interval between allocations.
 constexpr Duration DEFAULT_ALLOCATION_INTERVAL = Seconds(1);
@@ -132,6 +155,11 @@ constexpr char READWRITE_HTTP_AUTHENTICATION_REALM[] =
 // Name of the default authentication realm for HTTP frameworks.
 constexpr char DEFAULT_HTTP_FRAMEWORK_AUTHENTICATION_REALM[] =
   "mesos-master-scheduler";
+
+// Agents older than this version are not allowed to register.
+const Version MINIMUM_AGENT_VERSION = Version(1, 0, 0);
+
+std::vector<MasterInfo::Capability> MASTER_CAPABILITIES();
 
 } // namespace master {
 } // namespace internal {

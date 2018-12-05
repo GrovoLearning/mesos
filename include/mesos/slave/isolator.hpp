@@ -17,13 +17,12 @@
 #ifndef __MESOS_SLAVE_ISOLATOR_HPP__
 #define __MESOS_SLAVE_ISOLATOR_HPP__
 
-#include <list>
 #include <string>
+#include <vector>
 
 #include <mesos/resources.hpp>
 
-// ONLY USEFUL AFTER RUNNING PROTOC.
-#include <mesos/slave/isolator.pb.h>
+#include <mesos/slave/containerizer.hpp>
 
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
@@ -42,11 +41,24 @@ class Isolator
 public:
   virtual ~Isolator() {}
 
+  // Returns true if this isolator supports nested containers. This
+  // method is designed to allow isolators to opt-in to support nested
+  // containers.
+  virtual bool supportsNesting()
+  {
+    return false;
+  }
+
+  virtual bool supportsStandalone()
+  {
+    return false;
+  }
+
   // Recover containers from the run states and the orphan containers
   // (known to the launcher but not known to the slave) detected by
   // the launcher.
   virtual process::Future<Nothing> recover(
-      const std::list<ContainerState>& states,
+      const std::vector<ContainerState>& states,
       const hashset<ContainerID>& orphans)
   {
     return Nothing();
@@ -103,10 +115,16 @@ public:
       const ContainerID& containerId)
   {
     return ContainerStatus();
-  };
+  }
 
   // Clean up a terminated container. This is called after the
   // executor and all processes in the container have terminated.
+  // It's likely that isolator `cleanup` is called for an unknown
+  // container (see MESOS-6059). Therefore, the isolator should ignore
+  // the cleanup is the container is unknown to it. In any case, the
+  // `cleanup` won't be called multiple times for a container. Also,
+  // if `prepare` is called, the cleanup is guaranteed to be called
+  // after `prepare` finishes (or fails).
   virtual process::Future<Nothing> cleanup(
       const ContainerID& containerId)
   {

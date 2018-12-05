@@ -16,8 +16,6 @@
 
 #include "master/master.hpp"
 
-#include <list>
-
 #include <mesos/roles.hpp>
 
 #include <mesos/authorizer/authorizer.hpp>
@@ -30,13 +28,16 @@
 #include <stout/strings.hpp>
 #include <stout/utils.hpp>
 
+#include "common/authorization.hpp"
+
 #include "master/weights.hpp"
 
 namespace http = process::http;
 
 using google::protobuf::RepeatedPtrField;
 
-using std::list;
+using mesos::authorization::createSubject;
+
 using std::string;
 using std::vector;
 
@@ -49,15 +50,17 @@ using http::OK;
 using process::Future;
 using process::Owned;
 
+using process::http::authentication::Principal;
+
 namespace mesos {
 namespace internal {
 namespace master {
 
 Future<http::Response> Master::WeightsHandler::get(
     const http::Request& request,
-    const Option<string>& principal) const
+    const Option<Principal>& principal) const
 {
-  VLOG(1) << "Handling get weights request.";
+  VLOG(1) << "Handling get weights request";
 
   // Check that the request type is GET which is guaranteed by the master.
   CHECK_EQ("GET", request.method);
@@ -79,7 +82,7 @@ Future<http::Response> Master::WeightsHandler::get(
 
 Future<http::Response> Master::WeightsHandler::get(
     const mesos::master::Call& call,
-    const Option<string>& principal,
+    const Option<Principal>& principal,
     ContentType contentType) const
 {
   CHECK_EQ(mesos::master::Call::GET_WEIGHTS, call.type());
@@ -102,7 +105,7 @@ Future<http::Response> Master::WeightsHandler::get(
 
 
 Future<vector<WeightInfo>> Master::WeightsHandler::_getWeights(
-    const Option<string>& principal) const
+    const Option<Principal>& principal) const
 {
   vector<WeightInfo> weightInfos;
   weightInfos.reserve(master->weights.size());
@@ -116,15 +119,16 @@ Future<vector<WeightInfo>> Master::WeightsHandler::_getWeights(
 
   // Create a list of authorization actions for each role we may return.
   // TODO(alexr): Batch these actions once we have BatchRequest in authorizer.
-  list<Future<bool>> roleAuthorizations;
+  vector<Future<bool>> roleAuthorizations;
+  roleAuthorizations.reserve(weightInfos.size());
   foreach (const WeightInfo& info, weightInfos) {
-    roleAuthorizations.push_back(authorizeGetWeight(principal, info.role()));
+    roleAuthorizations.push_back(authorizeGetWeight(principal, info));
   }
 
   return process::collect(roleAuthorizations)
     .then(defer(
         master->self(),
-        [=](const list<bool>& roleAuthorizationsCollected)
+        [=](const vector<bool>& roleAuthorizationsCollected)
           -> Future<vector<WeightInfo>> {
       return _filterWeights(weightInfos, roleAuthorizationsCollected);
   }));
@@ -133,7 +137,7 @@ Future<vector<WeightInfo>> Master::WeightsHandler::_getWeights(
 
 Future<vector<WeightInfo>> Master::WeightsHandler::_filterWeights(
     const vector<WeightInfo>& weightInfos,
-    const list<bool>& roleAuthorizations) const
+    const vector<bool>& roleAuthorizations) const
 {
   CHECK(weightInfos.size() == roleAuthorizations.size());
 
@@ -155,7 +159,7 @@ Future<vector<WeightInfo>> Master::WeightsHandler::_filterWeights(
 
 Future<http::Response> Master::WeightsHandler::update(
     const http::Request& request,
-    const Option<std::string>& principal) const
+    const Option<Principal>& principal) const
 {
   VLOG(1) << "Updating weights from request: '" << request.body << "'";
 
@@ -185,7 +189,7 @@ Future<http::Response> Master::WeightsHandler::update(
 
 Future<http::Response> Master::WeightsHandler::update(
     const mesos::master::Call& call,
-    const Option<std::string>& principal,
+    const Option<Principal>& principal,
     ContentType /*contentType*/) const
 {
   CHECK_EQ(mesos::master::Call::UPDATE_WEIGHTS, call.type());
@@ -196,7 +200,7 @@ Future<http::Response> Master::WeightsHandler::update(
 
 
 Future<http::Response> Master::WeightsHandler::_updateWeights(
-    const Option<string>& principal,
+    const Option<Principal>& principal,
     const RepeatedPtrField<WeightInfo>& weightInfos) const {
   vector<WeightInfo> validatedWeightInfos;
   vector<string> roles;
@@ -208,7 +212,7 @@ Future<http::Response> Master::WeightsHandler::_updateWeights(
     if (roleError.isSome()) {
       return BadRequest(
           "Failed to validate update weights request JSON: Invalid role '" +
-          role + "': " + roleError.get().message);
+          role + "': " + roleError->message);
     }
 
     // Check that the role is on the role whitelist, if it exists.
@@ -245,7 +249,7 @@ Future<http::Response> Master::WeightsHandler::__updateWeights(
     const vector<WeightInfo>& weightInfos) const
 {
   // Update the registry and acknowledge the request.
-  return master->registrar->apply(Owned<Operation>(
+  return master->registrar->apply(Owned<RegistryOperation>(
       new weights::UpdateWeights(weightInfos)))
     .then(defer(master->self(), [=](bool result) -> Future<http::Response> {
       CHECK(result);
@@ -278,7 +282,7 @@ Future<http::Response> Master::WeightsHandler::__updateWeights(
 
 
 void Master::WeightsHandler::rescindOffers(
-    const std::vector<WeightInfo>& weightInfos) const
+    const vector<WeightInfo>& weightInfos) const
 {
   bool rescind = false;
 
@@ -290,7 +294,7 @@ void Master::WeightsHandler::rescindOffers(
 
     // Rescind all outstanding offers if at least one of the
     // updated roles has a registered frameworks.
-    if (master->activeRoles.contains(role)) {
+    if (master->roles.contains(role)) {
       rescind = true;
       break;
     }
@@ -313,7 +317,7 @@ void Master::WeightsHandler::rescindOffers(
 
 
 Future<bool> Master::WeightsHandler::authorizeUpdateWeights(
-    const Option<string>& principal,
+    const Option<Principal>& principal,
     const vector<string>& roles) const
 {
   if (master->authorizer.isNone()) {
@@ -321,17 +325,19 @@ Future<bool> Master::WeightsHandler::authorizeUpdateWeights(
   }
 
   LOG(INFO) << "Authorizing principal '"
-            << (principal.isSome() ? principal.get() : "ANY")
+            << (principal.isSome() ? stringify(principal.get()) : "ANY")
             << "' to update weights for roles '" << stringify(roles) << "'";
 
   authorization::Request request;
-  request.set_action(authorization::UPDATE_WEIGHT_WITH_ROLE);
+  request.set_action(authorization::UPDATE_WEIGHT);
 
-  if (principal.isSome()) {
-    request.mutable_subject()->set_value(principal.get());
+  Option<authorization::Subject> subject = createSubject(principal);
+  if (subject.isSome()) {
+    request.mutable_subject()->CopyFrom(subject.get());
   }
 
-  list<Future<bool>> authorizations;
+  vector<Future<bool>> authorizations;
+  authorizations.reserve(roles.size());
   foreach (const string& role, roles) {
     request.mutable_object()->set_value(role);
     authorizations.push_back(master->authorizer.get()->authorized(request));
@@ -341,40 +347,32 @@ Future<bool> Master::WeightsHandler::authorizeUpdateWeights(
     return master->authorizer.get()->authorized(request);
   }
 
-  return await(authorizations)
-      .then([](const std::list<Future<bool>>& authorizations)
-            -> Future<bool> {
-        // Compute a disjunction.
-        foreach (const Future<bool>& authorization, authorizations) {
-          if (!authorization.get()) {
-            return false;
-          }
-        }
-        return true;
-      });
+  return authorization::collectAuthorizations(authorizations);
 }
 
 
 Future<bool> Master::WeightsHandler::authorizeGetWeight(
-    const Option<string>& principal,
-    const string& role) const
+    const Option<Principal>& principal,
+    const WeightInfo& weight) const
 {
   if (master->authorizer.isNone()) {
     return true;
   }
 
   LOG(INFO) << "Authorizing principal '"
-            << (principal.isSome() ? principal.get() : "ANY")
-            << "' to get weight for role '" << role << "'";
+            << (principal.isSome() ? stringify(principal.get()) : "ANY")
+            << "' to get weight for role '" << weight.role() << "'";
 
   authorization::Request request;
   request.set_action(authorization::VIEW_ROLE);
 
-  if (principal.isSome()) {
-    request.mutable_subject()->set_value(principal.get());
+  Option<authorization::Subject> subject = createSubject(principal);
+  if (subject.isSome()) {
+    request.mutable_subject()->CopyFrom(subject.get());
   }
 
-  request.mutable_object()->set_value(role);
+  request.mutable_object()->mutable_weight_info()->CopyFrom(weight);
+  request.mutable_object()->set_value(weight.role());
 
   return master->authorizer.get()->authorized(request);
 }

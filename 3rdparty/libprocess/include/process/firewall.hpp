@@ -55,7 +55,7 @@ public:
    *     for failure. Otherwise an unset 'Option' object.
    */
   virtual Option<http::Response> apply(
-      const network::Socket& socket,
+      const network::inet::Socket& socket,
       const http::Request& request) = 0;
 };
 
@@ -72,11 +72,11 @@ class DisabledEndpointsFirewallRule : public FirewallRule
 public:
   explicit DisabledEndpointsFirewallRule(const hashset<std::string>& _paths);
 
-  virtual ~DisabledEndpointsFirewallRule() {}
+  ~DisabledEndpointsFirewallRule() override {}
 
-  virtual Option<http::Response> apply(
-      const network::Socket&,
-      const http::Request& request)
+  Option<http::Response> apply(
+      const network::inet::Socket&,
+      const http::Request& request) override
   {
     if (paths.contains(request.url.path)) {
       return http::Forbidden("Endpoint '" + request.url.path + "' is disabled");

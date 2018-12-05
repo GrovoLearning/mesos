@@ -29,7 +29,7 @@
 #include <mesos/log/log.hpp>
 
 #include <mesos/state/log.hpp>
-#include <mesos/state/protobuf.hpp>
+#include <mesos/state/state.hpp>
 #include <mesos/state/storage.hpp>
 
 #include <process/clock.hpp>
@@ -55,6 +55,7 @@
 #include "master/master.hpp"
 #include "master/quota.hpp"
 #include "master/registrar.hpp"
+#include "master/registry_operations.hpp"
 #include "master/weights.hpp"
 
 #include "tests/mesos.hpp"
@@ -100,7 +101,6 @@ namespace internal {
 namespace tests {
 
 namespace quota = mesos::internal::master::quota;
-namespace weights = mesos::internal::master::weights;
 
 namespace authentication = process::http::authentication;
 
@@ -114,8 +114,8 @@ using namespace mesos::internal::master::weights;
 using mesos::http::authentication::BasicAuthenticatorFactory;
 
 using mesos::state::LogStorage;
+using mesos::state::State;
 using mesos::state::Storage;
-using mesos::state::protobuf::State;
 
 using state::Entry;
 
@@ -148,7 +148,7 @@ public:
       replica2(nullptr) {}
 
 protected:
-  virtual void SetUp()
+  void SetUp() override
   {
     TemporaryDirectoryTest::SetUp();
 
@@ -176,7 +176,7 @@ protected:
     state = new State(storage);
 
     // Compensate for slow CI machines / VMs.
-    flags.registry_store_timeout = Seconds(10);
+    flags.registry_store_timeout = process::TEST_AWAIT_TIMEOUT;
 
     master.CopyFrom(protobuf::createMasterInfo(UPID("master@127.0.0.1:5050")));
 
@@ -190,7 +190,7 @@ protected:
     slave.CopyFrom(info);
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     delete state;
     delete storage;
@@ -212,79 +212,119 @@ protected:
 };
 
 
-class RegistrarTest : public RegistrarTestBase,
-                      public WithParamInterface<bool>
-{
-protected:
-  virtual void SetUp()
-  {
-    RegistrarTestBase::SetUp();
-    flags.registry_strict = GetParam();
-  }
-};
+class RegistrarTest : public RegistrarTestBase {};
 
 
-// The Registrar tests are parameterized by "strictness".
-INSTANTIATE_TEST_CASE_P(Strict, RegistrarTest, ::testing::Bool());
-
-
-TEST_P(RegistrarTest, Recover)
+TEST_F(RegistrarTest, Recover)
 {
   Registrar registrar(flags, state);
 
   // Operations preceding recovery will fail.
-  AWAIT_EXPECT_FAILED(
-      registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
-  AWAIT_EXPECT_FAILED(
-      registrar.apply(Owned<Operation>(new ReadmitSlave(slave))));
-  AWAIT_EXPECT_FAILED(
-      registrar.apply(Owned<Operation>(new RemoveSlave(slave))));
+  AWAIT_EXPECT_FAILED(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(slave))));
+  AWAIT_EXPECT_FAILED(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveUnreachable(slave, protobuf::getCurrentTime()))));
+  AWAIT_EXPECT_FAILED(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveReachable(slave))));
+  AWAIT_EXPECT_FAILED(registrar.apply(Owned<RegistryOperation>(
+      new RemoveSlave(slave))));
 
   Future<Registry> registry = registrar.recover(master);
 
   // Before waiting for the recovery to complete, invoke some
   // operations to ensure they do not fail.
-  Future<bool> admit = registrar.apply(
-      Owned<Operation>(new AdmitSlave(slave)));
-  Future<bool> readmit = registrar.apply(
-      Owned<Operation>(new ReadmitSlave(slave)));
-  Future<bool> remove = registrar.apply(
-      Owned<Operation>(new RemoveSlave(slave)));
+  Future<bool> admit = registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(slave)));
+  Future<bool> unreachable = registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveUnreachable(slave, protobuf::getCurrentTime())));
+  Future<bool> reachable = registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveReachable(slave)));
+  Future<bool> remove = registrar.apply(Owned<RegistryOperation>(
+      new RemoveSlave(slave)));
 
   AWAIT_READY(registry);
-  EXPECT_EQ(master, registry.get().master().info());
+  EXPECT_EQ(master, registry->master().info());
 
   AWAIT_TRUE(admit);
-  AWAIT_TRUE(readmit);
+  AWAIT_TRUE(unreachable);
+  AWAIT_TRUE(reachable);
   AWAIT_TRUE(remove);
 }
 
 
-TEST_P(RegistrarTest, Admit)
+TEST_F(RegistrarTest, Admit)
 {
   Registrar registrar(flags, state);
   AWAIT_READY(registrar.recover(master));
 
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(new AdmitSlave(slave))));
+  AWAIT_FALSE(registrar.apply(Owned<RegistryOperation>(new AdmitSlave(slave))));
+}
 
-  if (flags.registry_strict) {
-    AWAIT_FALSE(registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
-  } else {
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
+
+TEST_F(RegistrarTest, UpdateSlave)
+{
+  // Add a new slave to the registry.
+  {
+    Registrar registrar(flags, state);
+    AWAIT_READY(registrar.recover(master));
+
+    slave.set_hostname("original");
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new AdmitSlave(slave))));
+  }
+
+
+  // Verify that the slave is present, and update its hostname.
+  {
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(1, registry->slaves().slaves().size());
+    EXPECT_EQ("original", registry->slaves().slaves(0).info().hostname());
+
+    slave.set_hostname("changed");
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new UpdateSlave(slave))));
+  }
+
+  // Verify that the hostname indeed changed, and do one additional update
+  // to check that the operation is idempotent.
+  {
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(1, registry->slaves().slaves().size());
+    EXPECT_EQ("changed", registry->slaves().slaves(0).info().hostname());
+
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new UpdateSlave(slave))));
+  }
+
+  // Verify that nothing changed from the second update.
+  {
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(1, registry->slaves().slaves().size());
+    EXPECT_EQ("changed", registry->slaves().slaves(0).info().hostname());
   }
 }
 
 
-TEST_P(RegistrarTest, Readmit)
+TEST_F(RegistrarTest, MarkReachable)
 {
   Registrar registrar(flags, state);
   AWAIT_READY(registrar.recover(master));
 
-  SlaveInfo info1;
-  info1.set_hostname("localhost");
-
   SlaveID id1;
   id1.set_value("1");
+
+  SlaveInfo info1;
+  info1.set_hostname("localhost");
   info1.mutable_id()->CopyFrom(id1);
 
   SlaveID id2;
@@ -294,28 +334,125 @@ TEST_P(RegistrarTest, Readmit)
   info2.set_hostname("localhost");
   info2.mutable_id()->CopyFrom(id2);
 
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info1))));
 
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new ReadmitSlave(info1))));
+  // Attempting to mark a slave as reachable that is already reachable
+  // should not result in an error.
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveReachable(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveReachable(info1))));
 
-  if (flags.registry_strict) {
-    AWAIT_FALSE(registrar.apply(Owned<Operation>(new ReadmitSlave(info2))));
-  } else {
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new ReadmitSlave(info2))));
-  }
+  // Attempting to mark a slave as reachable that is not in the
+  // unreachable list should not result in error.
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveReachable(info2))));
 }
 
 
-TEST_P(RegistrarTest, Remove)
+TEST_F(RegistrarTest, MarkUnreachable)
 {
   Registrar registrar(flags, state);
   AWAIT_READY(registrar.recover(master));
 
+  SlaveID id1;
+  id1.set_value("1");
+
   SlaveInfo info1;
   info1.set_hostname("localhost");
+  info1.mutable_id()->CopyFrom(id1);
+
+  SlaveID id2;
+  id2.set_value("2");
+
+  SlaveInfo info2;
+  info2.set_hostname("localhost");
+  info2.mutable_id()->CopyFrom(id2);
+
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info1))));
+
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveUnreachable(info1, protobuf::getCurrentTime()))));
+
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveReachable(info1))));
+
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveUnreachable(info1, protobuf::getCurrentTime()))));
+
+  // If a slave is already unreachable, trying to mark it unreachable
+  // again should fail.
+  AWAIT_FALSE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveUnreachable(info1, protobuf::getCurrentTime()))));
+}
+
+
+// Verify that an admitted slave can be marked as gone.
+TEST_F(RegistrarTest, MarkGone)
+{
+  Registrar registrar(flags, state);
+  AWAIT_READY(registrar.recover(master));
 
   SlaveID id1;
   id1.set_value("1");
+
+  SlaveInfo info1;
+  info1.set_hostname("localhost");
+  info1.mutable_id()->CopyFrom(id1);
+
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info1))));
+
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveGone(info1.id(), protobuf::getCurrentTime()))));
+}
+
+
+// Verify that an unreachable slave can be marked as gone.
+TEST_F(RegistrarTest, MarkUnreachableGone)
+{
+  Registrar registrar(flags, state);
+  AWAIT_READY(registrar.recover(master));
+
+  SlaveID id1;
+  id1.set_value("1");
+
+  SlaveInfo info1;
+  info1.set_hostname("localhost");
+  info1.mutable_id()->CopyFrom(id1);
+
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info1))));
+
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveUnreachable(info1, protobuf::getCurrentTime()))));
+
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveGone(info1.id(), protobuf::getCurrentTime()))));
+
+  // If a slave is already gone, trying to mark it gone again should fail.
+  AWAIT_FALSE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveGone(info1.id(), protobuf::getCurrentTime()))));
+
+  // If a slave is already gone, trying to mark it unreachable
+  // again should fail.
+  AWAIT_FALSE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveUnreachable(info1, protobuf::getCurrentTime()))));
+}
+
+
+TEST_F(RegistrarTest, Prune)
+{
+  Registrar registrar(flags, state);
+  AWAIT_READY(registrar.recover(master));
+
+  SlaveID id1;
+  id1.set_value("1");
+
+  SlaveInfo info1;
+  info1.set_hostname("localhost");
   info1.mutable_id()->CopyFrom(id1);
 
   SlaveID id2;
@@ -332,35 +469,100 @@ TEST_P(RegistrarTest, Remove)
   info3.set_hostname("localhost");
   info3.mutable_id()->CopyFrom(id3);
 
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info2))));
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info3))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info2))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info3))));
 
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveUnreachable(info1, protobuf::getCurrentTime()))));
 
-  if (flags.registry_strict) {
-    AWAIT_FALSE(registrar.apply(Owned<Operation>(new RemoveSlave(info1))));
-  } else {
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveSlave(info1))));
-  }
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveUnreachable(info2, protobuf::getCurrentTime()))));
 
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveGone(info3.id(), protobuf::getCurrentTime()))));
 
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveSlave(info2))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new Prune({id1}, {}))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new Prune({id2}, {}))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new Prune({}, {id3}))));
 
-  if (flags.registry_strict) {
-    AWAIT_FALSE(registrar.apply(Owned<Operation>(new RemoveSlave(info2))));
-  } else {
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveSlave(info2))));
-  }
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info2))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info3))));
 
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveSlave(info3))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveUnreachable(info1, protobuf::getCurrentTime()))));
 
-  if (flags.registry_strict) {
-    AWAIT_FALSE(registrar.apply(Owned<Operation>(new RemoveSlave(info3))));
-  } else {
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveSlave(info3))));
-  }
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveUnreachable(info2, protobuf::getCurrentTime()))));
+
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new MarkSlaveGone(info3.id(), protobuf::getCurrentTime()))));
+
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new Prune({id1}, {}))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new Prune({id2}, {}))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new Prune({}, {id3}))));
+}
+
+
+TEST_F(RegistrarTest, Remove)
+{
+  Registrar registrar(flags, state);
+  AWAIT_READY(registrar.recover(master));
+
+  SlaveID id1;
+  id1.set_value("1");
+
+  SlaveInfo info1;
+  info1.set_hostname("localhost");
+  info1.mutable_id()->CopyFrom(id1);
+
+  SlaveID id2;
+  id2.set_value("2");
+
+  SlaveInfo info2;
+  info2.set_hostname("localhost");
+  info2.mutable_id()->CopyFrom(id2);
+
+  SlaveID id3;
+  id3.set_value("3");
+
+  SlaveInfo info3;
+  info3.set_hostname("localhost");
+  info3.mutable_id()->CopyFrom(id3);
+
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info2))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info3))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new RemoveSlave(info1))));
+  AWAIT_FALSE(registrar.apply(Owned<RegistryOperation>(
+      new RemoveSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new RemoveSlave(info2))));
+  AWAIT_FALSE(registrar.apply(Owned<RegistryOperation>(
+      new RemoveSlave(info2))));
+  AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+      new RemoveSlave(info3))));
+  AWAIT_FALSE(registrar.apply(Owned<RegistryOperation>(
+      new RemoveSlave(info3))));
 }
 
 
@@ -374,12 +576,12 @@ TEST_P(RegistrarTest, Remove)
 // For example:
 //   MaintenanceTest(flags, state, [=](const Registry& registry) {
 //     // Checks and operations.  i.e.:
-//     EXPECT_EQ(1, registry.get().schedules().size());
+//     EXPECT_EQ(1, registry->schedules().size());
 //   });
 
 // Adds maintenance schedules to the registry, one machine at a time.
 // Then removes machines from the schedule.
-TEST_P(RegistrarTest, UpdateMaintenanceSchedule)
+TEST_F(RegistrarTest, UpdateMaintenanceSchedule)
 {
   // Machine definitions used in this test.
   MachineID machine1;
@@ -403,8 +605,8 @@ TEST_P(RegistrarTest, UpdateMaintenanceSchedule)
     maintenance::Schedule schedule = createSchedule(
         {createWindow({machine1}, unavailability)});
 
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new UpdateSchedule(schedule))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new UpdateSchedule(schedule))));
   }
 
   {
@@ -413,21 +615,21 @@ TEST_P(RegistrarTest, UpdateMaintenanceSchedule)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    EXPECT_EQ(1, registry.get().schedules().size());
-    EXPECT_EQ(1, registry.get().schedules(0).windows().size());
-    EXPECT_EQ(1, registry.get().schedules(0).windows(0).machine_ids().size());
-    EXPECT_EQ(1, registry.get().machines().machines().size());
+    EXPECT_EQ(1, registry->schedules().size());
+    EXPECT_EQ(1, registry->schedules(0).windows().size());
+    EXPECT_EQ(1, registry->schedules(0).windows(0).machine_ids().size());
+    EXPECT_EQ(1, registry->machines().machines().size());
     EXPECT_EQ(
         MachineInfo::DRAINING,
-        registry.get().machines().machines(0).info().mode());
+        registry->machines().machines(0).info().mode());
 
     // Extend the schedule by one machine (in a different window).
     maintenance::Schedule schedule = createSchedule({
         createWindow({machine1}, unavailability),
         createWindow({machine2}, unavailability)});
 
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new UpdateSchedule(schedule))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new UpdateSchedule(schedule))));
   }
 
   {
@@ -436,22 +638,22 @@ TEST_P(RegistrarTest, UpdateMaintenanceSchedule)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    EXPECT_EQ(1, registry.get().schedules().size());
-    EXPECT_EQ(2, registry.get().schedules(0).windows().size());
-    EXPECT_EQ(1, registry.get().schedules(0).windows(0).machine_ids().size());
-    EXPECT_EQ(1, registry.get().schedules(0).windows(1).machine_ids().size());
-    EXPECT_EQ(2, registry.get().machines().machines().size());
+    EXPECT_EQ(1, registry->schedules().size());
+    EXPECT_EQ(2, registry->schedules(0).windows().size());
+    EXPECT_EQ(1, registry->schedules(0).windows(0).machine_ids().size());
+    EXPECT_EQ(1, registry->schedules(0).windows(1).machine_ids().size());
+    EXPECT_EQ(2, registry->machines().machines().size());
     EXPECT_EQ(
         MachineInfo::DRAINING,
-        registry.get().machines().machines(1).info().mode());
+        registry->machines().machines(1).info().mode());
 
     // Extend a window by one machine.
     maintenance::Schedule schedule = createSchedule({
         createWindow({machine1}, unavailability),
         createWindow({machine2, machine3}, unavailability)});
 
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new UpdateSchedule(schedule))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new UpdateSchedule(schedule))));
   }
 
   {
@@ -460,21 +662,21 @@ TEST_P(RegistrarTest, UpdateMaintenanceSchedule)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    EXPECT_EQ(1, registry.get().schedules().size());
-    EXPECT_EQ(2, registry.get().schedules(0).windows().size());
-    EXPECT_EQ(1, registry.get().schedules(0).windows(0).machine_ids().size());
-    EXPECT_EQ(2, registry.get().schedules(0).windows(1).machine_ids().size());
-    EXPECT_EQ(3, registry.get().machines().machines().size());
+    EXPECT_EQ(1, registry->schedules().size());
+    EXPECT_EQ(2, registry->schedules(0).windows().size());
+    EXPECT_EQ(1, registry->schedules(0).windows(0).machine_ids().size());
+    EXPECT_EQ(2, registry->schedules(0).windows(1).machine_ids().size());
+    EXPECT_EQ(3, registry->machines().machines().size());
     EXPECT_EQ(
         MachineInfo::DRAINING,
-        registry.get().machines().machines(2).info().mode());
+        registry->machines().machines(2).info().mode());
 
     // Rearrange the schedule into one window.
     maintenance::Schedule schedule = createSchedule(
         {createWindow({machine1, machine2, machine3}, unavailability)});
 
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new UpdateSchedule(schedule))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new UpdateSchedule(schedule))));
   }
 
   {
@@ -483,28 +685,28 @@ TEST_P(RegistrarTest, UpdateMaintenanceSchedule)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    EXPECT_EQ(1, registry.get().schedules().size());
-    EXPECT_EQ(1, registry.get().schedules(0).windows().size());
-    EXPECT_EQ(3, registry.get().schedules(0).windows(0).machine_ids().size());
-    EXPECT_EQ(3, registry.get().machines().machines().size());
+    EXPECT_EQ(1, registry->schedules().size());
+    EXPECT_EQ(1, registry->schedules(0).windows().size());
+    EXPECT_EQ(3, registry->schedules(0).windows(0).machine_ids().size());
+    EXPECT_EQ(3, registry->machines().machines().size());
     EXPECT_EQ(
         MachineInfo::DRAINING,
-        registry.get().machines().machines(0).info().mode());
+        registry->machines().machines(0).info().mode());
 
     EXPECT_EQ(
         MachineInfo::DRAINING,
-        registry.get().machines().machines(1).info().mode());
+        registry->machines().machines(1).info().mode());
 
     EXPECT_EQ(
         MachineInfo::DRAINING,
-        registry.get().machines().machines(2).info().mode());
+        registry->machines().machines(2).info().mode());
 
     // Delete one machine from the schedule.
     maintenance::Schedule schedule = createSchedule(
         {createWindow({machine2, machine3}, unavailability)});
 
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new UpdateSchedule(schedule))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new UpdateSchedule(schedule))));
   }
 
   {
@@ -513,15 +715,15 @@ TEST_P(RegistrarTest, UpdateMaintenanceSchedule)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    EXPECT_EQ(1, registry.get().schedules().size());
-    EXPECT_EQ(1, registry.get().schedules(0).windows().size());
-    EXPECT_EQ(2, registry.get().schedules(0).windows(0).machine_ids().size());
-    EXPECT_EQ(2, registry.get().machines().machines().size());
+    EXPECT_EQ(1, registry->schedules().size());
+    EXPECT_EQ(1, registry->schedules(0).windows().size());
+    EXPECT_EQ(2, registry->schedules(0).windows(0).machine_ids().size());
+    EXPECT_EQ(2, registry->machines().machines().size());
 
     // Delete all machines from the schedule.
     maintenance::Schedule schedule;
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new UpdateSchedule(schedule))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new UpdateSchedule(schedule))));
   }
 
   {
@@ -530,15 +732,15 @@ TEST_P(RegistrarTest, UpdateMaintenanceSchedule)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    EXPECT_EQ(1, registry.get().schedules().size());
-    EXPECT_EQ(0, registry.get().schedules(0).windows().size());
-    EXPECT_EQ(0, registry.get().machines().machines().size());
+    EXPECT_EQ(1, registry->schedules().size());
+    EXPECT_TRUE(registry->schedules(0).windows().empty());
+    EXPECT_TRUE(registry->machines().machines().empty());
   }
 }
 
 
 // Creates a schedule and properly starts maintenance.
-TEST_P(RegistrarTest, StartMaintenance)
+TEST_F(RegistrarTest, StartMaintenance)
 {
   // Machine definitions used in this test.
   MachineID machine1;
@@ -562,14 +764,14 @@ TEST_P(RegistrarTest, StartMaintenance)
     maintenance::Schedule schedule = createSchedule(
         {createWindow({machine1, machine2}, unavailability)});
 
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new UpdateSchedule(schedule))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new UpdateSchedule(schedule))));
 
     // Transition machine two into `DOWN` mode.
     RepeatedPtrField<MachineID> machines = createMachineList({machine2});
 
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new StartMaintenance(machines))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new StartMaintenance(machines))));
   }
 
   {
@@ -578,28 +780,28 @@ TEST_P(RegistrarTest, StartMaintenance)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    EXPECT_EQ(2, registry.get().machines().machines().size());
+    EXPECT_EQ(2, registry->machines().machines().size());
     EXPECT_EQ(
         MachineInfo::DRAINING,
-        registry.get().machines().machines(0).info().mode());
+        registry->machines().machines(0).info().mode());
 
     EXPECT_EQ(
         MachineInfo::DOWN,
-        registry.get().machines().machines(1).info().mode());
+        registry->machines().machines(1).info().mode());
 
     // Schedule three machines for maintenance.
     maintenance::Schedule schedule = createSchedule(
         {createWindow({machine1, machine2, machine3}, unavailability)});
 
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new UpdateSchedule(schedule))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new UpdateSchedule(schedule))));
 
     // Deactivate the two `DRAINING` machines.
     RepeatedPtrField<MachineID> machines =
       createMachineList({machine1, machine3});
 
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new StartMaintenance(machines))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new StartMaintenance(machines))));
   }
 
   {
@@ -608,24 +810,24 @@ TEST_P(RegistrarTest, StartMaintenance)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    EXPECT_EQ(3, registry.get().machines().machines().size());
+    EXPECT_EQ(3, registry->machines().machines().size());
     EXPECT_EQ(
         MachineInfo::DOWN,
-        registry.get().machines().machines(0).info().mode());
+        registry->machines().machines(0).info().mode());
 
     EXPECT_EQ(
         MachineInfo::DOWN,
-        registry.get().machines().machines(1).info().mode());
+        registry->machines().machines(1).info().mode());
 
     EXPECT_EQ(
         MachineInfo::DOWN,
-        registry.get().machines().machines(2).info().mode());
+        registry->machines().machines(2).info().mode());
   }
 }
 
 
 // Creates a schedule and properly starts and stops maintenance.
-TEST_P(RegistrarTest, StopMaintenance)
+TEST_F(RegistrarTest, StopMaintenance)
 {
   // Machine definitions used in this test.
   MachineID machine1;
@@ -650,18 +852,18 @@ TEST_P(RegistrarTest, StopMaintenance)
         createWindow({machine1, machine2}, unavailability),
         createWindow({machine3}, unavailability)});
 
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new UpdateSchedule(schedule))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new UpdateSchedule(schedule))));
 
     // Transition machine three into `DOWN` mode.
     RepeatedPtrField<MachineID> machines = createMachineList({machine3});
 
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new StartMaintenance(machines))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new StartMaintenance(machines))));
 
     // Transition machine three into `UP` mode.
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new StopMaintenance(machines))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new StopMaintenance(machines))));
   }
 
   {
@@ -670,28 +872,28 @@ TEST_P(RegistrarTest, StopMaintenance)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    EXPECT_EQ(1, registry.get().schedules().size());
-    EXPECT_EQ(1, registry.get().schedules(0).windows().size());
-    EXPECT_EQ(2, registry.get().schedules(0).windows(0).machine_ids().size());
-    EXPECT_EQ(2, registry.get().machines().machines().size());
+    EXPECT_EQ(1, registry->schedules().size());
+    EXPECT_EQ(1, registry->schedules(0).windows().size());
+    EXPECT_EQ(2, registry->schedules(0).windows(0).machine_ids().size());
+    EXPECT_EQ(2, registry->machines().machines().size());
     EXPECT_EQ(
         MachineInfo::DRAINING,
-        registry.get().machines().machines(0).info().mode());
+        registry->machines().machines(0).info().mode());
 
     EXPECT_EQ(
         MachineInfo::DRAINING,
-        registry.get().machines().machines(1).info().mode());
+        registry->machines().machines(1).info().mode());
 
     // Transition machine one and two into `DOWN` mode.
     RepeatedPtrField<MachineID> machines =
       createMachineList({machine1, machine2});
 
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new StartMaintenance(machines))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new StartMaintenance(machines))));
 
     // Transition all machines into `UP` mode.
-    AWAIT_READY(registrar.apply(
-        Owned<Operation>(new StopMaintenance(machines))));
+    AWAIT_READY(registrar.apply(Owned<RegistryOperation>(
+        new StopMaintenance(machines))));
   }
 
   {
@@ -700,14 +902,14 @@ TEST_P(RegistrarTest, StopMaintenance)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    EXPECT_EQ(0, registry.get().schedules().size());
-    EXPECT_EQ(0, registry.get().machines().machines().size());
+    EXPECT_TRUE(registry->schedules().empty());
+    EXPECT_TRUE(registry->machines().machines().empty());
   }
 }
 
 
 // Tests that adding and updating quotas in the registry works properly.
-TEST_P(RegistrarTest, UpdateQuota)
+TEST_F(RegistrarTest, UpdateQuota)
 {
   const string ROLE1 = "role1";
   const string ROLE2 = "role2";
@@ -740,7 +942,8 @@ TEST_P(RegistrarTest, UpdateQuota)
     AWAIT_READY(registry);
 
     // Store quota for a role without quota.
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new UpdateQuota(quota1))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new UpdateQuota(quota1))));
   }
 
   {
@@ -749,18 +952,19 @@ TEST_P(RegistrarTest, UpdateQuota)
     AWAIT_READY(registry);
 
     // Check that the recovered quota matches the one we stored.
-    ASSERT_EQ(1, registry.get().quotas().size());
-    EXPECT_EQ(ROLE1, registry.get().quotas(0).info().role());
-    ASSERT_EQ(2, registry.get().quotas(0).info().guarantee().size());
+    ASSERT_EQ(1, registry->quotas().size());
+    EXPECT_EQ(ROLE1, registry->quotas(0).info().role());
+    ASSERT_EQ(2, registry->quotas(0).info().guarantee().size());
 
-    Resources storedResources(registry.get().quotas(0).info().guarantee());
+    Resources storedResources(registry->quotas(0).info().guarantee());
     EXPECT_EQ(quotaResources1, storedResources);
 
     // Change quota for `ROLE1`.
     quota1.mutable_guarantee()->CopyFrom(quotaResources2);
 
     // Update the only stored quota.
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new UpdateQuota(quota1))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new UpdateQuota(quota1))));
   }
 
   {
@@ -769,15 +973,16 @@ TEST_P(RegistrarTest, UpdateQuota)
     AWAIT_READY(registry);
 
     // Check that the recovered quota matches the one we updated.
-    ASSERT_EQ(1, registry.get().quotas().size());
-    EXPECT_EQ(ROLE1, registry.get().quotas(0).info().role());
-    ASSERT_EQ(1, registry.get().quotas(0).info().guarantee().size());
+    ASSERT_EQ(1, registry->quotas().size());
+    EXPECT_EQ(ROLE1, registry->quotas(0).info().role());
+    ASSERT_EQ(1, registry->quotas(0).info().guarantee().size());
 
-    Resources storedResources(registry.get().quotas(0).info().guarantee());
+    Resources storedResources(registry->quotas(0).info().guarantee());
     EXPECT_EQ(quotaResources2, storedResources);
 
     // Store one more quota for a role without quota.
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new UpdateQuota(quota2))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new UpdateQuota(quota2))));
   }
 
   {
@@ -789,21 +994,22 @@ TEST_P(RegistrarTest, UpdateQuota)
     // NOTE: We assume quota messages are stored in order they have
     // been added.
     // TODO(alexr): Consider removing dependency on the order.
-    ASSERT_EQ(2, registry.get().quotas().size());
-    EXPECT_EQ(ROLE1, registry.get().quotas(0).info().role());
-    ASSERT_EQ(1, registry.get().quotas(0).info().guarantee().size());
+    ASSERT_EQ(2, registry->quotas().size());
+    EXPECT_EQ(ROLE1, registry->quotas(0).info().role());
+    ASSERT_EQ(1, registry->quotas(0).info().guarantee().size());
 
-    EXPECT_EQ(ROLE2, registry.get().quotas(1).info().role());
-    ASSERT_EQ(2, registry.get().quotas(1).info().guarantee().size());
+    EXPECT_EQ(ROLE2, registry->quotas(1).info().role());
+    ASSERT_EQ(2, registry->quotas(1).info().guarantee().size());
 
-    Resources storedResources(registry.get().quotas(1).info().guarantee());
+    Resources storedResources(registry->quotas(1).info().guarantee());
     EXPECT_EQ(quotaResources1, storedResources);
 
     // Change quota for `role2`.
     quota2.mutable_guarantee()->CopyFrom(quotaResources2);
 
     // Update quota for `role2` in presence of multiple quotas.
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new UpdateQuota(quota2))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new UpdateQuota(quota2))));
   }
 
   {
@@ -816,25 +1022,25 @@ TEST_P(RegistrarTest, UpdateQuota)
     // NOTE: We assume quota messages are stored in order they have been
     // added and update does not change the order.
     // TODO(alexr): Consider removing dependency on the order.
-    ASSERT_EQ(2, registry.get().quotas().size());
+    ASSERT_EQ(2, registry->quotas().size());
 
-    EXPECT_EQ(ROLE1, registry.get().quotas(0).info().role());
-    ASSERT_EQ(1, registry.get().quotas(0).info().guarantee().size());
+    EXPECT_EQ(ROLE1, registry->quotas(0).info().role());
+    ASSERT_EQ(1, registry->quotas(0).info().guarantee().size());
 
-    Resources storedResources1(registry.get().quotas(0).info().guarantee());
+    Resources storedResources1(registry->quotas(0).info().guarantee());
     EXPECT_EQ(quotaResources2, storedResources1);
 
-    EXPECT_EQ(ROLE2, registry.get().quotas(1).info().role());
-    ASSERT_EQ(1, registry.get().quotas(1).info().guarantee().size());
+    EXPECT_EQ(ROLE2, registry->quotas(1).info().role());
+    ASSERT_EQ(1, registry->quotas(1).info().guarantee().size());
 
-    Resources storedResources2(registry.get().quotas(1).info().guarantee());
+    Resources storedResources2(registry->quotas(1).info().guarantee());
     EXPECT_EQ(quotaResources2, storedResources2);
   }
 }
 
 
 // Tests removing quotas from the registry.
-TEST_P(RegistrarTest, RemoveQuota)
+TEST_F(RegistrarTest, RemoveQuota)
 {
   const string ROLE1 = "role1";
   const string ROLE2 = "role2";
@@ -866,8 +1072,10 @@ TEST_P(RegistrarTest, RemoveQuota)
     Option<Error> validateError2 = quota::validation::quotaInfo(quota2);
     EXPECT_NONE(validateError2);
 
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new UpdateQuota(quota1))));
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new UpdateQuota(quota2))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new UpdateQuota(quota1))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new UpdateQuota(quota2))));
   }
 
   {
@@ -879,12 +1087,13 @@ TEST_P(RegistrarTest, RemoveQuota)
     // NOTE: We assume quota messages are stored in order they have been
     // added.
     // TODO(alexr): Consider removing dependency on the order.
-    ASSERT_EQ(2, registry.get().quotas().size());
-    EXPECT_EQ(ROLE1, registry.get().quotas(0).info().role());
-    EXPECT_EQ(ROLE2, registry.get().quotas(1).info().role());
+    ASSERT_EQ(2, registry->quotas().size());
+    EXPECT_EQ(ROLE1, registry->quotas(0).info().role());
+    EXPECT_EQ(ROLE2, registry->quotas(1).info().role());
 
     // Remove quota for `role2`.
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveQuota(ROLE2))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new RemoveQuota(ROLE2))));
   }
 
   {
@@ -893,11 +1102,12 @@ TEST_P(RegistrarTest, RemoveQuota)
     AWAIT_READY(registry);
 
     // Check that there is only one quota left in the registry.
-    ASSERT_EQ(1, registry.get().quotas().size());
-    EXPECT_EQ(ROLE1, registry.get().quotas(0).info().role());
+    ASSERT_EQ(1, registry->quotas().size());
+    EXPECT_EQ(ROLE1, registry->quotas(0).info().role());
 
     // Remove quota for `ROLE1`.
-    AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveQuota(ROLE1))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new RemoveQuota(ROLE1))));
   }
 
   {
@@ -906,13 +1116,13 @@ TEST_P(RegistrarTest, RemoveQuota)
     AWAIT_READY(registry);
 
     // Check that there are no more quotas at this point.
-    ASSERT_EQ(0, registry.get().quotas().size());
+    ASSERT_TRUE(registry->quotas().empty());
   }
 }
 
 
 // Tests that updating weights in the registry works properly.
-TEST_P(RegistrarTest, UpdateWeights)
+TEST_F(RegistrarTest, UpdateWeights)
 {
   const string ROLE1 = "role1";
   double WEIGHT1 = 2.0;
@@ -927,15 +1137,15 @@ TEST_P(RegistrarTest, UpdateWeights)
     Future<Registry> registry = registrar.recover(master);
     AWAIT_READY(registry);
 
-    ASSERT_EQ(0, registry.get().weights_size());
+    ASSERT_TRUE(registry->weights().empty());
 
     // Store the weight for 'ROLE1' previously without weight.
     hashmap<string, double> weights;
     weights[ROLE1] = WEIGHT1;
     vector<WeightInfo> weightInfos = getWeightInfos(weights);
 
-    AWAIT_TRUE(registrar.apply(
-        Owned<Operation>(new UpdateWeights(weightInfos))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new UpdateWeights(weightInfos))));
   }
 
   {
@@ -945,9 +1155,9 @@ TEST_P(RegistrarTest, UpdateWeights)
 
     // Check that the recovered weights matches the weights we stored
     // previously.
-    ASSERT_EQ(1, registry.get().weights_size());
-    EXPECT_EQ(ROLE1, registry.get().weights(0).info().role());
-    ASSERT_EQ(WEIGHT1, registry.get().weights(0).info().weight());
+    ASSERT_EQ(1, registry->weights_size());
+    EXPECT_EQ(ROLE1, registry->weights(0).info().role());
+    ASSERT_EQ(WEIGHT1, registry->weights(0).info().weight());
 
     // Change weight for 'ROLE1', and store the weight for 'ROLE2'.
     hashmap<string, double> weights;
@@ -955,8 +1165,8 @@ TEST_P(RegistrarTest, UpdateWeights)
     weights[ROLE2] = WEIGHT2;
     vector<WeightInfo> weightInfos = getWeightInfos(weights);
 
-    AWAIT_TRUE(registrar.apply(
-        Owned<Operation>(new UpdateWeights(weightInfos))));
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new UpdateWeights(weightInfos))));
   }
 
   {
@@ -966,31 +1176,28 @@ TEST_P(RegistrarTest, UpdateWeights)
 
     // Check that the recovered weights matches the weights we updated
     // previously.
-    ASSERT_EQ(2, registry.get().weights_size());
-    EXPECT_EQ(ROLE1, registry.get().weights(0).info().role());
-    ASSERT_EQ(UPDATED_WEIGHT1, registry.get().weights(0).info().weight());
-    EXPECT_EQ(ROLE2, registry.get().weights(1).info().role());
-    ASSERT_EQ(WEIGHT2, registry.get().weights(1).info().weight());
+    ASSERT_EQ(2, registry->weights_size());
+    EXPECT_EQ(ROLE1, registry->weights(0).info().role());
+    ASSERT_EQ(UPDATED_WEIGHT1, registry->weights(0).info().weight());
+    EXPECT_EQ(ROLE2, registry->weights(1).info().role());
+    ASSERT_EQ(WEIGHT2, registry->weights(1).info().weight());
   }
 }
 
 
-TEST_P(RegistrarTest, Bootstrap)
+TEST_F(RegistrarTest, Bootstrap)
 {
-  // Run 1 readmits a slave that is not present.
+  // Run 1 simulates the reregistration of a slave that is not present
+  // in the registry.
   {
     Registrar registrar(flags, state);
     AWAIT_READY(registrar.recover(master));
 
-    // If not strict, we should be allowed to readmit the slave.
-    if (flags.registry_strict) {
-      AWAIT_FALSE(registrar.apply(Owned<Operation>(new ReadmitSlave(slave))));
-    } else {
-      AWAIT_TRUE(registrar.apply(Owned<Operation>(new ReadmitSlave(slave))));
-    }
+    AWAIT_TRUE(registrar.apply(Owned<RegistryOperation>(
+        new MarkSlaveReachable(slave))));
   }
 
-  // Run 2 should see the slave if not strict.
+  // Run 2 should see the slave.
   {
     Registrar registrar(flags, state);
 
@@ -998,12 +1205,8 @@ TEST_P(RegistrarTest, Bootstrap)
 
     AWAIT_READY(registry);
 
-    if (flags.registry_strict) {
-      EXPECT_EQ(0, registry.get().slaves().slaves().size());
-    } else {
-      ASSERT_EQ(1, registry.get().slaves().slaves().size());
-      EXPECT_EQ(slave, registry.get().slaves().slaves(0).info());
-    }
+    ASSERT_EQ(1, registry->slaves().slaves().size());
+    EXPECT_EQ(slave, registry->slaves().slaves(0).info());
   }
 }
 
@@ -1011,14 +1214,14 @@ TEST_P(RegistrarTest, Bootstrap)
 class MockStorage : public Storage
 {
 public:
-  MOCK_METHOD1(get, Future<Option<Entry> >(const string&));
-  MOCK_METHOD2(set, Future<bool>(const Entry&, const UUID&));
+  MOCK_METHOD1(get, Future<Option<Entry>>(const string&));
+  MOCK_METHOD2(set, Future<bool>(const Entry&, const id::UUID&));
   MOCK_METHOD1(expunge, Future<bool>(const Entry&));
   MOCK_METHOD0(names, Future<std::set<string>>());
 };
 
 
-TEST_P(RegistrarTest, FetchTimeout)
+TEST_F(RegistrarTest, FetchTimeout)
 {
   Clock::pause();
 
@@ -1028,7 +1231,7 @@ TEST_P(RegistrarTest, FetchTimeout)
   Future<Nothing> get;
   EXPECT_CALL(storage, get(_))
     .WillOnce(DoAll(FutureSatisfy(&get),
-                    Return(Future<Option<Entry> >())));
+                    Return(Future<Option<Entry>>())));
 
   Registrar registrar(flags, &state);
 
@@ -1043,11 +1246,12 @@ TEST_P(RegistrarTest, FetchTimeout)
   Clock::resume();
 
   // Ensure the registrar fails subsequent operations.
-  AWAIT_FAILED(registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
+  AWAIT_FAILED(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(slave))));
 }
 
 
-TEST_P(RegistrarTest, StoreTimeout)
+TEST_F(RegistrarTest, StoreTimeout)
 {
   Clock::pause();
 
@@ -1075,11 +1279,12 @@ TEST_P(RegistrarTest, StoreTimeout)
   Clock::resume();
 
   // Ensure the registrar fails subsequent operations.
-  AWAIT_FAILED(registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
+  AWAIT_FAILED(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(slave))));
 }
 
 
-TEST_P(RegistrarTest, Abort)
+TEST_F(RegistrarTest, Abort)
 {
   MockStorage storage;
   State state(&storage);
@@ -1097,16 +1302,18 @@ TEST_P(RegistrarTest, Abort)
   AWAIT_READY(registrar.recover(master));
 
   // Storage failure.
-  AWAIT_FAILED(registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
+  AWAIT_FAILED(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(slave))));
 
   // The registrar should now be aborted!
-  AWAIT_FAILED(registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
+  AWAIT_FAILED(registrar.apply(Owned<RegistryOperation>(
+      new AdmitSlave(slave))));
 }
 
 
 // Tests that requests to the '/registry' endpoint are authenticated when HTTP
 // authentication is enabled.
-TEST_P(RegistrarTest, Authentication)
+TEST_F(RegistrarTest, Authentication)
 {
   const string AUTHENTICATION_REALM = "realm";
 
@@ -1126,8 +1333,7 @@ TEST_P(RegistrarTest, Authentication)
 
   // Requests without credentials should be rejected.
   Future<Response> response = process::http::get(registrar.pid(), "registry");
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response)
-    << response.get().body;
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
 
   Credential badCredential;
   badCredential.set_principal("bad-principal");
@@ -1139,8 +1345,7 @@ TEST_P(RegistrarTest, Authentication)
       "registry",
       None(),
       createBasicAuthHeaders(badCredential));
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response)
-    << response.get().body;
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
 
   // Requests with good credentials should be permitted.
   response = process::http::get(
@@ -1148,8 +1353,7 @@ TEST_P(RegistrarTest, Authentication)
       "registry",
       None(),
       createBasicAuthHeaders(DEFAULT_CREDENTIAL));
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-    << response.get().body;
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
   AWAIT_READY(authentication::unsetAuthenticator(AUTHENTICATION_REALM));
 }
@@ -1172,8 +1376,6 @@ TEST_P(Registrar_BENCHMARK_Test, Performance)
   Registrar registrar(flags, state);
   AWAIT_READY(registrar.recover(master));
 
-  vector<SlaveInfo> infos;
-
   Attributes attributes = Attributes::parse("foo:bar;baz:quux");
   Resources resources =
     Resources::parse("cpus(*):1.0;mem(*):512;disk(*):2048").get();
@@ -1181,6 +1383,7 @@ TEST_P(Registrar_BENCHMARK_Test, Performance)
   size_t slaveCount = GetParam();
 
   // Create slaves.
+  vector<SlaveInfo> infos;
   for (size_t i = 0; i < slaveCount; ++i) {
     // Simulate real slave information.
     SlaveInfo info;
@@ -1197,7 +1400,7 @@ TEST_P(Registrar_BENCHMARK_Test, Performance)
   watch.start();
   Future<bool> result;
   foreach (const SlaveInfo& info, infos) {
-    result = registrar.apply(Owned<Operation>(new AdmitSlave(info)));
+    result = registrar.apply(Owned<RegistryOperation>(new AdmitSlave(info)));
   }
   AWAIT_READY_FOR(result, Minutes(5));
   LOG(INFO) << "Admitted " << slaveCount << " agents in " << watch.elapsed();
@@ -1206,13 +1409,17 @@ TEST_P(Registrar_BENCHMARK_Test, Performance)
   // same as in production).
   std::random_shuffle(infos.begin(), infos.end());
 
-  // Readmit slaves.
+  // Mark slaves reachable again. This simulates the master failing
+  // over, and then the previously registered agents reregistering
+  // with the new master.
   watch.start();
   foreach (const SlaveInfo& info, infos) {
-    result = registrar.apply(Owned<Operation>(new ReadmitSlave(info)));
+    result = registrar.apply(Owned<RegistryOperation>(
+        new MarkSlaveReachable(info)));
   }
   AWAIT_READY_FOR(result, Minutes(5));
-  LOG(INFO) << "Readmitted " << slaveCount << " agents in " << watch.elapsed();
+  LOG(INFO) << "Marked " << slaveCount
+            << " agents reachable in " << watch.elapsed();
 
   // Recover slaves.
   Registrar registrar2(flags, state);
@@ -1224,7 +1431,7 @@ TEST_P(Registrar_BENCHMARK_Test, Performance)
   Future<Registry> registry = registrar2.recover(info);
   AWAIT_READY(registry);
   LOG(INFO) << "Recovered " << slaveCount << " agents ("
-            << Bytes(registry.get().ByteSize()) << ") in " << watch.elapsed();
+            << Bytes(registry->ByteSize()) << ") in " << watch.elapsed();
 
   // Shuffle the slaves so we are removing them in random order (same
   // as in production).
@@ -1233,10 +1440,150 @@ TEST_P(Registrar_BENCHMARK_Test, Performance)
   // Remove slaves.
   watch.start();
   foreach (const SlaveInfo& info, infos) {
-    result = registrar2.apply(Owned<Operation>(new RemoveSlave(info)));
+    result = registrar2.apply(Owned<RegistryOperation>(new RemoveSlave(info)));
   }
   AWAIT_READY_FOR(result, Minutes(5));
   cout << "Removed " << slaveCount << " agents in " << watch.elapsed() << endl;
+}
+
+
+// Test the performance of marking all registered slaves unreachable,
+// then marking them reachable again. This might occur if there is a
+// network partition and then the partition heals.
+TEST_P(Registrar_BENCHMARK_Test, MarkUnreachableThenReachable)
+{
+  Registrar registrar(flags, state);
+  AWAIT_READY(registrar.recover(master));
+
+  Attributes attributes = Attributes::parse("foo:bar;baz:quux");
+  Resources resources =
+    Resources::parse("cpus(*):1.0;mem(*):512;disk(*):2048").get();
+
+  size_t slaveCount = GetParam();
+
+  // Create slaves.
+  vector<SlaveInfo> infos;
+  for (size_t i = 0; i < slaveCount; ++i) {
+    // Simulate real slave information.
+    SlaveInfo info;
+    info.set_hostname("localhost");
+    info.mutable_id()->set_value(
+        string("201310101658-2280333834-5050-48574-") + stringify(i));
+    info.mutable_resources()->MergeFrom(resources);
+    info.mutable_attributes()->MergeFrom(attributes);
+    infos.push_back(info);
+  }
+
+  // Admit slaves.
+  Stopwatch watch;
+  watch.start();
+  Future<bool> result;
+  foreach (const SlaveInfo& info, infos) {
+    result = registrar.apply(Owned<RegistryOperation>(new AdmitSlave(info)));
+  }
+  AWAIT_READY_FOR(result, Minutes(5));
+  LOG(INFO) << "Admitted " << slaveCount << " agents in " << watch.elapsed();
+
+  // Shuffle the slaves so that we mark them unreachable in random
+  // order (same as in production).
+  std::random_shuffle(infos.begin(), infos.end());
+
+  // Mark all slaves unreachable.
+  TimeInfo unreachableTime = protobuf::getCurrentTime();
+
+  watch.start();
+  foreach (const SlaveInfo& info, infos) {
+    result = registrar.apply(Owned<RegistryOperation>(
+        new MarkSlaveUnreachable(info, unreachableTime)));
+  }
+  AWAIT_READY_FOR(result, Minutes(5));
+  cout << "Marked " << slaveCount << " agents unreachable in "
+       << watch.elapsed() << endl;
+
+  // Shuffles the slaves again so that we mark them reachable in
+  // random order (same as in production).
+  std::random_shuffle(infos.begin(), infos.end());
+
+  // Mark all slaves reachable.
+  watch.start();
+  foreach (const SlaveInfo& info, infos) {
+    result = registrar.apply(Owned<RegistryOperation>(
+        new MarkSlaveReachable(info)));
+  }
+  AWAIT_READY_FOR(result, Minutes(5));
+  cout << "Marked " << slaveCount << " agents reachable in "
+       << watch.elapsed() << endl;
+}
+
+
+// Test the performance of garbage collecting a large portion of the
+// unreachable list in a single operation. We use a fixed percentage
+// at the moment (50%).
+TEST_P(Registrar_BENCHMARK_Test, GcManyAgents)
+{
+  Registrar registrar(flags, state);
+  AWAIT_READY(registrar.recover(master));
+
+  Attributes attributes = Attributes::parse("foo:bar;baz:quux");
+  Resources resources =
+    Resources::parse("cpus(*):1.0;mem(*):512;disk(*):2048").get();
+
+  size_t slaveCount = GetParam();
+
+  // Create slaves.
+  vector<SlaveInfo> infos;
+  for (size_t i = 0; i < slaveCount; ++i) {
+    // Simulate real slave information.
+    SlaveInfo info;
+    info.set_hostname("localhost");
+    info.mutable_id()->set_value(
+        string("201310101658-2280333834-5050-48574-") + stringify(i));
+    info.mutable_resources()->MergeFrom(resources);
+    info.mutable_attributes()->MergeFrom(attributes);
+    infos.push_back(info);
+  }
+
+  // Admit slaves.
+  Stopwatch watch;
+  watch.start();
+  Future<bool> result;
+  foreach (const SlaveInfo& info, infos) {
+    result = registrar.apply(Owned<RegistryOperation>(new AdmitSlave(info)));
+  }
+  AWAIT_READY_FOR(result, Minutes(5));
+  LOG(INFO) << "Admitted " << slaveCount << " agents in " << watch.elapsed();
+
+  // Shuffle the slaves so that we mark them unreachable in random
+  // order (same as in production).
+  std::random_shuffle(infos.begin(), infos.end());
+
+  // Mark all slaves unreachable.
+  TimeInfo unreachableTime = protobuf::getCurrentTime();
+
+  watch.start();
+  foreach (const SlaveInfo& info, infos) {
+    result = registrar.apply(Owned<RegistryOperation>(
+        new MarkSlaveUnreachable(info, unreachableTime)));
+  }
+  AWAIT_READY_FOR(result, Minutes(5));
+  LOG(INFO) << "Marked " << slaveCount << " agents unreachable in "
+            << watch.elapsed() << endl;
+
+  // Prepare to GC the first half of the unreachable list.
+  hashset<SlaveID> toRemove;
+  for (size_t i = 0; (i * 2) < slaveCount; i++) {
+    const SlaveInfo& info = infos[i];
+    toRemove.insert(info.id());
+  }
+
+  // Do GC.
+  watch.start();
+  result = registrar.apply(Owned<RegistryOperation>(
+      new Prune(toRemove, hashset<SlaveID>())));
+
+  AWAIT_READY_FOR(result, Minutes(5));
+  cout << "Garbage collected " << toRemove.size() << " agents in "
+       << watch.elapsed() << endl;
 }
 
 } // namespace tests {

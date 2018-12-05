@@ -10,14 +10,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef __STOUT_OS_POSIX_HPP__
-#define __STOUT_OS_POSIX_HPP__
+#ifndef __STOUT_OS_LINUX_HPP__
+#define __STOUT_OS_LINUX_HPP__
 
 // This file contains Linux-only OS utilities.
 #ifndef __linux__
 #error "stout/os/linux.hpp is only available on Linux systems."
-#endif
+#endif // __linux__
 
+#include <sys/mman.h>
 #include <sys/types.h> // For pid_t.
 
 #include <list>
@@ -33,7 +34,6 @@
 #include <stout/result.hpp>
 #include <stout/try.hpp>
 
-#include <stout/os/pagesize.hpp>
 #include <stout/os/process.hpp>
 
 namespace os {
@@ -49,32 +49,120 @@ static int childMain(void* _func)
 }
 
 
-inline pid_t clone(const lambda::function<int()>& func, int flags)
+// Helper that captures information about a stack to be used when
+// invoking clone.
+class Stack
+{
+public:
+  // 8 MiB is the default for "ulimit -s" on OSX and Linux.
+  static constexpr size_t DEFAULT_SIZE = 8 * 1024 * 1024;
+
+  // Allocate a stack. Note that this is NOT async signal safe, nor
+  // safe to call between fork and exec.
+  static Try<Stack> create(size_t size)
+  {
+    Stack stack(size);
+
+    if (!stack.allocate()) {
+      return ErrnoError();
+    }
+
+    return stack;
+  }
+
+  explicit Stack(size_t size_) : size(size_) {}
+
+  // Allocate the stack using mmap. We avoid malloc because we want
+  // this to be safe to use between fork and exec where malloc might
+  // deadlock. Returns false and sets `errno` on failure.
+  bool allocate()
+  {
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+
+#if defined(MAP_STACK)
+    flags |= MAP_STACK;
+#endif
+
+    address = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (address == MAP_FAILED) {
+      return false;
+    }
+
+    return true;
+  }
+
+  // Explicitly free the stack.
+  // The destructor won't free the allocated stack.
+  void deallocate()
+  {
+    PCHECK(::munmap(address, size) == 0);
+    address = MAP_FAILED;
+  }
+
+  // Stack grows down, return the first usable address.
+  char* start() const
+  {
+    return address == MAP_FAILED
+      ? nullptr
+      : (static_cast<char*>(address) + size);
+  }
+
+private:
+  size_t size;
+  void* address = MAP_FAILED;
+};
+
+
+namespace signal_safe {
+
+
+inline pid_t clone(
+    const Stack& stack,
+    int flags,
+    const lambda::function<int()>& func)
+{
+  return ::clone(childMain, stack.start(), flags, (void*) &func);
+}
+
+} // namespace signal_safe {
+
+
+inline pid_t clone(
+    const lambda::function<int()>& func,
+    int flags)
 {
   // Stack for the child.
-  // - unsigned long long used for best alignment.
-  // - 8 MiB appears to be the default for "ulimit -s" on OSX and Linux.
   //
   // NOTE: We need to allocate the stack dynamically. This is because
   // glibc's 'clone' will modify the stack passed to it, therefore the
   // stack must NOT be shared as multiple 'clone's can be invoked
   // simultaneously.
-  int stackSize = 8 * 1024 * 1024;
-  unsigned long long *stack =
-    new unsigned long long[stackSize/sizeof(unsigned long long)];
+  Stack stack(Stack::DEFAULT_SIZE);
 
-  pid_t pid = ::clone(
-      childMain,
-      &stack[stackSize/sizeof(stack[0]) - 1],  // stack grows down.
-      flags,
-      (void*) &func);
+  if (!stack.allocate()) {
+    // TODO(jpeach): In MESOS-8155, we will return an
+    // ErrnoError() here, but for now keep the interface
+    // compatible.
+    return -1;
+  }
 
-  // If CLONE_VM is not set, ::clone would create a process which runs in a
-  // separate copy of the memory space of the calling process. So we destroy the
-  // stack here to avoid memory leak. If CLONE_VM is set, ::clone would create a
-  // thread which runs in the same memory space with the calling process.
-  if (!(flags & CLONE_VM)) {
-    delete[] stack;
+  pid_t pid = signal_safe::clone(stack, flags, func);
+
+  // Given we allocated the stack ourselves, there are two
+  // circumstances where we need to delete the allocated stack to
+  // avoid a memory leak:
+  //
+  // (1) Failed to clone.
+  //
+  // (2) CLONE_VM is not set implying ::clone will create a process
+  //     which runs in its own copy of the memory space of the
+  //     calling process. If CLONE_VM is set ::clone will create a
+  //     thread which runs in the same memory space with the calling
+  //     process, in which case we don't want to call delete!
+  //
+  // TODO(jpeach): In case (2) we will leak the stack memory.
+  if (pid < 0 || !(flags & CLONE_VM)) {
+    stack.deallocate();
   }
 
   return pid;
@@ -84,10 +172,7 @@ inline pid_t clone(const lambda::function<int()>& func, int flags)
 inline Result<Process> process(pid_t pid)
 {
   // Page size, used for memory accounting.
-  static const int pageSize = os::pagesize();
-  if (pageSize <= 0) {
-    return Error("Failed to get `os::pagesize`");
-  }
+  static const size_t pageSize = os::pagesize();
 
   // Number of clock ticks per second, used for cpu accounting.
   static const long ticks = sysconf(_SC_CLK_TCK);
@@ -114,23 +199,24 @@ inline Result<Process> process(pid_t pid)
   // These are similar reports:
   // http://lkml.indiana.edu/hypermail/linux/kernel/1207.1/01388.html
   // https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1023214
-  Try<Duration> utime = Duration::create(status.get().utime / (double) ticks);
-  Try<Duration> stime = Duration::create(status.get().stime / (double) ticks);
+  Try<Duration> utime = Duration::create(status->utime / (double)ticks);
+  Try<Duration> stime = Duration::create(status->stime / (double)ticks);
 
-  // The command line from 'status.get().comm' is only "arg0" from
-  // "argv" (i.e., the canonical executable name). To get the entire
-  // command line we grab '/proc/[pid]/cmdline'.
+  // The command line from 'status->comm' is only "arg0" from "argv"
+  // (i.e., the canonical executable name). To get the entire command
+  // line we grab '/proc/[pid]/cmdline'.
   Result<std::string> cmdline = proc::cmdline(pid);
 
-  return Process(status.get().pid,
-                 status.get().ppid,
-                 status.get().pgrp,
-                 status.get().session,
-                 Bytes(status.get().rss * pageSize),
-                 utime.isSome() ? utime.get() : Option<Duration>::none(),
-                 stime.isSome() ? stime.get() : Option<Duration>::none(),
-                 cmdline.isSome() ? cmdline.get() : status.get().comm,
-                 status.get().state == 'Z');
+  return Process(
+      status->pid,
+      status->ppid,
+      status->pgrp,
+      status->session,
+      Bytes(status->rss * pageSize),
+      utime.isSome() ? utime.get() : Option<Duration>::none(),
+      stime.isSome() ? stime.get() : Option<Duration>::none(),
+      cmdline.isSome() ? cmdline.get() : status->comm,
+      status->state == 'Z');
 }
 
 
@@ -167,4 +253,4 @@ inline Try<Memory> memory()
 
 } // namespace os {
 
-#endif // __STOUT_OS_POSIX_HPP__
+#endif // __STOUT_OS_LINUX_HPP__

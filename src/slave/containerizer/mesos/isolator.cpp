@@ -21,7 +21,7 @@
 using namespace process;
 
 using std::string;
-using std::list;
+using std::vector;
 
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
@@ -46,8 +46,20 @@ MesosIsolator::~MesosIsolator()
 }
 
 
+bool MesosIsolator::supportsNesting()
+{
+  return process->supportsNesting();
+}
+
+
+bool MesosIsolator::supportsStandalone()
+{
+  return process->supportsStandalone();
+}
+
+
 Future<Nothing> MesosIsolator::recover(
-    const list<ContainerState>& state,
+    const vector<ContainerState>& state,
     const hashset<ContainerID>& orphans)
 {
   return dispatch(process.get(),

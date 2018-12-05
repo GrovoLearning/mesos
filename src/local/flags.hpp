@@ -18,6 +18,8 @@
 #define __LOCAL_FLAGS_HPP__
 
 #include <stout/flags.hpp>
+#include <stout/os.hpp>
+#include <stout/path.hpp>
 
 #include "logging/flags.hpp"
 
@@ -25,17 +27,42 @@ namespace mesos {
 namespace internal {
 namespace local {
 
-class Flags : public logging::Flags
+class Flags : public virtual logging::Flags
 {
 public:
   Flags()
   {
+    add(&Flags::work_dir,
+        "work_dir",
+        "Path of the master/agent work directory. This is where the\n"
+        "persistent information of the cluster will be stored.\n\n"
+        "NOTE: Locations like `/tmp` which are cleaned automatically\n"
+        "are not suitable for the work directory when running in\n"
+        "production, since long-running masters and agents could lose\n"
+        "data when cleanup occurs. Local mode is used explicitly for\n"
+        "non-production purposes, so this is the only case where having\n"
+        "a default `work_dir` flag is acceptable.\n"
+        "(Example: `/var/lib/mesos`)\n\n"
+        "Individual work directories for each master and agent will be\n"
+        "nested underneath the given work directory:\n"
+        "root (`work_dir` flag)\n"
+        "|-- agents\n"
+        "|   |-- 0\n"
+        "|   |   |-- fetch (--fetcher_cache_dir)\n"
+        "|   |   |-- run   (--runtime_dir)\n"
+        "|   |   |-- work  (--work_dir)\n"
+        "|   |-- 1\n"
+        "|   |   ...\n"
+        "|-- master",
+        path::join(os::temp(), "mesos", "work"));
+
     add(&Flags::num_slaves,
         "num_slaves",
         "Number of agents to launch for local cluster",
         1);
   }
 
+  std::string work_dir;
   int num_slaves;
 };
 

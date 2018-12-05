@@ -48,43 +48,42 @@ class CgroupsIsolatorProcess : public MesosIsolatorProcess
 public:
   static Try<mesos::slave::Isolator*> create(const Flags& flags);
 
-  virtual ~CgroupsIsolatorProcess();
+  ~CgroupsIsolatorProcess() override;
 
-  virtual process::Future<Nothing> recover(
-      const std::list<mesos::slave::ContainerState>& states,
-      const hashset<ContainerID>& orphans);
+  bool supportsNesting() override;
+  bool supportsStandalone() override;
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  process::Future<Nothing> recover(
+      const std::vector<mesos::slave::ContainerState>& states,
+      const hashset<ContainerID>& orphans) override;
+
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig);
+      const mesos::slave::ContainerConfig& containerConfig) override;
 
-  virtual process::Future<Nothing> isolate(
+  process::Future<Nothing> isolate(
       const ContainerID& containerId,
-      pid_t pid);
+      pid_t pid) override;
 
-  virtual process::Future<mesos::slave::ContainerLimitation> watch(
-      const ContainerID& containerId);
+  process::Future<mesos::slave::ContainerLimitation> watch(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<Nothing> update(
+  process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources);
+      const Resources& resources) override;
 
-  virtual process::Future<ResourceStatistics> usage(
-      const ContainerID& containerId);
+  process::Future<ResourceStatistics> usage(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<ContainerStatus> status(
-      const ContainerID& containerId);
+  process::Future<ContainerStatus> status(
+      const ContainerID& containerId) override;
 
-  virtual process::Future<Nothing> cleanup(
-      const ContainerID& containerId);
+  process::Future<Nothing> cleanup(
+      const ContainerID& containerId) override;
 
 private:
-  CgroupsIsolatorProcess(
-      const Flags& _flags,
-      const hashmap<std::string, std::string>& _hierarchies,
-      const multihashmap<std::string, process::Owned<Subsystem>>& _subsystems);
-
-  struct Info {
+  struct Info
+  {
     Info(const ContainerID& _containerId, const std::string& _cgroup)
       : containerId(_containerId), cgroup(_cgroup) {}
 
@@ -94,14 +93,63 @@ private:
     // This promise will complete if a container is impacted by a resource
     // limitation and should be terminated.
     process::Promise<mesos::slave::ContainerLimitation> limitation;
+
+    // This `hashset` stores the name of subsystems which are recovered
+    // or prepared for the container.
+    hashset<std::string> subsystems;
   };
+
+  CgroupsIsolatorProcess(
+      const Flags& _flags,
+      const multihashmap<std::string, process::Owned<Subsystem>>&
+        _subsystems);
+
+  process::Future<Nothing> _recover(
+      const hashset<ContainerID>& orphans,
+      const std::vector<process::Future<Nothing>>& futures);
+
+  process::Future<Nothing> __recover(
+      const hashset<ContainerID>& unknownOrphans,
+      const std::vector<process::Future<Nothing>>& futures);
+
+  process::Future<Nothing> ___recover(
+      const ContainerID& containerId);
+
+  process::Future<Nothing> ____recover(
+      const ContainerID& containerId,
+      const hashset<std::string>& recoveredSubsystems,
+      const std::vector<process::Future<Nothing>>& futures);
+
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> _prepare(
+      const ContainerID& containerId,
+      const mesos::slave::ContainerConfig& containerConfig,
+      const std::vector<process::Future<Nothing>>& futures);
+
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> __prepare(
+      const ContainerID& containerId,
+      const mesos::slave::ContainerConfig& containerConfig);
+
+  process::Future<Nothing> _isolate(
+      const std::vector<process::Future<Nothing>>& futures);
+
+  void _watch(
+      const ContainerID& containerId,
+      const process::Future<mesos::slave::ContainerLimitation>& future);
+
+  process::Future<Nothing> _update(
+      const std::vector<process::Future<Nothing>>& futures);
+
+  process::Future<Nothing> _cleanup(
+      const ContainerID& containerId,
+      const std::vector<process::Future<Nothing>>& futures);
+
+  process::Future<Nothing> __cleanup(
+      const ContainerID& containerId,
+      const std::vector<process::Future<Nothing>>& futures);
 
   const Flags flags;
 
-  // Map from subsystem name to hierarchy path.
-  hashmap<std::string, std::string> hierarchies;
-
-  // We map hierarchy path and `Subsytem` in subsystems. Same hierarchy may
+  // We map hierarchy path and `Subsystem` in subsystems. Same hierarchy may
   // map to multiple Subsystems. For example, our cgroups hierarchies may
   // mount like below in the machine:
   //   /cgroup/cpu,cpuacct -> cpu

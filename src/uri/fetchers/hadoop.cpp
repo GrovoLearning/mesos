@@ -45,6 +45,9 @@ HadoopFetcherPlugin::Flags::Flags()
 }
 
 
+const char HadoopFetcherPlugin::NAME[] = "hadoop";
+
+
 Try<Owned<Fetcher::Plugin>> HadoopFetcherPlugin::create(const Flags& flags)
 {
   Try<Owned<HDFS>> hdfs = HDFS::create(flags.hadoop_client);
@@ -61,15 +64,22 @@ Try<Owned<Fetcher::Plugin>> HadoopFetcherPlugin::create(const Flags& flags)
 }
 
 
-set<string> HadoopFetcherPlugin::schemes()
+set<string> HadoopFetcherPlugin::schemes() const
 {
   return schemes_;
 }
 
 
+string HadoopFetcherPlugin::name() const
+{
+  return NAME;
+}
+
+
 Future<Nothing> HadoopFetcherPlugin::fetch(
     const URI& uri,
-    const string& directory)
+    const string& directory,
+    const Option<string>& data) const
 {
   // TODO(jieyu): Validate the given URI.
 
@@ -89,7 +99,7 @@ Future<Nothing> HadoopFetcherPlugin::fetch(
   // configuration file.
   //
   // TODO(jieyu): Allow user to specify the name of the output file.
-  return hdfs.get()->copyToLocal(
+  return hdfs->copyToLocal(
       (uri.has_host() ? stringify(uri) : uri.path()),
       path::join(directory, Path(uri.path()).basename()));
 }

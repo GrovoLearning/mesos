@@ -18,11 +18,11 @@
 
 namespace os {
 
-inline int pagesize()
+inline size_t pagesize()
 {
-  SYSTEM_INFO si;
-  GetSystemInfo(&si);
-  return si.dwPageSize;
+  SYSTEM_INFO info;
+  ::GetSystemInfo(&info);
+  return static_cast<size_t>(info.dwPageSize);
 }
 
 } // namespace os {
